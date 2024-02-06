@@ -11,8 +11,7 @@ from typing import Tuple
 
 import fire
 import wandb
-from datasets import Dataset, concatenate_datasets
-from torch.utils.data import IterableDataset
+from datasets import Dataset, IterableDataset, concatenate_datasets
 from tqdm import tqdm
 from transformers.hf_argparser import HfArgumentParser
 from transformers.modeling_utils import PreTrainedModel
@@ -106,8 +105,8 @@ def get_samples(max_runs=200, num_steps=1, max_samples=None):
 
 
 class ExtendableIterableDataset(IterableDataset):
-    def __init__(self, ttl=None):
-        super().__init__()
+    def __init__(self, *args, ttl=None, **kwargs):
+        super().__init__(*args, **kwargs)
         self.data_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.ttl = ttl  # Time-to-live for blocking on the queue
@@ -143,7 +142,7 @@ class ExtendableIterableDataset(IterableDataset):
         return data
 
 
-def data_producer(dataset):
+def data_producer():
     seen_keys = set()
     while True:
         ds = get_samples()
@@ -152,7 +151,7 @@ def data_producer(dataset):
             if id in seen_keys:
                 continue
             seen_keys.add(id)
-            dataset.add_item(sample)
+            yield sample
         time.sleep(60.0)
 
 
@@ -178,7 +177,8 @@ def do_train(cfg, cli_args) -> Tuple[PreTrainedModel, PreTrainedTokenizer]:
     else:
         register_chatml_template()
 
-    ds = ExtendableIterableDataset(ttl=3600)
+    ds = IterableDataset.from_generator(data_producer)
+    # ds = ExtendableIterableDataset(ttl=3600)
     import axolotl.utils.data
 
     def patched_ds_fetcher(*args, **kwargs):
