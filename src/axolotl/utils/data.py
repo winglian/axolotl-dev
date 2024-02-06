@@ -64,6 +64,12 @@ def md5(to_hash: str, encoding: str = "utf-8") -> str:
         return hashlib.md5(to_hash.encode(encoding)).hexdigest()  # nosec
 
 
+def get_streaming_dataset(ds_cfg):
+    return load_dataset(
+        ds_cfg["path"], streaming=True, split="train", name=ds_cfg["name"]
+    )
+
+
 def prepare_dataset(cfg, tokenizer):
     prompters = []
     if not cfg.pretraining_dataset:
@@ -97,7 +103,7 @@ def prepare_dataset(cfg, tokenizer):
         )
 
         train_dataset = wrap_pretraining_dataset(
-            load_dataset(path, streaming=True, split="train", name=name),
+            get_streaming_dataset(cfg.pretraining_dataset[0]),
             tokenizer,
             cfg,
             ds_wrapper_partial,
