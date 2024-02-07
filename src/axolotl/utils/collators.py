@@ -229,4 +229,4 @@ class PretrainingBatchSamplerDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 arrays = [np.array(item) for item in features[feature]]
                 chunked_data[feature] = np.concatenate(arrays)
         features = [chunked_data]
-        return super().__call__(features, return_tensors=return_tensors)
+        return super().__call__(features, return_tensors=return_tensors).to("cpu")

@@ -3,15 +3,18 @@ CLI to run training on a model
 """
 import logging
 import queue
+import random
 import threading
 import time
 import typing
+from collections import defaultdict
 from pathlib import Path
 from typing import Tuple
 
 import fire
 import wandb
-from datasets import Dataset, IterableDataset, concatenate_datasets
+from datasets import Dataset, IterableDataset, concatenate_datasets, Value
+from datasets.iterable_dataset import ExamplesIterable
 from tqdm import tqdm
 from transformers.hf_argparser import HfArgumentParser
 from transformers.modeling_utils import PreTrainedModel
@@ -100,7 +103,6 @@ def get_samples(max_runs=200, num_steps=1, max_samples=None):
                 break
         ds = Dataset.from_list(buffer)
         all_datasets.append(ds)
-
     return concatenate_datasets(all_datasets)
 
 
@@ -143,16 +145,20 @@ class ExtendableIterableDataset(IterableDataset):
 
 
 def data_producer():
-    seen_keys = set()
+    seen_keys = defaultdict(set)
     while True:
-        ds = get_samples()
+        ds = get_samples(num_steps=5)
         for sample in ds:
             id = sample["id"]
-            if id in seen_keys:
-                continue
-            seen_keys.add(id)
-            yield sample
-        time.sleep(60.0)
+            exp = 2
+            for i in range(4):
+                if id not in seen_keys[i]:
+                    if random.randint(1, 3600) % pow((i + 1), exp) == 0:
+                        seen_keys[i].add(id)
+                        yield id, sample
+                        break
+                    else:
+                        break
 
 
 def do_cli(config: Path = Path("examples/"), **kwargs):
@@ -177,16 +183,13 @@ def do_train(cfg, cli_args) -> Tuple[PreTrainedModel, PreTrainedTokenizer]:
     else:
         register_chatml_template()
 
-    ds = IterableDataset.from_generator(data_producer)
-    # ds = ExtendableIterableDataset(ttl=3600)
+    ds = IterableDataset(ExamplesIterable(data_producer, {}))
     import axolotl.utils.data
 
     def patched_ds_fetcher(*args, **kwargs):
         return ds
 
     axolotl.utils.data.get_streaming_dataset = patched_ds_fetcher
-    producer_thread = threading.Thread(target=data_producer, args=(ds))
-    producer_thread.start()
 
     if cfg.rl:
         dataset_meta = load_rl_datasets(cfg=cfg, cli_args=cli_args)
