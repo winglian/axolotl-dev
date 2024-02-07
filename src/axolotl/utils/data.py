@@ -110,6 +110,7 @@ def prepare_dataset(cfg, tokenizer):
             max_tokens=cfg.sequence_len,
             batch_size=cfg.micro_batch_size,
             seed=cfg.seed or 42,
+            buffer_size=2000,
         )
         # https://discuss.huggingface.co/t/how-to-use-huggingface-trainer-streaming-datasets-without-wrapping-it-with-torchdatas-iterablewrapper/25230
         train_dataset = train_dataset.with_format("torch")
@@ -823,7 +824,7 @@ def wrap_pretraining_dataset(
         # input_columns="text",
         # remove all the existing columns after mapping since they end up having
         # a different length than the encoded/tokenized column
-        remove_columns=dataset.features.keys(),
+        remove_columns=["conversations", "run_id", "step", "id", "uid"],
     )
     return dataset
 
@@ -857,18 +858,15 @@ def encode_packed_pretraining(
     for batch in sampler:
         for data in batch:
             features = train_dataset[data]
-            if "num_truncated_tokens" in features:
-                del features["num_truncated_tokens"]
-            if "num_truncated_tokens" in features:
-                del features["num_truncated_tokens"]
-            if "overflow_to_sample_mapping" in features:
-                del features["overflow_to_sample_mapping"]
-            if "labels" not in features:
-                features["labels"] = features["input_ids"].copy()
+            for feature in list(features.keys()):
+                if feature not in ['input_ids', 'attention_mask', 'labels', 'position_ids', 'length']:
+                    del features[feature]
             collated_features = collate_fn(features)
 
             for feature in features.keys():
                 if feature == "length":
+                    continue
+                if feature not in ['input_ids', 'attention_mask', 'labels', 'position_ids']:
                     continue
                 chunked_data[feature].append(collated_features[feature].squeeze(0))
 

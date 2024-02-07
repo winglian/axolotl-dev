@@ -92,7 +92,7 @@ def disable_datasets_caching():
 
 def add_position_ids(sample):
     sample_len = len(sample["input_ids"])
-    sample["position_ids"] = torch.arange(len(sample["input_ids"]))
+    sample["position_ids"] = torch.arange(len(sample["input_ids"]), device="cpu")
     sample["length"] = sample_len
     return sample
 
