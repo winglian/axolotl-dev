@@ -97,6 +97,18 @@ def add_position_ids(sample):
     return sample
 
 
+def add_position_ids_batched(batch):
+    # Ensuring dtype=object in case of variable-length sequences
+    input_ids = np.array(batch["input_ids"], dtype=object)
+
+    lengths = np.vectorize(len)(input_ids)
+
+    batch["position_ids"] = [np.arange(l, dtype=int) for l in lengths]
+    batch["length"] = lengths.tolist()
+
+    return batch
+
+
 def add_length(sample):
     sample["length"] = len(sample["input_ids"])
     return sample
@@ -178,7 +190,7 @@ def process_pretraining_datasets_for_packing(train_dataset, sequence_len):
         desc="Dropping Long Sequences",
     )
     train_dataset = train_dataset.map(
-        add_position_ids,
+        add_position_ids_batched,
         desc="Add position_id column (Pretraining Sample Packing)",
     )
     return train_dataset
