@@ -3,6 +3,8 @@
 
 """Bounded cost refinement with protected optimizer-step label and token variance."""
 
+from axolotl.utils.samplers.utils import padded_length
+
 
 def balance_microbatches(
     batches,
@@ -35,9 +37,7 @@ def balance_microbatches(
     result = [[list(row) for row in batch] for batch in batches]
 
     def cost(rows):
-        return len(rows) * (
-            (max(rows) + padding_multiple - 1) // padding_multiple * padding_multiple
-        )
+        return len(rows) * padded_length(max(rows), padding_multiple)
 
     end = len(result) // width * width
     all_used = [[sum(lengths[i] for i in row) for row in b] for b in result[:end]]
@@ -112,15 +112,11 @@ def balance_microbatches(
                         hrow, lrow = used[hi][hr] - delta, used[lo][lr] + delta
                         if capacity is not None and max(hrow, lrow) > capacity:
                             continue
-                        hc = len(used[hi]) * (
-                            (max(hrow, remaining[0][hr]) + padding_multiple - 1)
-                            // padding_multiple
-                            * padding_multiple
+                        hc = len(used[hi]) * padded_length(
+                            max(hrow, remaining[0][hr]), padding_multiple
                         )
-                        lc = len(used[lo]) * (
-                            (max(lrow, remaining[1][lr]) + padding_multiple - 1)
-                            // padding_multiple
-                            * padding_multiple
+                        lc = len(used[lo]) * padded_length(
+                            max(lrow, remaining[1][lr]), padding_multiple
                         )
                         saved = costs[hi] + costs[lo] - hc - lc
                         if saved < 0 or max(hc, lc) > max(costs[hi], costs[lo]):

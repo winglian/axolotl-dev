@@ -50,6 +50,7 @@ DATASET_HASH_BASE_DATASET_FIELDS = (
 
 DATASET_HASH_CONFIG_EXTRA_FIELDS = (
     "added_tokens_overrides",
+    "balance_labels",
     "chat_template",
     "chat_template_jinja",
     "chat_template_kwargs",

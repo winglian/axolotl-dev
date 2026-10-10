@@ -52,6 +52,17 @@ class TestGenerateDatasetHashFromConfig:
         )
         assert h1 == h2
 
+    def test_balancing_metadata_changes_prepared_dataset_hash(self):
+        ordinary = generate_dataset_hash_from_config(_base_cfg(), _datasets(), "tok")
+        disabled = generate_dataset_hash_from_config(
+            _base_cfg(balance_labels=False), _datasets(), "tok"
+        )
+        balanced = generate_dataset_hash_from_config(
+            _base_cfg(balance_labels=True), _datasets(), "tok"
+        )
+        assert disabled == ordinary
+        assert balanced != ordinary
+
     def test_different_tokenizer_different_hash(self):
         """A different tokenizer path produces a different hash."""
         cfg = _base_cfg()

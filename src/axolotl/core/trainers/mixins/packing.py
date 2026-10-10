@@ -2,6 +2,8 @@
 
 from transformers import Trainer
 
+from axolotl.utils.samplers.utils import LABEL_METADATA_COLUMNS
+
 
 class PackingMixin(Trainer):
     """
@@ -10,6 +12,10 @@ class PackingMixin(Trainer):
 
     def _set_signature_columns_if_needed(self):
         super()._set_signature_columns_if_needed()
+        if self._signature_columns and getattr(self.args, "balance_labels", False):
+            self._signature_columns = list(
+                dict.fromkeys([*self._signature_columns, *LABEL_METADATA_COLUMNS])
+            )
         if (
             self._signature_columns
             and self.args.sample_packing
