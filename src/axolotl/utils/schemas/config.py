@@ -1695,23 +1695,25 @@ class AxolotlInputConfig(
     @model_validator(mode="after")
     def check_label_balanced_packing(self):
         """Label balancing requires static token-level labels and reorderable samples."""
-        if self.balance_labels and (
-            (
-                not self.sample_packing
-                and (self.streaming or self.pretraining_dataset or self.group_by_length)
-            )
-            or self.sample_packing_sequentially
-            or self.curriculum_sampling
-            or self.diffusion_lm
-            or self.rl
-            or self.reward_model
-            or self.process_reward_model
+        if not self.balance_labels:
+            return self
+        for option in (
+            "sample_packing_sequentially",
+            "curriculum_sampling",
+            "diffusion_lm",
+            "rl",
+            "reward_model",
+            "process_reward_model",
         ):
-            raise ValueError(
-                "balance_labels requires causal LM "
-                "sample_packing or map-style fixed-count batching without sequential, curriculum, or conflicting length-grouped sampling"
-            )
-        if self.balance_labels and (self.accelerator_config or {}).get("split_batches"):
+            if getattr(self, option):
+                raise ValueError(f"balance_labels is incompatible with {option}")
+        if not self.sample_packing:
+            for option in ("streaming", "pretraining_dataset", "group_by_length"):
+                if getattr(self, option):
+                    raise ValueError(
+                        f"balance_labels requires sample_packing=True when {option} is enabled"
+                    )
+        if (self.accelerator_config or {}).get("split_batches"):
             raise ValueError(
                 "balance_labels requires split_batches=False for optimizer-step grouping"
             )

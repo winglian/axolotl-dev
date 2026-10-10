@@ -7,6 +7,8 @@ import heapq
 
 import numpy as np
 
+from axolotl.utils.samplers.utils import padded_length
+
 
 def _bin_labels(bin_, counts, starts):
     return sum(int(counts[i]) for i in bin_) - int(starts[bin_[0]])
@@ -18,11 +20,7 @@ def _batch_labels(batch, counts, starts):
 
 def _padded_slots(batches, lengths, multiple):
     return sum(
-        (
-            (max(sum(int(lengths[i]) for i in bin_) for bin_ in batch) + multiple - 1)
-            // multiple
-        )
-        * multiple
+        padded_length(max(sum(int(lengths[i]) for i in row) for row in batch), multiple)
         * len(batch)
         for batch in batches
     )
@@ -78,9 +76,7 @@ def _swap(high, low, lengths, counts, starts, capacity, difference, padding_mult
                     high_used[hb] -= length_delta
                     low_used[lb] += length_delta
                     slots = sum(
-                        ((max(used) + padding_multiple - 1) // padding_multiple)
-                        * padding_multiple
-                        * len(used)
+                        padded_length(max(used), padding_multiple) * len(used)
                         for used in (high_used, low_used)
                     )
                     if slots > padding_budget:

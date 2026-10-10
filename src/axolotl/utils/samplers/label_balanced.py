@@ -17,6 +17,7 @@ from axolotl.utils.samplers.accumulation import (
 )
 from axolotl.utils.samplers.microbatch_balance import balance_microbatches
 from axolotl.utils.samplers.rank_balance import order_batches_by_rank
+from axolotl.utils.samplers.utils import padded_length
 
 LOG = get_logger(__name__)
 
@@ -109,11 +110,7 @@ class LabelBalancedRandomSampler(Sampler[int]):
         return len(batch) * self._padded_length(max(lengths, default=0))
 
     def _padded_length(self, length):
-        return (
-            (length + self.padding_multiple - 1)
-            // self.padding_multiple
-            * self.padding_multiple
-        )
+        return padded_length(length, self.padding_multiple)
 
     def _balance_padded_window(self, window):
         size, count = self.batch_size, len(window)

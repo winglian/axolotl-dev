@@ -43,8 +43,12 @@ packed rows, each with capacity `sequence_len`. Under the default Accelerate
 `split_batches: false`, data parallelism shards whole microbatches across ranks.
 Four ranks with microbatch size one therefore process four rows globally; this
 is distinct from balancing four rows jointly inside one rank's microbatch.
-Tokenized label counts are read once per sampler construction and reused across
-epochs. For causal loss, counts exclude the first label of each packed row;
+Preprocessing with `balance_labels: true` caches raw label counts and row-start
+flags as private `_axolotl_*` columns. Samplers read these columns without scanning
+token rows, then apply the runtime causal-shift convention. Separate columns
+cover `labels` and `shift_labels`. Older prepared datasets without metadata fall
+back to a chunked scan. The metadata is removed before collation, and counts are
+reused across epochs. For causal loss, counts exclude the first label of each packed row;
 precomputed `shift_labels` are counted directly. Exchanges also preserve the total
 number of loss-bearing labels. The resulting full batches are shuffled within
 each window using the training seed and epoch.
@@ -169,7 +173,9 @@ without changing any microbatch or its cost.
 
 For map-style packed, padded, and flattened training, `balance_labels`
 receives a normalized `batches_per_optimizer_step` from the trainer: data-parallel
-replicas multiplied by `gradient_accumulation_steps`. Both `MultipackBatchSampler`
+replicas multiplied by `gradient_accumulation_steps`. Axolotl expert-parallel
+ranks count as distinct data consumers; context, sequence, and tensor-parallel
+ranks do not. Both `MultipackBatchSampler`
 and `LabelBalancedRandomSampler` use this same grouping value. With accumulation
 steps times rank count greater than one, a second pass reorders whole microbatches across up to
 16 complete optimizer updates. With `W` ranks and `G` accumulation steps, each

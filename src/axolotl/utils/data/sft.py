@@ -36,6 +36,7 @@ from axolotl.utils.data.wrappers import get_dataset_wrapper
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.distributed import is_local_main_process
 from axolotl.utils.logging import get_logger
+from axolotl.utils.samplers.utils import add_label_metadata
 from axolotl.utils.trainer import (
     calculate_total_num_steps,
     deepspeed_context_parallel,
@@ -366,6 +367,15 @@ def _load_raw_datasets(
         # Deduplicate before saving so the saved dataset is already de-duplicated
         if cfg.dataset_exact_deduplication:
             dataset, _ = deduplicate_and_log_datasets(dataset=dataset)
+
+        if split == "train" and cfg.balance_labels:
+            dataset = dataset.map(
+                add_label_metadata,
+                batched=True,
+                num_proc=cfg.dataset_num_proc,
+                load_from_cache_file=not cfg.is_preprocess,
+                desc="Cache supervised-token counts",
+            )
 
         # Save the prepared dataset
         dataset_hash = generate_dataset_hash_from_config(

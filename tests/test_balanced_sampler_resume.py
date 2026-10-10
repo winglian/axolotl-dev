@@ -232,6 +232,17 @@ def test_checkpoint_resume_with_production_dataloader(tmp_path, kind, monkeypatc
         ]
     )
 
+    from axolotl.utils.samplers.utils import add_label_metadata
+
+    dataset = dataset.map(add_label_metadata, batched=True)
+
+    def no_label_scan(*args, **kwargs):
+        raise AssertionError(
+            "Prepared label metadata must survive sampler construction"
+        )
+
+    monkeypatch.setattr(Dataset, "iter", no_label_scan)
+
     class Model(TraceModel):
         def forward(
             self, input_ids, labels=None, attention_mask=None, position_ids=None

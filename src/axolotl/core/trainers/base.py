@@ -70,7 +70,10 @@ from axolotl.utils.samplers import (
     MultipackBatchSampler,
     get_dataset_lengths,
 )
-from axolotl.utils.samplers.utils import get_dataset_label_counts
+from axolotl.utils.samplers.utils import (
+    LABEL_METADATA_COLUMNS,
+    get_dataset_label_counts,
+)
 from axolotl.utils.schemas.fp8 import DEFAULT_FP8_RECIPE
 
 LOG = get_logger(__name__)
@@ -314,7 +317,11 @@ class AxolotlTrainer(
             getattr(self, "accelerator", None), "parallelism_config", None
         )
         if parallelism is not None:
-            replicas = parallelism.dp_replicate_size * parallelism.dp_shard_size
+            replicas = (
+                parallelism.dp_replicate_size
+                * parallelism.dp_shard_size
+                * getattr(parallelism, "ep_size", 1)
+            )
         return replicas
 
     def _batches_per_optimizer_step(self) -> int:
@@ -423,7 +430,17 @@ class AxolotlTrainer(
             lengths = get_dataset_lengths(train_dataset)
             if "labels" in train_dataset.column_names:
                 counts, starts = get_dataset_label_counts(
-                    train_dataset.select_columns(["labels"]),
+                    train_dataset.select_columns(
+                        [
+                            "labels",
+                            *[
+                                column
+                                for column in LABEL_METADATA_COLUMNS
+                                if column.startswith("_axolotl_labels_")
+                                and column in train_dataset.column_names
+                            ],
+                        ]
+                    ),
                     shift_labels=flattened
                     or getattr(self, "_loss_shifts_labels", True),
                 )
@@ -575,8 +592,14 @@ class AxolotlTrainer(
         ):
             self.accelerator.even_batches = False
 
-        if dataset.column_names and "length" in dataset.column_names:
-            dataset = dataset.remove_columns(["length"])
+        if dataset.column_names:
+            metadata = [
+                column
+                for column in ("length", *LABEL_METADATA_COLUMNS)
+                if column in dataset.column_names
+            ]
+            if metadata:
+                dataset = dataset.remove_columns(metadata)
 
         if (
             dataset.column_names

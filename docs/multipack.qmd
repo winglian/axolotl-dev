@@ -149,6 +149,10 @@ trainer's token-weighted loss normalization; it does not replace it.
 
 ### Checking the results
 
+Preprocessing with `balance_labels: true` also saves label-count metadata, so
+training ranks can load counts without scanning every tokenized label again.
+Existing prepared datasets without this metadata still work.
+
 Compare the before and after sampler statistics to see whether balancing helps
 your dataset:
 

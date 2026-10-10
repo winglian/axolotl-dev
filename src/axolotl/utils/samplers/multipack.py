@@ -25,6 +25,7 @@ from axolotl.utils.samplers.accumulation import (
 from axolotl.utils.samplers.label_balance import _batch_labels, balance_labels
 from axolotl.utils.samplers.microbatch_balance import balance_microbatches
 from axolotl.utils.samplers.rank_balance import order_batches_by_rank
+from axolotl.utils.samplers.utils import padded_length
 
 LOG = get_logger(__name__)
 
@@ -491,14 +492,9 @@ class MultipackBatchSampler(BatchSampler):
                 multiple = self.padding_multiple or 1
                 costs = [
                     len(batch)
-                    * (
-                        (
-                            max(sum(int(self.lengths[i]) for i in row) for row in batch)
-                            + multiple
-                            - 1
-                        )
-                        // multiple
-                        * multiple
+                    * padded_length(
+                        max(sum(int(self.lengths[i]) for i in row) for row in batch),
+                        multiple,
                     )
                     for batch in batches[:limit]
                 ]
