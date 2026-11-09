@@ -24,6 +24,13 @@
 
 namespace deep_gemm {
 
+// Packs 4 floats into 4 E4M3 bytes (first value in the lowest byte), saturating like __nv_fp8_e4m3(float).
+__device__ __forceinline__ uint32_t mono_ep_fp8x4(const float a, const float b, const float c, const float d) {
+    const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+    const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
+    return lo | (hi << 16);
+}
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -47,6 +54,8 @@ template <
     uint32_t kDiagAblate = 0,
     bool kWarpReduceDscore = false,
     bool kVectorXdyPack = false,
+    uint32_t kVectorHdzPack = 0,
+    uint32_t kVectorDzQuant = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1399,7 +1408,157 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 asm volatile("fence.proxy.async.global;" ::: "memory");
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 trace_mark[1] = trace_clock();
-                if (backward.qh_col != nullptr and not (kDiagAblate & 4u)) {
+                if (kVectorHdzPack != 0 and backward.qh_col != nullptr and not (kDiagAblate & 4u)) {
+                    // Scratch holds 128 rows x 32 BF16 pairs; pair ^ 4 * (row / 16) keeps both the 16-byte
+                    // row fills and the 8-lanes-per-pair, 16-rows-per-lane column reads conflict-free.
+                    DG_STATIC_ASSERT(BLOCK_M == 128 and BLOCK_N == 128, "Vector h/dZ pack assumes 128x128 tiles");
+                    const uint32_t expert_start = pool_m_idx - task_info.m_block_idx * BLOCK_M;
+                    const uint32_t padded_count =
+                        shared_storage.expert_padded_counts[task_info.local_expert_idx];
+                    const uint32_t local_row = pool_m_idx - expert_start;
+                    auto* scratch_words = reinterpret_cast<uint32_t*>(shared_storage.quantized_a);
+                    auto* scratch_chunks = reinterpret_cast<uint4*>(shared_storage.quantized_a);
+                    const uint32_t segment = lane_idx % 8;
+                    #pragma unroll 1
+                    for (uint32_t kind = 0; kind < 3; ++kind) {
+                        for (uint32_t linear = epilogue_thread_idx; linear < BLOCK_M * 8;
+                             linear += kNumEpilogueThreads) {
+                            const uint32_t row = linear / 8;
+                            const uint32_t chunk = linear % 8;
+                            uint4 value = make_uint4(0u, 0u, 0u, 0u);
+                            if (row < valid_m) {
+                                const void* src = kind < 2
+                                    ? static_cast<const void*>(shared_storage.smem_d.raw +
+                                        row * BLOCK_N + 16 * chunk + kind * 8)
+                                    : static_cast<const void*>(shared_storage.backward_epilogue.dh +
+                                        row * BLOCK_N + half * 64 + 8 * chunk);
+                                value = *static_cast<const uint4*>(src);
+                            }
+                            scratch_chunks[row * 8 + (chunk ^ ((row / 16) % 8))] = value;
+                        }
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        const uint32_t width = kind == 0 ? kIntermediateHidden : 2 * kIntermediateHidden;
+                        auto* scales = kind == 0 ? backward.sh_col : backward.sdz_col;
+                        auto* q = kind == 0 ? backward.qh_col : backward.qdz_col;
+                        for (uint32_t pair = epilogue_warp_idx * 4 + lane_idx / 8; pair < 32;
+                             pair += 4 * kNumEpilogueWarps) {
+                            uint32_t words[16];
+                            float amax_lo = 1.0e-4f, amax_hi = 1.0e-4f;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < 16; ++i) {
+                                words[i] = scratch_words[(segment * 16 + i) * 32 + (pair ^ (4 * segment))];
+                                amax_lo = fmaxf(amax_lo, fabsf(__uint_as_float(words[i] << 16)));
+                                amax_hi = fmaxf(amax_hi, fabsf(__uint_as_float(words[i] & 0xffff0000u)));
+                            }
+                            #pragma unroll
+                            for (uint32_t delta = 4; delta > 0; delta /= 2) {
+                                amax_lo = fmaxf(amax_lo, __shfl_xor_sync(0xffffffff, amax_lo, delta));
+                                amax_hi = fmaxf(amax_hi, __shfl_xor_sync(0xffffffff, amax_hi, delta));
+                            }
+                            const uint32_t bits_lo = __float_as_uint(amax_lo / 448.0f);
+                            const uint32_t bits_hi = __float_as_uint(amax_hi / 448.0f);
+                            const uint32_t exp_lo = ((bits_lo >> 23) & 255u) + ((bits_lo & 0x7fffffu) != 0);
+                            const uint32_t exp_hi = ((bits_hi >> 23) & 255u) + ((bits_hi & 0x7fffffu) != 0);
+                            const float inv_lo = exp_lo == 255u ? 0.0f : __uint_as_float((254u - exp_lo) << 23);
+                            const float inv_hi = exp_hi == 255u ? 0.0f : __uint_as_float((254u - exp_hi) << 23);
+                            const uint32_t col = n_block_idx * 64 + 2 * pair + (kind == 2 ? kIntermediateHidden : 0);
+                            if (segment == 0) {
+                                scales[static_cast<uint64_t>(pool_block_idx) * width + col] =
+                                    __uint_as_float(exp_lo << 23);
+                                scales[static_cast<uint64_t>(pool_block_idx) * width + col + 1] =
+                                    __uint_as_float(exp_hi << 23);
+                            }
+                            uint4 out_lo, out_hi;
+                            auto* lo = reinterpret_cast<uint32_t*>(&out_lo);
+                            auto* hi = reinterpret_cast<uint32_t*>(&out_hi);
+                            #pragma unroll
+                            for (uint32_t i = 0; i < 4; ++i) {
+                                lo[i] = mono_ep_fp8x4(
+                                    __uint_as_float(words[4 * i] << 16) * inv_lo,
+                                    __uint_as_float(words[4 * i + 1] << 16) * inv_lo,
+                                    __uint_as_float(words[4 * i + 2] << 16) * inv_lo,
+                                    __uint_as_float(words[4 * i + 3] << 16) * inv_lo);
+                                hi[i] = mono_ep_fp8x4(
+                                    __uint_as_float(words[4 * i] & 0xffff0000u) * inv_hi,
+                                    __uint_as_float(words[4 * i + 1] & 0xffff0000u) * inv_hi,
+                                    __uint_as_float(words[4 * i + 2] & 0xffff0000u) * inv_hi,
+                                    __uint_as_float(words[4 * i + 3] & 0xffff0000u) * inv_hi);
+                            }
+                            const uint64_t dst = static_cast<uint64_t>(expert_start) * width +
+                                static_cast<uint64_t>(col) * padded_count + local_row + segment * 16;
+                            *reinterpret_cast<uint4*>(q + dst) = out_lo;
+                            *reinterpret_cast<uint4*>(q + dst + padded_count) = out_hi;
+                        }
+                        // The closing barrier below covers the last kind's scratch reads.
+                        if (kind < 2)
+                            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    }
+                    // Mode 2 skips the global fences: packed h/dZ columns are only read by the wgrad
+                    // GEMM launched after this kernel, so kernel completion already orders them.
+                    if constexpr (kVectorHdzPack != 2 or (kDiagAblate & 64u)) {
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
+                        __threadfence();
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if constexpr (kPhaseTrace and (kDiagAblate & 64u)) {
+                        // Diagnostic self-check: redo the scalar pack and count bytes/scales that differ.
+                        auto* packed_scratch = reinterpret_cast<d_dtype_t*>(shared_storage.quantized_a);
+                        uint32_t mismatches = 0, checked = 0;
+                        for (uint32_t kind = 0; kind < 3; ++kind) {
+                            for (uint32_t linear = epilogue_thread_idx;
+                                 linear < BLOCK_M * 64; linear += kNumEpilogueThreads) {
+                                const uint32_t row = linear / 64;
+                                const uint32_t p = linear % 64;
+                                const uint32_t gate_col = 16 * (p / 8) + p % 8;
+                                const float value = kind < 2 ? static_cast<float>(
+                                    shared_storage.smem_d.raw[row * BLOCK_N + gate_col + kind * 8]) :
+                                    __bfloat162float(shared_storage.backward_epilogue.dh[
+                                        row * BLOCK_N + half * 64 + p]);
+                                packed_scratch[row * 64 + (p ^ (2 * (row & 31)))] =
+                                    d_dtype_t(row < valid_m ? value : 0.0f);
+                            }
+                            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                            for (uint32_t p = epilogue_warp_idx; p < 64; p += kNumEpilogueWarps) {
+                                d_dtype_t values[4];
+                                float amax = 1.0e-4f;
+                                #pragma unroll
+                                for (uint32_t j = 0; j < 4; ++j) {
+                                    const uint32_t row = lane_idx + j * 32;
+                                    values[j] = packed_scratch[row * 64 + (p ^ (2 * (row & 31)))];
+                                    amax = fmaxf(amax, fabsf(static_cast<float>(values[j])));
+                                }
+                                #pragma unroll
+                                for (uint32_t delta = 16; delta > 0; delta /= 2)
+                                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+                                const uint32_t bits = __float_as_uint(amax / 448.0f);
+                                const uint32_t exponent = ((bits >> 23) & 255u) + ((bits & 0x7fffffu) != 0);
+                                const float inv = exponent == 255u ? 0.0f :
+                                    __uint_as_float((254u - exponent) << 23);
+                                const uint32_t width = kind == 0 ? kIntermediateHidden : 2 * kIntermediateHidden;
+                                const uint32_t col = n_block_idx * 64 + p + (kind == 2 ? kIntermediateHidden : 0);
+                                const auto* scales = kind == 0 ? backward.sh_col : backward.sdz_col;
+                                const auto* q = kind == 0 ? backward.qh_col : backward.qdz_col;
+                                if (lane_idx == 0) {
+                                    checked += 1;
+                                    mismatches += __float_as_uint(__ldcg(scales +
+                                        static_cast<uint64_t>(pool_block_idx) * width + col)) != (exponent << 23);
+                                }
+                                const uint64_t dst = static_cast<uint64_t>(expert_start) * width +
+                                    static_cast<uint64_t>(col) * padded_count + local_row + lane_idx;
+                                #pragma unroll
+                                for (uint32_t j = 0; j < 4; ++j) {
+                                    const __nv_fp8_e4m3 expected(static_cast<float>(values[j]) * inv);
+                                    const auto written = __ldcg(reinterpret_cast<const unsigned char*>(q + dst + j * 32));
+                                    checked += 1;
+                                    mismatches += written != expected.__x;
+                                }
+                            }
+                            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        }
+                        trace_add(61, mismatches);
+                        trace_add(63, checked);
+                    }
+                } else if (backward.qh_col != nullptr and not (kDiagAblate & 4u)) {
                     const uint32_t expert_start = pool_m_idx - task_info.m_block_idx * BLOCK_M;
                     const uint32_t padded_count =
                         shared_storage.expert_padded_counts[task_info.local_expert_idx];
@@ -1460,7 +1619,102 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 }
                 trace_mark[2] = trace_clock();
-                if constexpr (kCacheDz and not (kDiagAblate & 8u)) {
+                if constexpr (kCacheDz and kVectorDzQuant != 0 and not (kDiagAblate & 8u)) {
+                    if (half == 1) {
+                        // 8 lanes quantize one 128-column (row, operand) span, 16 contiguous values per lane.
+                        // kVectorDzQuant is the number of 4-span warp steps whose loads are issued together.
+                        constexpr uint32_t kBatch = kVectorDzQuant;
+                        DG_STATIC_ASSERT((BLOCK_M * 2) % (kNumEpilogueWarps * 4 * kBatch) == 0,
+                                         "Vector dZ quantize needs whole warp batches");
+                        const uint32_t scratch_m_idx = backward.qh_col == nullptr ? pool_m_idx : ring_m_idx;
+                        const uint32_t segment = lane_idx % 8;
+                        for (uint32_t base = epilogue_warp_idx * 4 * kBatch; base < BLOCK_M * 2;
+                             base += kNumEpilogueWarps * 4 * kBatch) {
+                            uint4 raw[kBatch][2];
+                            #pragma unroll
+                            for (uint32_t b = 0; b < kBatch; ++b) {
+                                const uint32_t span = base + b * 4 + lane_idx / 8;
+                                const uint32_t column = (span % 2) * kIntermediateHidden +
+                                    task_info.n_cluster_idx * 128 + segment * 16;
+                                const auto* src = reinterpret_cast<const uint4*>(backward.dz_pool +
+                                    static_cast<uint64_t>(scratch_m_idx + span / 2) * (2 * kIntermediateHidden) + column);
+                                raw[b][0] = src[0];
+                                raw[b][1] = src[1];
+                            }
+                            #pragma unroll
+                            for (uint32_t b = 0; b < kBatch; ++b) {
+                                const uint32_t span = base + b * 4 + lane_idx / 8;
+                                const auto* words = reinterpret_cast<const uint32_t*>(raw[b]);
+                                float values[16];
+                                float amax = 1.0e-4f;
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 8; ++i) {
+                                    values[2 * i] = __uint_as_float(words[i] << 16);
+                                    values[2 * i + 1] = __uint_as_float(words[i] & 0xffff0000u);
+                                    amax = fmaxf(amax, fmaxf(fabsf(values[2 * i]), fabsf(values[2 * i + 1])));
+                                }
+                                #pragma unroll
+                                for (uint32_t delta = 4; delta > 0; delta /= 2)
+                                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+                                const uint32_t bits = __float_as_uint(amax / 448.0f);
+                                const uint32_t exponent = ((bits >> 23) & 255u) + ((bits & 0x7fffffu) != 0);
+                                const float inv = exponent == 255u ? 0.0f : __uint_as_float((254u - exponent) << 23);
+                                const uint64_t offset = static_cast<uint64_t>(pool_m_idx + span / 2) * (2 * kIntermediateHidden) +
+                                    (span % 2) * kIntermediateHidden + task_info.n_cluster_idx * 128;
+                                if (segment == 0)
+                                    backward.sdz_pool[offset / 128] = __uint_as_float(exponent << 23);
+                                uint4 out;
+                                auto* packed = reinterpret_cast<uint32_t*>(&out);
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++i)
+                                    packed[i] = mono_ep_fp8x4(values[4 * i] * inv, values[4 * i + 1] * inv,
+                                                                 values[4 * i + 2] * inv, values[4 * i + 3] * inv);
+                                *reinterpret_cast<uint4*>(backward.qdz_pool + offset + segment * 16) = out;
+                            }
+                        }
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
+                        __threadfence();
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        if constexpr (kPhaseTrace and (kDiagAblate & 64u)) {
+                            // Diagnostic self-check: redo the scalar row quantize and count differences.
+                            uint32_t mismatches = 0, checked = 0;
+                            for (uint32_t row = epilogue_thread_idx / 32; row < BLOCK_M; row += kNumEpilogueWarps) {
+                                for (uint32_t operand = 0; operand < 2; ++operand) {
+                                    const uint32_t column = operand * kIntermediateHidden + task_info.n_cluster_idx * 128;
+                                    const uint64_t src_offset = static_cast<uint64_t>(scratch_m_idx + row) * (2 * kIntermediateHidden) + column;
+                                    const uint64_t offset = static_cast<uint64_t>(pool_m_idx + row) * (2 * kIntermediateHidden) + column;
+                                    float values[4];
+                                    float amax = 1.0e-4f;
+                                    #pragma unroll
+                                    for (uint32_t j = 0; j < 4; ++j) {
+                                        values[j] = __bfloat162float(backward.dz_pool[src_offset + lane_idx + j * 32]);
+                                        amax = fmaxf(amax, fabsf(values[j]));
+                                    }
+                                    #pragma unroll
+                                    for (uint32_t delta = 16; delta > 0; delta /= 2)
+                                        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+                                    const uint32_t bits = __float_as_uint(amax / 448.0f);
+                                    const uint32_t exponent = ((bits >> 23) & 255u) + ((bits & 0x7fffffu) != 0);
+                                    const float inv = exponent == 255u ? 0.0f : __uint_as_float((254u - exponent) << 23);
+                                    if (lane_idx == 0) {
+                                        checked += 1;
+                                        mismatches += __float_as_uint(__ldcg(backward.sdz_pool + offset / 128)) != (exponent << 23);
+                                    }
+                                    #pragma unroll
+                                    for (uint32_t j = 0; j < 4; ++j) {
+                                        const __nv_fp8_e4m3 expected(values[j] * inv);
+                                        const auto written = __ldcg(reinterpret_cast<const unsigned char*>(
+                                            backward.qdz_pool + offset + lane_idx + j * 32));
+                                        checked += 1;
+                                        mismatches += written != expected.__x;
+                                    }
+                                }
+                            }
+                            trace_add(62, mismatches);
+                            trace_add(63, checked);
+                        }
+                    }
+                } else if constexpr (kCacheDz and not (kDiagAblate & 8u)) {
                     if (half == 1) {
                         for (uint32_t row = epilogue_thread_idx / 32; row < BLOCK_M; row += kNumEpilogueWarps) {
                             for (uint32_t operand = 0; operand < 2; ++operand) {
