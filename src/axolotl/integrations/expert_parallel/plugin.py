@@ -122,6 +122,28 @@ def per_rank_expert_mesh(mesh, device_type: str):
     return root[("dp_replicate", "dp_shard")] if replicate > 1 else root["dp_shard"]
 
 
+def _apply_gate_is_plain(experts) -> bool:
+    """Whether an overridden ``_apply_gate`` still computes ``act_fn(gate) * up``.
+
+    Beam routes the plain SwiGLU through an FP32 override; a numeric probe tells
+    that apart from a different gating function without naming model types.
+    """
+    act_fn = getattr(experts, "act_fn", None)
+    if act_fn is None:
+        return False
+    probe = torch.linspace(-6.0, 6.0, 64, dtype=torch.float32).reshape(2, 32)
+    try:
+        with torch.no_grad():
+            got = experts._apply_gate(probe)
+    except (RuntimeError, TypeError, ValueError, AttributeError, IndexError):
+        return False
+    gate, up = probe.chunk(2, dim=-1)
+    want = act_fn(gate) * up
+    return tuple(got.shape) == tuple(want.shape) and torch.allclose(
+        got.float(), want, atol=1e-5, rtol=1e-5
+    )
+
+
 class ExpertParallelPlugin(BasePlugin):
     """Plugin that swaps MoE dispatch/combine for expert-parallel token dispatch."""
 
@@ -535,7 +557,9 @@ class ExpertParallelPlugin(BasePlugin):
         if apply_gate is not None and clamp is None:
             from transformers.integrations.moe import _default_apply_gate
 
-            if apply_gate is not _default_apply_gate:
+            if apply_gate is not _default_apply_gate and not _apply_gate_is_plain(
+                experts
+            ):
                 return "custom", None, "custom gated activation (_apply_gate)"
         act_fn = getattr(experts, "act_fn", None)
         silu = isinstance(act_fn, (torch.nn.SiLU, SiLUActivation))
@@ -664,8 +688,7 @@ class ExpertParallelPlugin(BasePlugin):
             top_k=geometry.top_k,
             hidden=geometry.hidden,
             intermediate=geometry.intermediate,
-            precision=getattr(cfg, "expert_parallel_mono_ep_precision", None)
-            or "auto",
+            precision=getattr(cfg, "expert_parallel_mono_ep_precision", None) or "auto",
             reserved_sms=DEFAULT_RESERVED_SMS,
             activation_clamp=geometry.activation_clamp,
         )

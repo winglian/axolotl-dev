@@ -339,6 +339,45 @@ class TestModelFallback:
         )
         assert geometry is None and match in reason
 
+    def test_fp32_plain_gate_override_is_accepted(
+        self, mono_ep_package, cuda_capability
+    ):
+        cuda_capability((9, 0))
+        model = _qwen3_model()
+        experts = model.mlp.experts
+
+        def _apply_gate(self, gate_up):
+            gate, up = gate_up.chunk(2, dim=-1)
+            return (self.act_fn(gate.float()) * up.float()).to(gate.dtype)
+
+        experts.__class__ = type(
+            "BeamLikeExperts", (type(experts),), {"_apply_gate": _apply_gate}
+        )
+        cfg = _cfg()
+        ExpertParallelPlugin().post_model_build(cfg, model)
+        assert cfg.expert_parallel_backend == "mono_ep"
+        assert experts_fn.get_backend() == "mono_ep"
+
+    def test_different_gate_override_falls_back(
+        self, mono_ep_package, cuda_capability, caplog
+    ):
+        cuda_capability((9, 0))
+        model = _qwen3_model()
+        experts = model.mlp.experts
+
+        def _apply_gate(self, gate_up):
+            gate, up = gate_up.chunk(2, dim=-1)
+            return torch.nn.functional.gelu(gate) * up
+
+        experts.__class__ = type(
+            "GeluGateExperts", (type(experts),), {"_apply_gate": _apply_gate}
+        )
+        cfg = _cfg()
+        with caplog.at_level("WARNING"):
+            ExpertParallelPlugin().post_model_build(cfg, model)
+        assert "custom gated activation" in caplog.text
+        assert cfg.expert_parallel_backend == "torch"
+
     @pytest.mark.parametrize("capability", [(9, 0), (10, 0)])
     def test_supported_model_keeps_backend(
         self, mono_ep_package, cuda_capability, capability
@@ -365,9 +404,7 @@ class TestRuntimeLifecycle:
             ExpertParallelPlugin, "_resolve_ep_group", staticmethod(lambda cfg: group)
         )
         plugin = ExpertParallelPlugin()
-        plugin._mono_ep_geometry = plugin_mod.MonoEPGeometry(
-            8, 512, 1024, 2, None
-        )
+        plugin._mono_ep_geometry = plugin_mod.MonoEPGeometry(8, 512, 1024, 2, None)
         cfg.activation_checkpointing = {"enabled": False}
         plugin.post_model_load(cfg, torch.nn.Linear(2, 2))
         return plugin, group
@@ -422,9 +459,7 @@ class TestRuntimeLifecycle:
 
 class TestDistributedEnv:
     @pytest.mark.parametrize("replicate,ctas", [(None, "8"), (1, "8"), (2, "5")])
-    def test_mono_ep_exports_nccl_max_ctas(
-        self, mono_ep_package, replicate, ctas
-    ):
+    def test_mono_ep_exports_nccl_max_ctas(self, mono_ep_package, replicate, ctas):
         env = ExpertParallelPlugin().get_distributed_env(
             _cfg(dp_replicate_size=replicate)
         )
