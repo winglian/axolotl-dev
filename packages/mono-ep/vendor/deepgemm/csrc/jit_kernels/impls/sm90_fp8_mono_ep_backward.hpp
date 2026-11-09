@@ -169,7 +169,15 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(dscore_selector == nullptr or std::string_view(dscore_selector) == "0" or
         std::string_view(dscore_selector) == "1");
     const bool dscore_warp_reduce = dscore_selector != nullptr and std::string_view(dscore_selector) == "1";
-    const std::string diag_suffix = dscore_warp_reduce
+    const char* xdy_selector = std::getenv("MONO_EP_SM90_FP8_XDY_VECTOR_PACK");
+    DG_HOST_ASSERT(xdy_selector == nullptr or std::string_view(xdy_selector) == "0" or
+        std::string_view(xdy_selector) == "1");
+    const bool xdy_vector_pack = xdy_selector != nullptr and std::string_view(xdy_selector) == "1";
+    DG_HOST_ASSERT(not xdy_vector_pack or (transport_fp8 and cached));
+    const std::string diag_suffix = xdy_vector_pack
+        ? std::format(", {}, {}u, {}, true", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
+            dscore_warp_reduce ? "true" : "false")
+        : dscore_warp_reduce
         ? std::format(", {}, {}u, true", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
         : diag_ablate != 0
         ? std::format(", {}, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
@@ -192,7 +200,7 @@ static void fp8_mono_ep_backward_sm90(
             transport_fp8 ? (fp8_combine ? "fp8transport_fp8combine" : "fp8transport_bf16combine") : "bf16transport",
             phase_trace_ptr != 0 ? "_phasetrace" : "",
             (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
-                (dscore_warp_reduce ? "_dscorewarp" : "")),
+                (dscore_warp_reduce ? "_dscorewarp" : "") + (xdy_vector_pack ? "_xdyvec" : "")),
         std::format(R"({}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{

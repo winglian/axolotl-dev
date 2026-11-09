@@ -46,6 +46,7 @@ template <
     bool kPhaseTrace = false,
     uint32_t kDiagAblate = 0,
     bool kWarpReduceDscore = false,
+    bool kVectorXdyPack = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -85,6 +86,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     DG_STATIC_ASSERT(not kHasShared and kOwnMBlocks, "Backward requires owned routed blocks");
     DG_STATIC_ASSERT(not kCacheDz or kCacheActivations, "dZ cache requires cached activation staging");
+    DG_STATIC_ASSERT(not kVectorXdyPack or (kTransportFP8 and kCacheActivations),
+                     "Vectorized x/dy pack reads the cached FP8 pools");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     constexpr uint32_t kNumLocalityDomains = 1;
 
@@ -1175,6 +1178,110 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 __threadfence();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             };
+            // Same numerics as pack_cached_columns (max reductions are order free), restaged per
+            // 128-column scale group with 16-byte loads/stores; reuses smem_d.raw, so the caller
+            // must have consumed the dh accumulator first.
+            auto pack_cached_xdy_vectorized = [&]() {
+                constexpr uint32_t kChunk = 128;
+                constexpr uint32_t kChunkBytes = BLOCK_M * kChunk;
+                constexpr uint32_t kNumVectors = 2 * kChunkBytes / 16;
+                DG_STATIC_ASSERT(sizeof(shared_storage.smem_d) >= 2 * kChunkBytes, "x/dy staging needs 32 KB");
+                DG_STATIC_ASSERT(sizeof(shared_storage.quantized_a) >= 2 * BLOCK_M * sizeof(float), "scale staging");
+                DG_STATIC_ASSERT(kNumEpilogueThreads == 256 and BLOCK_M == 128 and kHidden % kChunk == 0,
+                                 "vectorized x/dy pack assumes 8 warps over 128x128 chunks");
+                DG_STATIC_ASSERT(kNumVectors % kNumEpilogueThreads == 0, "Invalid staging split");
+                const uint32_t expert_start = pool_m_idx - task_info.m_block_idx * BLOCK_M;
+                const uint32_t padded_count = shared_storage.expert_padded_counts[task_info.local_expert_idx];
+                const uint32_t local_row = pool_m_idx - expert_start;
+                auto* stage = reinterpret_cast<uint8_t*>(shared_storage.smem_d.raw);
+                auto* stage_scales = reinterpret_cast<float*>(shared_storage.quantized_a);
+                const uint8_t* sources[2] = {backward.qx_pool, backward.qdy_pool};
+                const float* source_scales[2] = {backward.sx_pool, backward.sdy_pool};
+                uint8_t* packed[2] = {backward.qx_col, backward.qdy_col};
+                float* packed_scales[2] = {backward.sx_col, backward.sdy_col};
+                const uint32_t col_group = 4 * epilogue_warp_idx + lane_idx / 8;
+                const uint32_t row_group = lane_idx % 8;
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                for (uint32_t chunk = 0; chunk < kHidden / kChunk; ++chunk) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumVectors / kNumEpilogueThreads; ++i) {
+                        const uint32_t linear = epilogue_thread_idx + i * kNumEpilogueThreads;
+                        const uint32_t tensor = linear / (kChunkBytes / 16);
+                        const uint32_t row = (linear / 8) % BLOCK_M;
+                        const uint32_t vec = linear % 8;
+                        uint4 value = make_uint4(0, 0, 0, 0);
+                        if (row < valid_m)
+                            value = *reinterpret_cast<const uint4*>(sources[tensor] +
+                                static_cast<uint64_t>(pool_m_idx + row) * kHidden + chunk * kChunk + vec * 16);
+                        *reinterpret_cast<uint4*>(stage + tensor * kChunkBytes + row * kChunk +
+                            ((vec ^ ((row / 16) % 8)) * 16)) = value;
+                    }
+                    {
+                        const uint32_t tensor = epilogue_thread_idx / BLOCK_M;
+                        const uint32_t row = epilogue_thread_idx % BLOCK_M;
+                        stage_scales[epilogue_thread_idx] = row < valid_m
+                            ? source_scales[tensor][static_cast<uint64_t>(pool_m_idx + row) * (kHidden / 128) + chunk]
+                            : 0.0f;
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    #pragma unroll
+                    for (uint32_t tensor = 0; tensor < 2; ++tensor) {
+                        const auto* words = reinterpret_cast<const uint32_t*>(stage + tensor * kChunkBytes);
+                        const uint32_t word_idx = col_group ^ (4 * row_group);
+                        const float* row_scales = stage_scales + tensor * BLOCK_M + row_group * 16;
+                        auto dequant = [&](uint32_t word, uint32_t k, float scale) {
+                            __nv_fp8_e4m3 fp8;
+                            fp8.__x = static_cast<__nv_fp8_storage_t>((word >> (8 * k)) & 0xffu);
+                            return __bfloat162float(__float2bfloat16_rn(static_cast<float>(fp8) * scale));
+                        };
+                        float amax[4] = {1.0e-4f, 1.0e-4f, 1.0e-4f, 1.0e-4f};
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 16; ++j) {
+                            const uint32_t word = words[(row_group * 16 + j) * (kChunk / 4) + word_idx];
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 4; ++k)
+                                amax[k] = fmaxf(amax[k], fabsf(dequant(word, k, row_scales[j])));
+                        }
+                        float inv[4], scale_out[4];
+                        #pragma unroll
+                        for (uint32_t k = 0; k < 4; ++k) {
+                            #pragma unroll
+                            for (uint32_t delta = 1; delta < 8; delta *= 2)
+                                amax[k] = fmaxf(amax[k], __shfl_xor_sync(0xffffffff, amax[k], delta));
+                            const uint32_t bits = __float_as_uint(amax[k] / 448.0f);
+                            const uint32_t exponent = ((bits >> 23) & 255u) + ((bits & 0x7fffffu) != 0);
+                            inv[k] = exponent == 255u ? 0.0f : __uint_as_float((254u - exponent) << 23);
+                            scale_out[k] = __uint_as_float(exponent << 23);
+                        }
+                        const uint32_t col = chunk * kChunk + 4 * col_group;
+                        if (row_group == 0)
+                            *reinterpret_cast<float4*>(packed_scales[tensor] +
+                                static_cast<uint64_t>(pool_block_idx) * kHidden + col) =
+                                make_float4(scale_out[0], scale_out[1], scale_out[2], scale_out[3]);
+                        uint32_t out[4][4] = {};
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 16; ++j) {
+                            const uint32_t word = words[(row_group * 16 + j) * (kChunk / 4) + word_idx];
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 4; ++k) {
+                                const __nv_fp8_e4m3 q(dequant(word, k, row_scales[j]) * inv[k]);
+                                out[k][j / 4] |= static_cast<uint32_t>(q.__x) << (8 * (j % 4));
+                            }
+                        }
+                        #pragma unroll
+                        for (uint32_t k = 0; k < 4; ++k) {
+                            const uint64_t dst = static_cast<uint64_t>(expert_start) * kHidden +
+                                static_cast<uint64_t>(col + k) * padded_count + local_row + row_group * 16;
+                            *reinterpret_cast<uint4*>(packed[tensor] + dst) =
+                                make_uint4(out[k][0], out[k][1], out[k][2], out[k][3]);
+                        }
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+                __threadfence();
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            };
             if (is_dh) {
                 if (task_info.n_cluster_idx == 0) {
                     const auto expected = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
@@ -1182,7 +1289,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     trace_mark[1] = trace_clock();
                     for (uint32_t row = epilogue_thread_idx; row < BLOCK_M; row += kNumEpilogueThreads)
                         shared_storage.dscore[row] = 0.0f;
-                    if constexpr (kDiagAblate & 1u) {
+                    if constexpr ((kDiagAblate & 1u) or kVectorXdyPack) {
                     } else if constexpr (kTransportFP8) {
                         pack_cached_columns(backward.qx_pool, backward.sx_pool,
                                             backward.qx_col, backward.sx_col);
@@ -1202,6 +1309,12 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     shared_storage.backward_epilogue.dh[linear] = row < valid_m
                         ? __float2bfloat16_rn(static_cast<float>(shared_storage.smem_d.raw[linear]))
                         : __float2bfloat16_rn(0.0f);
+                }
+                if constexpr (kVectorXdyPack and not (kDiagAblate & 1u)) {
+                    if (task_info.n_cluster_idx == 0) {
+                        pack_cached_xdy_vectorized();
+                        trace_mark[2] = trace_clock();
+                    }
                 }
             } else if (not is_dx) {
                 for (uint32_t linear = epilogue_thread_idx; linear < BLOCK_M * (BLOCK_N / 2);
