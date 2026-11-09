@@ -1,0 +1,7 @@
+recursive-include vendor *
+recursive-include tools *.py
+recursive-include examples *.py
+prune vendor/deepgemm/third-party
+prune vendor/deepgemm/build
+prune vendor/deepgemm/dist
+global-exclude __pycache__ *.pyc

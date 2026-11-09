@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Axolotl AI
+
+"""Qwen3-30B-A3B FP8 native/NCCL training timing on one eight-GPU Hopper node."""
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import modal
+
+TIMING_GPU = os.getenv("MONO_EP_TIMING_GPU", "H200")
+if TIMING_GPU not in ("H100", "H200"):
+    raise ValueError("MONO_EP_TIMING_GPU must be H100 or H200")
+app = modal.App(f"axolotl-{TIMING_GPU.lower()}-persistent-fp8-timing")
+image = None
+if modal.is_local():
+    from modal_validate import base_image
+
+    root = Path(__file__).resolve().parents[1]
+    source = Path(os.environ.get("MONO_EP_SOURCE_DIR", root / "src"))
+    image = base_image.add_local_dir(source, "/probe/src").add_local_file(
+        root / "examples/benchmark_persistent_training.py", "/probe/benchmark.py"
+    )
+
+
+def _benchmark(
+    profile: bool = False,
+    compare_forward_layouts: bool = False,
+    compare_kernel_layouts: bool = False,
+    fp8_transport: bool = False,
+    fp8_combine: bool = False,
+    trap_timeouts: bool = False,
+    expected_gpu: str = "H200",
+):
+    import torch
+
+    actual_gpu = torch.cuda.get_device_name()
+    if expected_gpu not in actual_gpu:
+        raise RuntimeError(f"Expected {expected_gpu}, allocated {actual_gpu}")
+    if fp8_combine and not fp8_transport:
+        raise ValueError("FP8 combine requires FP8 input transport")
+    result = subprocess.run(
+        [
+            "python",
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=8",
+            "/probe/benchmark.py",
+            "--compute-dtype",
+            "blockwise",
+            "--recompute",
+            "--compare-native",
+            "--compiled",
+            *(["--profile"] if profile else []),
+            *(["--compare-forward-layouts"] if compare_forward_layouts else []),
+            *(["--compare-kernel-layouts"] if compare_kernel_layouts else []),
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": "/probe/src",
+            "OMP_NUM_THREADS": "1",
+            "MONO_EP_SM90_FP8_TRAP_TIMEOUTS": "1" if trap_timeouts else "0",
+            "MONO_EP_SM90_FP8_TRANSPORT": "1" if fp8_transport else "0",
+            "MONO_EP_SM90_FP8_COMBINE": "1" if fp8_combine else "0",
+        },
+        capture_output=True,
+        text=True,
+        timeout=1700,
+        check=False,
+    )
+    return dict(
+        returncode=result.returncode, stdout=result.stdout, stderr=result.stderr
+    )
+
+
+@app.function(image=image, gpu="H100!:8", cpu=32, memory=131072, timeout=1800)
+def benchmark_h100(*args):
+    return _benchmark(*args, expected_gpu="H100")
+
+
+@app.function(image=image, gpu="H200:8", cpu=32, memory=131072, timeout=1800)
+def benchmark_h200(*args):
+    return _benchmark(*args, expected_gpu="H200")
+
+
+@app.local_entrypoint()
+def main(
+    gpu: str = "H200",
+    profile: bool = False,
+    compare_forward_layouts: bool = False,
+    compare_kernel_layouts: bool = False,
+    fp8_transport: bool = False,
+    fp8_combine: bool = False,
+    trap_timeouts: bool = False,
+):
+    if compare_forward_layouts and compare_kernel_layouts:
+        raise ValueError(
+            "Forward-layout and kernel-layout comparisons are separate runs"
+        )
+    if fp8_combine and not fp8_transport:
+        raise ValueError("--fp8-combine requires --fp8-transport")
+    if gpu not in ("H100", "H200"):
+        raise ValueError("gpu must be H100 or H200")
+    benchmark = benchmark_h100 if gpu == "H100" else benchmark_h200
+    result = benchmark.remote(
+        profile,
+        compare_forward_layouts,
+        compare_kernel_layouts,
+        fp8_transport,
+        fp8_combine,
+        trap_timeouts,
+    )
+    print(json.dumps(result))
+    if result["returncode"]:
+        raise RuntimeError(f"{gpu} native FP8 timing failed")

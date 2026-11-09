@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mono-ep"
+version = "0.0.1"
+description = "Experimental DeepGEMM-based expert-parallel MoE training kernels"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "vendor/deepgemm/LICENSE", "vendor/sonic-moe/LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Axolotl AI" }]
+dependencies = ["torch>=2.9", "triton>=3.4"]
+
+[project.optional-dependencies]
+sonic = ["transformers>=5.8", "kernels", "nvidia-cutlass-dsl==4.8.0"]
+sonic-fp8-experimental = [
+    "sonic-moe @ git+https://github.com/bdepyzy/sonic-moe.git@1630585e1ff121cf21df9d700f37d8d4ee88e445",
+    "quack-kernels==0.6.5",
+    "nvidia-cutlass-dsl==4.8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: requires a CUDA GPU", "gpu_blackwell: requires Hopper or Blackwell", "slow: extended kernel compilation or validation"]
+
+[tool.setuptools.package-data]
+mono_ep = ["include/*.cuh", "include/*.cpp", "include/*.cu"]

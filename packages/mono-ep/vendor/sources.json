@@ -1,0 +1,93 @@
+{
+  "deepgemm": {
+    "url": "https://github.com/deepseek-ai/DeepGEMM.git",
+    "revision": "5081f8513af57e61696de4f4f04b0e707ffb503e",
+    "license": "MIT",
+    "excluded": [
+      ".github",
+      "tests"
+    ],
+    "local_modifications": [
+      "BF16 SwiGLU backward epilogue with gate/up gradients and deterministic score-gradient partial sums",
+      "Host bindings and SM100 normal/swap-AB epilogue store hooks",
+      "Experimental SM100 BF16 aligned-chunk readiness queue with system-acquire polling and CTA-staged descriptors",
+      "Expose existing SwiGLU backward epilogue through readiness-queue GEMM",
+      "Experimental SM100 E4M3 aligned-chunk queue with prepacked UE8M0 scales and readiness covering values and scales",
+      "SM100 grouped E4M3 GEMM with in-kernel system-acquire readiness, including the fused SwiGLU backward epilogue",
+      "Experimental SM100 grouped E4M3 forward peer scatter-add epilogue with system-scope CTA completion publication",
+      "Scatter epilogue bypasses scratch shared-memory staging and TMA output stores while preserving tensor-memory release and system publication",
+      "Warp register transposition for adjacent-column peer atomics in normal and swap-AB scatter epilogues",
+      "Add an exclusive-destination scatter-store epilogue to avoid remote atomics when each routed assignment owns a distinct output slot",
+      "Support BF16 exclusive scatter-store output while retaining FP32 atomic accumulation",
+      "Reduce and store SwiGLU score-gradient partials inside the derivative loop to shorten register lifetimes",
+      "Skip SwiGLU derivative epilogues on empty expert tiles, preserving caller-zeroed gradient outputs",
+      "Bound readiness-aware SM100 GEMM scheduling by acquired expert descriptors without changing allocation or host counts",
+      "Optionally bound SM100 scatter GEMM scheduling by a GPU row end while retaining all CTA completion publications",
+      "SM100 grouped BF16 readiness entry point with acquired GPU row bounds",
+      "SM100 grouped BF16 peer scatter/store epilogue with GPU row bounds and all-CTA completion publication",
+      "BF16 interleaved gate/up SwiGLU forward epilogue writes weighted activations and concatenated saved projections directly, bypassing TMA scratch stores",
+      "Vectorize normal-layout BF16 SwiGLU forward epilogue into four-value stores for saved gate/up and weighted activations",
+      "Warp register/row permutation coalesces swap-AB fused BF16 SwiGLU forward stores into adjacent four-value vectors",
+      "Opt-in SM100 incremental expert-ready tile scheduler with per-descriptor system-acquire admission and preserved cluster-aligned tile pairs",
+      "SM90 grouped BF16 incremental readiness with system-acquire admission and single-CTA clusters for arbitrary tile-aligned chunk boundaries",
+      "Optional SM100 BF16 persistent-forward gate/up retention keyed by original rank/token/top-k slot, with caller-owned lifetime and host shape validation",
+      "SM90 readiness-aware BF16 SwiGLU backward epilogue with weighted activation, gate/up gradients, and score partials",
+      "SM90 readiness-aware interleaved BF16 SwiGLU forward epilogue with separate raw GEMM scratch and tile-local gate/up deinterleaving",
+      "SM90 grouped blockwise E4M3 incremental readiness with pretransformed FP32 scales and single-CTA clusters",
+      "Optional SM100 MXFP8 persistent-forward gate/up retention keyed by original rank/token/top-k slot, preserving caller-owned activation lifetime",
+      "Parameterize persistent mono-ep scheduling for one-CTA SM90 consumers while preserving two-CTA SM100 defaults",
+      "SM100 BF16 recompute SwiGLU derivative epilogue consumes rounded gate/up accumulators and precomputed dH to emit h, dz and score partials without storing z",
+      "Apply masked M-group tile suppression to direct-output BF16 SwiGLU forward/recompute epilogues as well as the saved-z derivative epilogue",
+      "Prototype SM90 persistent BF16 mono-ep forward with one-CTA scheduling, WGMMA register accumulation, and canonical shared-memory L1/L2 epilogues",
+      "Add experimental BF16 direct-peer assignment scatter epilogue for dX GEMM output; not yet integrated or GPU validated.",
+      "SM90 persistent BF16 mono-ep backward with one-CTA M-block ownership, WGMMA accumulation, CTA-local dH recompute, and architecture-gated host/runtime dispatch",
+      "SM90 BF16 K-grouped weight gradients consume GPU-resident expert starts and prefix ends with device-side capacity validation and no host size synchronization",
+      "SM90 persistent blockwise E4M3 forward and owned-M-block backward with default BF16 transport, opt-in lifetime-owned FP8 x/dy transport, per-row activation scales, direct column-scaled weight-gradient operands, and checked native host launchers",
+      "SM90 FP8 grouped NT weight-gradient capacity API consumes GPU padded sizes and MN-major physical scales; optional post-PDL device bounds validation preserves existing host-size path",
+      "SM90 persistent blockwise E4M3 forward caches input and routed L1 values plus L1-produced activations with rowwise FP32 scales while preserving BF16 activations for backward weight gradients and combine storage",
+      "SM90 backward dispatch caches E4M3 X/dY and the owned recompute epilogue caches dZ once per K128 tile while retaining BF16 pools for grouped weight gradients",
+      "Opt-in trap-only timeout diagnostics preserve timeout checks and failures for compiler experiments; default verbose diagnostics unchanged",
+      "Opt-in SM90 FP8 compact forward warp layout with call-time experimental host selection; validated 512-thread default preserved",
+      "Opt-in SM90 FP8 compact backward warp layout preserving owned M-block scheduling and cached-activation publication",
+      "Opt-in SM90 FP8 host timeout-diagnostic selection with separate JIT variants; default diagnostics and timeout checks preserved",
+      "Opt-in SM90 FP8 per-route combine storage quantizes BF16-rounded weighted contributions by K128, accumulates decoded routes in FP32, and exposes layout-derived diagnostic views",
+      "SM90 direct weight-gradient h/dG/dU column packing stages BF16 values through a bank-swizzled shared tile before warp-cooperative FP8 quantization",
+      "Opt-in SM90 FP8 forward consumes original-layout W1 through paired gate/up 64-row TMA loads and canonical gate/up accumulator columns; interleaved default preserved",
+      "Experimental SM90 backward x/dY column packing explicitly converts BF16 sources into 64-column bank-swizzled shared tiles for contiguous packed FP8 row stores",
+      "SM90 packed wgrad epilogue reuses its BF16 h/dz values in dead gate/up/dh shared slots instead of recomputing SwiGLU for each column operand"
+    ],
+    "dependencies": {
+      "cutlass": {
+        "url": "https://github.com/NVIDIA/cutlass.git",
+        "revision": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+      },
+      "deep_jit": {
+        "url": "https://github.com/deepseek-ai/DeepJIT.git",
+        "revision": "2efdab421e1cfb17fe8bc20e11ca72aa6d0e6c43"
+      }
+    },
+    "design_references": [
+      {
+        "url": "https://github.com/PFCCLab/TeraMoE",
+        "deepgemm_revision": "967046ae96fae618dd005980a1b61546f5deb774",
+        "license": "MIT",
+        "scope": "BF16 chunk queue and scheduler design adapted to current DeepJIT and epilogue APIs; original DeepSeek MIT notice retained"
+      }
+    ]
+  },
+  "sonic_fp8": {
+    "url": "https://github.com/bdepyzy/sonic-moe.git",
+    "revision": "1630585e1ff121cf21df9d700f37d8d4ee88e445",
+    "license": "Apache-2.0",
+    "source": "sonicmoe/functional/__init__.py",
+    "destination": "src/mono_ep/_vendor/sonic_fp8.py",
+    "local_modifications": [
+      "Extract expert projection autograd functions and general routing entrypoint",
+      "Use installed SonicMoE metadata/backward primitives via absolute imports",
+      "Remove pointer/version weight cache",
+      "Disable GEMM autotuning to avoid invalid SM100 FP8 tiles",
+      "Fuse FP8 up-projection, FP32 descaling and gated activation using Quack alpha epilogue",
+      "Fold down-projection, input-gradient and both weight-gradient descales into FP32 GEMM epilogues"
+    ]
+  }
+}
