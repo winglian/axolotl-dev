@@ -52,7 +52,6 @@ template <
     bool kFP8Combine = false,
     bool kPhaseTrace = false,
     uint32_t kDiagAblate = 0,
-    bool kWarpReduceDscore = false,
     bool kVectorXdyPack = false,
     uint32_t kVectorHdzPack = 0,
     uint32_t kVectorDzQuant = 0,
@@ -196,7 +195,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             alignas(kSharedMemoryAlignment) d_dtype_t raw[BLOCK_M * BLOCK_N];
         } smem_d;
         epilogue::MoEBackwardTileEpilogue<BLOCK_M> backward_epilogue;
-        float dscore[BLOCK_M];
+        float dscore[2][BLOCK_M];
         alignas(kSharedMemoryAlignment) a_dtype_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K];
         alignas(kSharedMemoryAlignment) b_dtype_t smem_b[kNumStages][LOAD_BLOCK_N * BLOCK_K];
         alignas(kSharedMemoryAlignment) __nv_fp8_e4m3 quantized_a[BLOCK_M * BLOCK_K];
@@ -336,7 +335,16 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                          "Too many registers");
     }
 
+#ifndef DG_MonoEP_ROLE_SCOPED_REGISTERS
+#define DG_MonoEP_ROLE_SCOPED_REGISTERS 0
+#endif
+    // ptxas drops every setmaxnreg (C7507) when a CFG path leads from a dealloc to the
+    // math role; the role-scoped layout places each directive inside its warpgroup's branch.
+    DG_STATIC_ASSERT(not DG_MonoEP_ROLE_SCOPED_REGISTERS or not kCompactNonMath,
+                     "Role-scoped registers require the 512-thread layout");
+
     // setmaxnreg must execute uniformly across each warpgroup.
+#if !DG_MonoEP_ROLE_SCOPED_REGISTERS
     if constexpr (kCompactNonMath) {
         if (warp_idx < 4)
             cutlass::arch::warpgroup_reg_dealloc<88>();
@@ -350,6 +358,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
         else
             cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
     }
+#endif
 
     // Grid sync index assignments (dispatch and epilogue use separate counters to avoid conflicts)
     constexpr uint32_t kDispatchGridSyncIndex = 0;
@@ -357,6 +366,9 @@ sm90_fp8_mono_ep_backward_impl(void* y,
 
     // Different warp roles
     if (warp_idx < kNumDispatchWarps) {
+#if DG_MonoEP_ROLE_SCOPED_REGISTERS
+        cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+#endif
         // Dispatch warps
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
@@ -822,7 +834,13 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+#if DG_MonoEP_ROLE_SCOPED_REGISTERS
+    } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
+        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        if (warp_idx == kNumDispatchWarps) {
+#else
     } else if (warp_idx == kNumDispatchWarps) {
+#endif
         // GEMM TMA load warp for tokens
         task_info_t task_info;
         uint64_t trace_l1_spin = 0, trace_l2_spin = 0, trace_a_empty = 0;
@@ -930,7 +948,13 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             scheduler.template mainloop_owned<true>();
         else
             scheduler.mainloop(num_tokens, sm_locality_domains);
+#if DG_MonoEP_ROLE_SCOPED_REGISTERS
+        }
+    } else {
+        cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
+#else
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
+#endif
         // GEMM epilogue warps
         const auto epilogue_warp_idx = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
         const auto epilogue_wg_idx = epilogue_warp_idx / 4;
@@ -1347,8 +1371,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     const auto expected = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
                     while (ptx::ld_acq(workspace.get_l2_empty_count_ptr(ring_block_idx)) != expected) {}
                     trace_mark[1] = trace_clock();
-                    for (uint32_t row = epilogue_thread_idx; row < BLOCK_M; row += kNumEpilogueThreads)
-                        shared_storage.dscore[row] = 0.0f;
+                    for (uint32_t i = epilogue_thread_idx; i < 2 * BLOCK_M; i += kNumEpilogueThreads)
+                        shared_storage.dscore[i / BLOCK_M][i % BLOCK_M] = 0.0f;
                     if constexpr ((kDiagAblate & 1u) or kVectorXdyPack) {
                     } else if constexpr (kTransportFP8) {
                         pack_cached_columns(backward.qx_pool, backward.sx_pool,
@@ -1377,50 +1401,76 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     }
                 }
             } else if (not is_dx) {
-                for (uint32_t linear = epilogue_thread_idx; linear < BLOCK_M * (BLOCK_N / 2);
-                     linear += kNumEpilogueThreads) {
-                    const uint32_t row = linear / (BLOCK_N / 2);
-                    const uint32_t p = linear % (BLOCK_N / 2);
-                    const uint32_t gate_col = 16 * (p / 8) + p % 8;
-                    const float gate = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col]);
-                    const float up = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8]);
-                    const float dh = __bfloat162float(
-                        shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p]);
-                    const float score = row < valid_m
-                        ? buffer.l1_topk_weights_buffer.get_base_ptr<float>()[ring_m_idx + row] : 0.0f;
-                    const float sigmoid = 1.0f / (1.0f + expf(-gate));
-                    const float silu = gate * sigmoid;
-                    const float h = silu * up * score;
-                    const float dg = dh * score * up * (sigmoid + silu * (1.0f - sigmoid));
-                    const float du = dh * score * silu;
-                    const uint32_t n = n_block_idx * 64 + p;
-                    const uint32_t scratch_m_idx = backward.qh_col == nullptr ? pool_m_idx : ring_m_idx;
-                    const uint64_t scratch = static_cast<uint64_t>(scratch_m_idx + row);
-                    const bool valid = row < valid_m;
-                    backward.h_pool[scratch * kIntermediateHidden + n] = __float2bfloat16_rn(valid ? h : 0.0f);
-                    backward.dz_pool[scratch * (2 * kIntermediateHidden) + n] = __float2bfloat16_rn(valid ? dg : 0.0f);
-                    backward.dz_pool[scratch * (2 * kIntermediateHidden) + kIntermediateHidden + n] =
-                        __float2bfloat16_rn(valid ? du : 0.0f);
-                    if constexpr (kWarpReduceDscore) {
-                        // A warp covers 32 columns of one row, so reduce before the shared atomic.
-                        DG_STATIC_ASSERT((BLOCK_N / 2) % 32 == 0 and kNumEpilogueThreads % (BLOCK_N / 2) == 0,
-                                         "dscore warp reduction needs row-uniform warps");
-                        float contribution = valid ? dh * silu * up : 0.0f;
+                // Reduce-scatter kChunk per-lane values across the warp: after log2(kChunk) halving
+                // steps lane bits [5 - log2(kChunk), 5) select the entry, butterflies finish the sum.
+                const auto reduce_scatter = [&](auto& values) {
+                    constexpr uint32_t kChunk = sizeof(values) / sizeof(float);
+                    #pragma unroll
+                    for (uint32_t width = kChunk / 2, delta = 16; width > 0; width /= 2, delta /= 2) {
+                        const bool upper = lane_idx & delta;
                         #pragma unroll
-                        for (uint32_t delta = 16; delta > 0; delta /= 2)
-                            contribution += __shfl_xor_sync(0xffffffff, contribution, delta);
-                        if (valid and lane_idx == 0 and not (kDiagAblate & 2u))
-                            atomicAdd(shared_storage.dscore + row, contribution);
-                    } else if (valid and not (kDiagAblate & 2u)) {
-                        atomicAdd(shared_storage.dscore + row, dh * silu * up);
+                        for (uint32_t j = 0; j < width; ++j) {
+                            const float send = upper ? values[j] : values[j + width];
+                            const float keep = upper ? values[j + width] : values[j];
+                            values[j] = keep + __shfl_xor_sync(0xffffffff, send, delta);
+                        }
                     }
-                    if (backward.qh_col != nullptr) {
-                        shared_storage.smem_d.raw[row * BLOCK_N + gate_col] =
-                            d_dtype_t(valid ? h : 0.0f);
-                        shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8] =
-                            d_dtype_t(valid ? dg : 0.0f);
-                        shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p] =
+                    #pragma unroll
+                    for (uint32_t delta = 32 / kChunk / 2; delta > 0; delta /= 2)
+                        values[0] += __shfl_xor_sync(0xffffffff, values[0], delta);
+                    return values[0];
+                };
+                // Each warp owns half of the columns of rows warp/2 + 4 * iter for every tile, so
+                // dscore[warp % 2][row] has a single writer lane and needs no atomics.
+                constexpr uint32_t kElemIters = BLOCK_M * (BLOCK_N / 2) / kNumEpilogueThreads;
+                // Deeper chunks overlap more iterations but spill under the 128-register math cap.
+                constexpr uint32_t kDscoreChunk = DG_MonoEP_ROLE_SCOPED_REGISTERS ? 8 : 2;
+                DG_STATIC_ASSERT((BLOCK_N / 2) % 32 == 0 and kNumEpilogueThreads % (BLOCK_N / 2) == 0 and
+                                 kElemIters % kDscoreChunk == 0, "dscore reduction needs row-uniform warps");
+                #pragma unroll 1
+                for (uint32_t chunk = 0; chunk < kElemIters; chunk += kDscoreChunk) {
+                    float contributions[kDscoreChunk];
+                    #pragma unroll
+                    for (uint32_t c = 0; c < kDscoreChunk; ++c) {
+                        const uint32_t linear = epilogue_thread_idx + (chunk + c) * kNumEpilogueThreads;
+                        const uint32_t row = linear / (BLOCK_N / 2);
+                        const uint32_t p = linear % (BLOCK_N / 2);
+                        const uint32_t gate_col = 16 * (p / 8) + p % 8;
+                        const float gate = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col]);
+                        const float up = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8]);
+                        const float dh = __bfloat162float(
+                            shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p]);
+                        const float score = row < valid_m
+                            ? buffer.l1_topk_weights_buffer.get_base_ptr<float>()[ring_m_idx + row] : 0.0f;
+                        const float sigmoid = 1.0f / (1.0f + expf(-gate));
+                        const float silu = gate * sigmoid;
+                        const float h = silu * up * score;
+                        const float dg = dh * score * up * (sigmoid + silu * (1.0f - sigmoid));
+                        const float du = dh * score * silu;
+                        const uint32_t n = n_block_idx * 64 + p;
+                        const uint32_t scratch_m_idx = backward.qh_col == nullptr ? pool_m_idx : ring_m_idx;
+                        const uint64_t scratch = static_cast<uint64_t>(scratch_m_idx + row);
+                        const bool valid = row < valid_m;
+                        backward.h_pool[scratch * kIntermediateHidden + n] = __float2bfloat16_rn(valid ? h : 0.0f);
+                        backward.dz_pool[scratch * (2 * kIntermediateHidden) + n] = __float2bfloat16_rn(valid ? dg : 0.0f);
+                        backward.dz_pool[scratch * (2 * kIntermediateHidden) + kIntermediateHidden + n] =
                             __float2bfloat16_rn(valid ? du : 0.0f);
+                        contributions[c] = valid ? dh * silu * up : 0.0f;
+                        if (backward.qh_col != nullptr) {
+                            shared_storage.smem_d.raw[row * BLOCK_N + gate_col] =
+                                d_dtype_t(valid ? h : 0.0f);
+                            shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8] =
+                                d_dtype_t(valid ? dg : 0.0f);
+                            shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p] =
+                                __float2bfloat16_rn(valid ? du : 0.0f);
+                        }
+                    }
+                    const float sum = reduce_scatter(contributions);
+                    constexpr uint32_t kLanesPerEntry = 32 / kDscoreChunk;
+                    if (lane_idx % kLanesPerEntry == 0 and not (kDiagAblate & 2u)) {
+                        const uint32_t row = epilogue_warp_idx / 2 +
+                            (chunk + lane_idx / kLanesPerEntry) * (kNumEpilogueThreads / (BLOCK_N / 2));
+                        shared_storage.dscore[epilogue_warp_idx % 2][row] += sum;
                     }
                 }
                 __threadfence();
@@ -1779,8 +1829,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                         auto* dst = backward.dscore_partials.map(
                             backward.dscore_partials.get_base_ptr<float*>(), src.rank_idx);
                         const uint64_t offset = (static_cast<uint64_t>(src.token_idx) * kNumTopk + src.topk_idx) * 2;
-                        dst[offset] = shared_storage.dscore[row];
-                        dst[offset + 1] = 0.0f;
+                        dst[offset] = shared_storage.dscore[0][row];
+                        dst[offset + 1] = shared_storage.dscore[1][row];
                     }
                     __threadfence_system();
                 }
@@ -1981,6 +2031,10 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             }
         }
 
+#if DG_MonoEP_ROLE_SCOPED_REGISTERS && defined(DG_MonoEP_SPLIT_COMBINE_REGISTERS)
+        // Without a region boundary here ptxas caps the whole math role near 128 registers.
+        cutlass::arch::warpgroup_reg_dealloc<DG_MonoEP_SPLIT_COMBINE_REGISTERS>();
+#endif
         // Combine: reduce top-k results and write back
         // NOTES: reuse shared memory from start up to the barriers
         constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);

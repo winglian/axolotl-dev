@@ -165,10 +165,6 @@ static void fp8_mono_ep_backward_sm90(
     const char* ablate_selector = std::getenv("MONO_EP_SM90_FP8_DIAG_ABLATE");
     const uint32_t diag_ablate = ablate_selector == nullptr ? 0 :
         static_cast<uint32_t>(std::strtoul(ablate_selector, nullptr, 10));
-    const char* dscore_selector = std::getenv("MONO_EP_SM90_FP8_DSCORE_WARP_REDUCE");
-    DG_HOST_ASSERT(dscore_selector == nullptr or std::string_view(dscore_selector) == "0" or
-        std::string_view(dscore_selector) == "1");
-    const bool dscore_warp_reduce = dscore_selector != nullptr and std::string_view(dscore_selector) == "1";
     const char* xdy_selector = std::getenv("MONO_EP_SM90_FP8_XDY_VECTOR_PACK");
     DG_HOST_ASSERT(xdy_selector == nullptr or std::string_view(xdy_selector) == "0" or
         std::string_view(xdy_selector) == "1");
@@ -196,14 +192,19 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(dispatch_spin <= 4);
     const std::string diag_suffix = xdy_vector_pack or vector_hdz_pack != 0 or vector_dz_quant != 0 or
             dx_combine_mode != 0 or dispatch_spin != 0
-        ? std::format(", {}, {}u, {}, {}, {}u, {}u, {}u, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
-            dscore_warp_reduce ? "true" : "false", xdy_vector_pack ? "true" : "false",
-            vector_hdz_pack, vector_dz_quant, dx_combine_mode, dispatch_spin)
-        : dscore_warp_reduce
-        ? std::format(", {}, {}u, true", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
+        ? std::format(", {}, {}u, {}, {}u, {}u, {}u, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
+            xdy_vector_pack ? "true" : "false", vector_hdz_pack, vector_dz_quant, dx_combine_mode, dispatch_spin)
         : diag_ablate != 0
         ? std::format(", {}, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
         : (phase_trace_ptr != 0 ? std::string(", true") : std::string());
+    const char* role_registers_selector = std::getenv("MONO_EP_SM90_FP8_ROLE_REGISTERS");
+    DG_HOST_ASSERT(role_registers_selector == nullptr or std::string_view(role_registers_selector) == "0" or
+        std::string_view(role_registers_selector) == "1" or std::string_view(role_registers_selector) == "2");
+    const bool role_registers =
+        role_registers_selector != nullptr and std::string_view(role_registers_selector) != "0";
+    const bool split_combine_registers =
+        role_registers_selector != nullptr and std::string_view(role_registers_selector) == "2";
+    DG_HOST_ASSERT(not (role_registers and compact_non_math));
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
     const int block_threads = compact_non_math ? 384 : 512;
@@ -216,24 +217,27 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(hidden_bytes % pull == 0 and pull % 16 == 0);
     const int smem = SM90ArchSpec::smem_capacity;
     const auto kernel = jit->compile(
-        std::format("sm90_fp8_mono_ep_backward_{}_{}_{}{}{}",
+        std::format("sm90_fp8_mono_ep_backward_{}_{}_{}{}{}{}",
             compact_non_math ? "compact384" : "baseline512",
             trap_timeouts ? "trap" : "diagnostic",
             transport_fp8 ? (fp8_combine ? "fp8transport_fp8combine" : "fp8transport_bf16combine") : "bf16transport",
             phase_trace_ptr != 0 ? "_phasetrace" : "",
             (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
-                (dscore_warp_reduce ? "_dscorewarp" : "") + (xdy_vector_pack ? "_xdyvec" : "") +
+                (xdy_vector_pack ? "_xdyvec" : "") +
                 (vector_hdz_pack ? std::format("_vechdz{}", vector_hdz_pack) : std::string()) +
                 (vector_dz_quant ? std::format("_vecdzq{}", vector_dz_quant) : std::string()) +
                 (dx_combine_mode != 0 ? std::format("_dxcombine{}", dx_combine_mode) : std::string()) +
-                (dispatch_spin != 0 ? std::format("_spin{}", dispatch_spin) : std::string())),
-        std::format(R"({}
+                (dispatch_spin != 0 ? std::format("_spin{}", dispatch_spin) : std::string()),
+            split_combine_registers ? "_rolereg_split" : role_registers ? "_rolereg" : ""),
+        std::format(R"({}{}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm90_fp8_mono_ep_backward_impl<
         {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, 2, {}, {}, {}, 256, {}, {}, true, {}, {}, {}, {}, {}{}>);
 }}
 )", trap_timeouts ? "#define DG_TRAP_ONLY_TIMEOUTS 1" : "",
+            split_combine_registers ? "\n#define DG_MonoEP_ROLE_SCOPED_REGISTERS 1\n#define DG_MonoEP_SPLIT_COMBINE_REGISTERS 160" :
+            role_registers ? "\n#define DG_MonoEP_ROLE_SCOPED_REGISTERS 1" : "",
             max_tokens, hidden, inner, experts * world, topk, ring_tokens, pull,
             dispatch_threads, non_epilogue_threads, sms, world, cached, cached_dz,
             compact_non_math ? "true" : "false", transport_fp8 ? "true" : "false",
