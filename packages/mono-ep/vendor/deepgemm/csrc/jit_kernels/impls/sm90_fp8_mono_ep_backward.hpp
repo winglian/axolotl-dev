@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <format>
 #include <limits>
+#include <string>
 #include <string_view>
 #include <torch/python.h>
 #include <deep_gemm/layout/moe_backward.cuh>
@@ -160,6 +161,13 @@ static void fp8_mono_ep_backward_sm90(
     const char* phase_trace_selector = std::getenv("MONO_EP_SM90_FP8_PHASE_TRACE");
     const uint64_t phase_trace_ptr = phase_trace_selector == nullptr ? 0 :
         std::strtoull(phase_trace_selector, nullptr, 10);
+    // Diagnostic only: bitmask removing epilogue constructs to time them (outputs become invalid).
+    const char* ablate_selector = std::getenv("MONO_EP_SM90_FP8_DIAG_ABLATE");
+    const uint32_t diag_ablate = ablate_selector == nullptr ? 0 :
+        static_cast<uint32_t>(std::strtoul(ablate_selector, nullptr, 10));
+    const std::string diag_suffix = diag_ablate != 0
+        ? std::format(", {}, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
+        : (phase_trace_ptr != 0 ? std::string(", true") : std::string());
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
     const int block_threads = compact_non_math ? 384 : 512;
@@ -172,11 +180,12 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(hidden_bytes % pull == 0 and pull % 16 == 0);
     const int smem = SM90ArchSpec::smem_capacity;
     const auto kernel = jit->compile(
-        std::format("sm90_fp8_mono_ep_backward_{}_{}_{}{}",
+        std::format("sm90_fp8_mono_ep_backward_{}_{}_{}{}{}",
             compact_non_math ? "compact384" : "baseline512",
             trap_timeouts ? "trap" : "diagnostic",
             transport_fp8 ? (fp8_combine ? "fp8transport_fp8combine" : "fp8transport_bf16combine") : "bf16transport",
-            phase_trace_ptr != 0 ? "_phasetrace" : ""),
+            phase_trace_ptr != 0 ? "_phasetrace" : "",
+            diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()),
         std::format(R"({}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{
@@ -187,7 +196,7 @@ static void instantiate() {{
             max_tokens, hidden, inner, experts * world, topk, ring_tokens, pull,
             dispatch_threads, non_epilogue_threads, sms, world, cached, cached_dz,
             compact_non_math ? "true" : "false", transport_fp8 ? "true" : "false",
-            fp8_combine ? "true" : "false", phase_trace_ptr != 0 ? ", true" : ""));
+            fp8_combine ? "true" : "false", diag_suffix));
     layout::MoEBackwardBuffers buffers{
         layout::SymBuffer<>(dy_ptrs, rank), layout::SymBuffer<>(ds_ptrs, rank),
         reinterpret_cast<__nv_bfloat16*>(pools[0].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[1].data_ptr()),

@@ -44,6 +44,7 @@ template <
     bool kTransportFP8 = false,
     bool kFP8Combine = false,
     bool kPhaseTrace = false,
+    uint32_t kDiagAblate = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1180,7 +1181,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     trace_mark[1] = trace_clock();
                     for (uint32_t row = epilogue_thread_idx; row < BLOCK_M; row += kNumEpilogueThreads)
                         shared_storage.dscore[row] = 0.0f;
-                    if constexpr (kTransportFP8) {
+                    if constexpr (kDiagAblate & 1u) {
+                    } else if constexpr (kTransportFP8) {
                         pack_cached_columns(backward.qx_pool, backward.sx_pool,
                                             backward.qx_col, backward.sx_col);
                         pack_cached_columns(backward.qdy_pool, backward.sdy_pool,
@@ -1225,7 +1227,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     backward.dz_pool[scratch * (2 * kIntermediateHidden) + n] = __float2bfloat16_rn(valid ? dg : 0.0f);
                     backward.dz_pool[scratch * (2 * kIntermediateHidden) + kIntermediateHidden + n] =
                         __float2bfloat16_rn(valid ? du : 0.0f);
-                    if (valid)
+                    if (valid and not (kDiagAblate & 2u))
                         atomicAdd(shared_storage.dscore + row, dh * silu * up);
                     if (backward.qh_col != nullptr) {
                         shared_storage.smem_d.raw[row * BLOCK_N + gate_col] =
@@ -1240,7 +1242,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 asm volatile("fence.proxy.async.global;" ::: "memory");
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 trace_mark[1] = trace_clock();
-                if (backward.qh_col != nullptr) {
+                if (backward.qh_col != nullptr and not (kDiagAblate & 4u)) {
                     const uint32_t expert_start = pool_m_idx - task_info.m_block_idx * BLOCK_M;
                     const uint32_t padded_count =
                         shared_storage.expert_padded_counts[task_info.local_expert_idx];
@@ -1301,7 +1303,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 }
                 trace_mark[2] = trace_clock();
-                if constexpr (kCacheDz) {
+                if constexpr (kCacheDz and not (kDiagAblate & 8u)) {
                     if (half == 1) {
                         for (uint32_t row = epilogue_thread_idx / 32; row < BLOCK_M; row += kNumEpilogueWarps) {
                             for (uint32_t operand = 0; operand < 2; ++operand) {
@@ -1353,7 +1355,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     __threadfence_system();
                 }
             } else {
-                if constexpr (kFP8Combine) {
+                if constexpr (kDiagAblate & 16u) {
+                } else if constexpr (kFP8Combine) {
                     for (uint32_t row = epilogue_warp_idx; row < valid_m; row += kNumEpilogueWarps) {
                         d_dtype_t values[4];
                         float amax = 1.0e-4f;
