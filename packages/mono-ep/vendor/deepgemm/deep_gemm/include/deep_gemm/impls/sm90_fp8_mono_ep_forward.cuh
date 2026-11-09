@@ -46,6 +46,7 @@ template <
     bool kVectorSwiGLU = false,
     bool kVectorHQuant = false,
     bool kSwizzleAccumSmem = false,
+    bool kFP8OnlyStages = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -143,6 +144,7 @@ sm90_fp8_mono_ep_forward_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_M == 128, "SM90 persistent BF16 requires block M 128");
     DG_STATIC_ASSERT(BLOCK_N == 128, "SM90 persistent BF16 requires block N 128");
     DG_STATIC_ASSERT(BLOCK_K == 128, "SM90 persistent FP8 requires block K 128");
+    DG_STATIC_ASSERT(not kFP8OnlyStages or not kHasShared, "FP8-only A stages require routed-only experts");
     DG_STATIC_ASSERT(kNumEpilogueThreads == 256, "SM90 persistent BF16 requires 256 math threads");
 
     // Swizzle configs
@@ -177,8 +179,9 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             alignas(kSharedMemoryAlignment) d_dtype_t l2[kNumEpilogueWarpgroups][STORE_BLOCK_M * BLOCK_N];
             alignas(kSharedMemoryAlignment) d_dtype_t raw[BLOCK_M * BLOCK_N];
         } smem_d;
+        // FP8-only stages drop the BF16 A width, which only shared-expert phases load.
         union AStage {
-            a_dtype_t bf16[LOAD_BLOCK_M * BLOCK_K];
+            a_dtype_t bf16[kFP8OnlyStages ? LOAD_BLOCK_M * BLOCK_K / 2 : LOAD_BLOCK_M * BLOCK_K];
             __nv_fp8_e4m3 fp8[LOAD_BLOCK_M * BLOCK_K];
         };
         alignas(kSharedMemoryAlignment) AStage smem_a[kNumStages];

@@ -165,45 +165,37 @@ static void fp8_mono_ep_backward_sm90(
     const char* ablate_selector = std::getenv("MONO_EP_SM90_FP8_DIAG_ABLATE");
     const uint32_t diag_ablate = ablate_selector == nullptr ? 0 :
         static_cast<uint32_t>(std::strtoul(ablate_selector, nullptr, 10));
-    const char* xdy_selector = std::getenv("MONO_EP_SM90_FP8_XDY_VECTOR_PACK");
-    DG_HOST_ASSERT(xdy_selector == nullptr or std::string_view(xdy_selector) == "0" or
-        std::string_view(xdy_selector) == "1");
-    const bool xdy_vector_pack = xdy_selector != nullptr and std::string_view(xdy_selector) == "1";
+    // Integrated epilogue/dispatch selectors: unset picks the default, "0" restores the original code path.
+    const auto env_mode = [](const char* name, int fallback, int max_value) {
+        const char* value = std::getenv(name);
+        const int mode = value == nullptr or *value == '\0' ? fallback : std::atoi(value);
+        DG_HOST_ASSERT(mode >= 0 and mode <= max_value);
+        return mode;
+    };
+    const bool xdy_vector_pack =
+        env_mode("MONO_EP_SM90_FP8_XDY_VECTOR_PACK", transport_fp8 and cached ? 1 : 0, 1) != 0;
     DG_HOST_ASSERT(not xdy_vector_pack or (transport_fp8 and cached));
-    const char* hdz_selector = std::getenv("MONO_EP_SM90_FP8_VECTOR_HDZ_PACK");
-    DG_HOST_ASSERT(hdz_selector == nullptr or std::string_view(hdz_selector) == "0" or
-        std::string_view(hdz_selector) == "1" or std::string_view(hdz_selector) == "2");
-    const int vector_hdz_pack = hdz_selector == nullptr ? 0 : std::atoi(hdz_selector);
-    const char* dz_quant_selector = std::getenv("MONO_EP_SM90_FP8_VECTOR_DZ_QUANT");
-    DG_HOST_ASSERT(dz_quant_selector == nullptr or std::string_view(dz_quant_selector) == "0" or
-        std::string_view(dz_quant_selector) == "1" or std::string_view(dz_quant_selector) == "2");
-    const int vector_dz_quant = dz_quant_selector == nullptr ? 0 : std::atoi(dz_quant_selector);
-    // Opt-in FP8 dx combine bitmask: 1 vectorized scatter, 2 one system fence per CTA, 4 vectorized tail.
-    const char* dx_combine_selector = std::getenv("MONO_EP_SM90_FP8_DX_COMBINE");
-    // Only the FP8 combine path has these variants; BF16 combine launches stay on the default kernel.
-    const uint32_t dx_combine_mode = dx_combine_selector == nullptr or not fp8_combine ? 0 :
-        static_cast<uint32_t>(std::strtoul(dx_combine_selector, nullptr, 10));
-    DG_HOST_ASSERT(dx_combine_mode < 8);
+    // 1 = vector pack with the original fences, 2 = also drops them (packed columns are read by a later launch).
+    const int vector_hdz_pack = env_mode("MONO_EP_SM90_FP8_VECTOR_HDZ_PACK", 2, 2);
+    // Load-batch depth of the vector dZ row-cache quantize; 2 spills in the combined build.
+    const int vector_dz_quant = env_mode("MONO_EP_SM90_FP8_VECTOR_DZ_QUANT", 1, 2);
+    // FP8 dx combine bitmask: 1 vectorized scatter, 2 one system fence per thread, 4 vectorized tail.
+    const int dx_combine_env = env_mode("MONO_EP_SM90_FP8_DX_COMBINE", 7, 7);
+    const int dx_combine_mode = fp8_combine ? dx_combine_env : 0;
     // 0 = ld.acquire spin on ring-slot release, 1 = relaxed poll + one acquire,
     // 2/3/4 = relaxed poll with nanosleep backoff (32-256 / 64-1024 / 128-4096 ns).
-    const char* spin_selector = std::getenv("MONO_EP_SM90_FP8_DISPATCH_SPIN");
-    const uint32_t dispatch_spin = spin_selector == nullptr ? 0 :
-        static_cast<uint32_t>(std::strtoul(spin_selector, nullptr, 10));
-    DG_HOST_ASSERT(dispatch_spin <= 4);
-    const std::string diag_suffix = xdy_vector_pack or vector_hdz_pack != 0 or vector_dz_quant != 0 or
-            dx_combine_mode != 0 or dispatch_spin != 0
-        ? std::format(", {}, {}u, {}, {}u, {}u, {}u, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
-            xdy_vector_pack ? "true" : "false", vector_hdz_pack, vector_dz_quant, dx_combine_mode, dispatch_spin)
-        : diag_ablate != 0
-        ? std::format(", {}, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
-        : (phase_trace_ptr != 0 ? std::string(", true") : std::string());
-    const char* role_registers_selector = std::getenv("MONO_EP_SM90_FP8_ROLE_REGISTERS");
-    DG_HOST_ASSERT(role_registers_selector == nullptr or std::string_view(role_registers_selector) == "0" or
-        std::string_view(role_registers_selector) == "1" or std::string_view(role_registers_selector) == "2");
-    const bool role_registers =
-        role_registers_selector != nullptr and std::string_view(role_registers_selector) != "0";
-    const bool split_combine_registers =
-        role_registers_selector != nullptr and std::string_view(role_registers_selector) == "2";
+    const int dispatch_spin = env_mode("MONO_EP_SM90_FP8_DISPATCH_SPIN", 4, 4);
+    // FP8-sized A stages (cached dZ only); 0 keeps two BF16-sized stages.
+    const int fp8_stages = env_mode("MONO_EP_SM90_FP8_BACKWARD_STAGES", 0, 8);
+    DG_HOST_ASSERT(fp8_stages == 0 or (fp8_stages >= 2 and cached_dz));
+    const bool fp8_only_stages = fp8_stages != 0;
+    const int num_stages = fp8_only_stages ? fp8_stages : 2;
+    const std::string diag_suffix = std::format(", {}, {}u, {}, {}u, {}u, {}u, {}u, {}",
+        phase_trace_ptr != 0 ? "true" : "false", diag_ablate, xdy_vector_pack ? "true" : "false",
+        vector_hdz_pack, vector_dz_quant, dx_combine_mode, dispatch_spin, fp8_only_stages ? "true" : "false");
+    const int role_registers_mode = env_mode("MONO_EP_SM90_FP8_ROLE_REGISTERS", 0, 2);
+    const bool role_registers = role_registers_mode != 0;
+    const bool split_combine_registers = role_registers_mode == 2;
     DG_HOST_ASSERT(not (role_registers and compact_non_math));
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
@@ -223,6 +215,7 @@ static void fp8_mono_ep_backward_sm90(
             transport_fp8 ? (fp8_combine ? "fp8transport_fp8combine" : "fp8transport_bf16combine") : "bf16transport",
             phase_trace_ptr != 0 ? "_phasetrace" : "",
             (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
+                (fp8_only_stages ? std::format("_fp8stages{}", num_stages) : std::string()) +
                 (xdy_vector_pack ? "_xdyvec" : "") +
                 (vector_hdz_pack ? std::format("_vechdz{}", vector_hdz_pack) : std::string()) +
                 (vector_dz_quant ? std::format("_vecdzq{}", vector_dz_quant) : std::string()) +
@@ -233,12 +226,12 @@ static void fp8_mono_ep_backward_sm90(
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm90_fp8_mono_ep_backward_impl<
-        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, 2, {}, {}, {}, 256, {}, {}, true, {}, {}, {}, {}, {}{}>);
+        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, {}, {}, {}, {}, 256, {}, {}, true, {}, {}, {}, {}, {}{}>);
 }}
 )", trap_timeouts ? "#define DG_TRAP_ONLY_TIMEOUTS 1" : "",
             split_combine_registers ? "\n#define DG_MonoEP_ROLE_SCOPED_REGISTERS 1\n#define DG_MonoEP_SPLIT_COMBINE_REGISTERS 160" :
             role_registers ? "\n#define DG_MonoEP_ROLE_SCOPED_REGISTERS 1" : "",
-            max_tokens, hidden, inner, experts * world, topk, ring_tokens, pull,
+            max_tokens, hidden, inner, experts * world, topk, ring_tokens, num_stages, pull,
             dispatch_threads, non_epilogue_threads, sms, world, cached, cached_dz,
             compact_non_math ? "true" : "false", transport_fp8 ? "true" : "false",
             fp8_combine ? "true" : "false", diag_suffix));

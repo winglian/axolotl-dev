@@ -57,6 +57,7 @@ template <
     uint32_t kVectorDzQuant = 0,
     uint32_t kDxCombineMode = 0,
     uint32_t kDispatchSpinMode = 0,
+    bool kFP8OnlyStages = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -98,6 +99,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
     DG_STATIC_ASSERT(not kCacheDz or kCacheActivations, "dZ cache requires cached activation staging");
     DG_STATIC_ASSERT(not kVectorXdyPack or (kTransportFP8 and kCacheActivations),
                      "Vectorized x/dy pack reads the cached FP8 pools");
+    // FP8-sized A stages are only valid when every phase loads cached FP8 A tiles.
+    DG_STATIC_ASSERT(not kFP8OnlyStages or kCacheDz, "FP8-only A stages require the dZ cache");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     constexpr uint32_t kNumLocalityDomains = 1;
 
@@ -153,6 +156,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
     using a_dtype_t = cutlass::bfloat16_t;
     using b_dtype_t = __nv_fp8_e4m3;
     using d_dtype_t = cutlass::bfloat16_t;
+    using smem_a_dtype_t = cute::conditional_t<kFP8OnlyStages, __nv_fp8_e4m3, a_dtype_t>;
 
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M;
@@ -196,7 +200,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
         } smem_d;
         epilogue::MoEBackwardTileEpilogue<BLOCK_M> backward_epilogue;
         float dscore[2][BLOCK_M];
-        alignas(kSharedMemoryAlignment) a_dtype_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K];
+        alignas(kSharedMemoryAlignment) smem_a_dtype_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K];
         alignas(kSharedMemoryAlignment) b_dtype_t smem_b[kNumStages][LOAD_BLOCK_N * BLOCK_K];
         alignas(kSharedMemoryAlignment) __nv_fp8_e4m3 quantized_a[BLOCK_M * BLOCK_K];
         float activation_scales[BLOCK_M];
@@ -891,9 +895,9 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     for (uint32_t half = 0; half < 2; ++half)
                         tma::copy<64, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
                             tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx],
-                            shared_storage.smem_a[stage_idx] + half * BLOCK_M * 64,
+                            reinterpret_cast<a_dtype_t*>(shared_storage.smem_a[stage_idx]) + half * BLOCK_M * 64,
                             k_idx + half * 64, m_idx);
-                    shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_a[0]));
+                    shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t));
                     }
                 }
                 __syncwarp();

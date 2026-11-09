@@ -96,38 +96,32 @@ static void fp8_mono_ep_forward_sm90(
     const char* ablate_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_DIAG_ABLATE");
     const uint32_t diag_ablate = ablate_selector == nullptr ? 0 :
         static_cast<uint32_t>(std::strtoul(ablate_selector, nullptr, 10));
-    const char* vector_scatter_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_VECTOR_SCATTER");
-    DG_HOST_ASSERT(vector_scatter_selector == nullptr or std::string_view(vector_scatter_selector) == "0" or
-        std::string_view(vector_scatter_selector) == "1");
-    const bool vector_scatter =
-        vector_scatter_selector != nullptr and std::string_view(vector_scatter_selector) == "1";
-    const char* defer_fence_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_DEFER_COMBINE_FENCE");
-    DG_HOST_ASSERT(defer_fence_selector == nullptr or std::string_view(defer_fence_selector) == "0" or
-        std::string_view(defer_fence_selector) == "1");
-    const bool defer_fence =
-        defer_fence_selector != nullptr and std::string_view(defer_fence_selector) == "1";
-    const char* vector_swiglu_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_VECTOR_SWIGLU");
-    DG_HOST_ASSERT(vector_swiglu_selector == nullptr or std::string_view(vector_swiglu_selector) == "0" or
-        std::string_view(vector_swiglu_selector) == "1");
-    const bool vector_swiglu =
-        vector_swiglu_selector != nullptr and std::string_view(vector_swiglu_selector) == "1";
-    const char* vector_hquant_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_VECTOR_HQUANT");
-    DG_HOST_ASSERT(vector_hquant_selector == nullptr or std::string_view(vector_hquant_selector) == "0" or
-        std::string_view(vector_hquant_selector) == "1");
-    const bool vector_hquant =
-        vector_hquant_selector != nullptr and std::string_view(vector_hquant_selector) == "1";
-    const char* swizzle_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_SWIZZLE_ACCUM_SMEM");
-    DG_HOST_ASSERT(swizzle_selector == nullptr or std::string_view(swizzle_selector) == "0" or
-        std::string_view(swizzle_selector) == "1");
-    const bool swizzle_accum = swizzle_selector != nullptr and std::string_view(swizzle_selector) == "1";
+    // Integrated epilogue selectors: unset picks the default, "0" restores the original code path.
+    const auto env_flag = [](const char* name, bool fallback) {
+        const char* value = std::getenv(name);
+        if (value == nullptr or *value == '\0')
+            return fallback;
+        DG_HOST_ASSERT(std::string_view(value) == "0" or std::string_view(value) == "1");
+        return std::string_view(value) == "1";
+    };
+    const bool vector_scatter = env_flag("MONO_EP_SM90_FP8_FORWARD_VECTOR_SCATTER", true);
+    const bool defer_fence = env_flag("MONO_EP_SM90_FP8_FORWARD_DEFER_COMBINE_FENCE", true);
+    const bool vector_swiglu = env_flag("MONO_EP_SM90_FP8_FORWARD_VECTOR_SWIGLU", true);
+    const bool vector_hquant = env_flag("MONO_EP_SM90_FP8_FORWARD_VECTOR_HQUANT", true);
+    const bool swizzle_accum = env_flag("MONO_EP_SM90_FP8_FORWARD_SWIZZLE_ACCUM_SMEM",
+        vector_scatter and vector_swiglu);
     DG_HOST_ASSERT(not swizzle_accum or (vector_scatter and vector_swiglu));
-    const bool diag = phase_trace_ptr != 0 or diag_ablate != 0 or vector_scatter or defer_fence or
-        vector_swiglu or vector_hquant or swizzle_accum;
-    const std::string diag_suffix = diag
-        ? std::format(", {}, {}u, {}, {}, {}, {}, {}", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
-            vector_scatter ? "true" : "false", defer_fence ? "true" : "false",
-            vector_swiglu ? "true" : "false", vector_hquant ? "true" : "false",
-            swizzle_accum ? "true" : "false") : std::string();
+    // 3 BF16-sized A stages still fit the unchanged layout; 4-5 switch to FP8-sized A stages (routed-only).
+    const char* stages_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_STAGES");
+    const bool custom_stages = stages_selector != nullptr and std::string_view(stages_selector) != "";
+    const int num_stages = custom_stages ? std::atoi(stages_selector) : 2;
+    DG_HOST_ASSERT(num_stages >= 2 and num_stages <= 5);
+    const bool fp8_only_stages = num_stages > 3;
+    const std::string diag_suffix = std::format(", {}, {}u, {}, {}, {}, {}, {}, {}",
+        phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
+        vector_scatter ? "true" : "false", defer_fence ? "true" : "false",
+        vector_swiglu ? "true" : "false", vector_hquant ? "true" : "false",
+        swizzle_accum ? "true" : "false", fp8_only_stages ? "true" : "false");
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
     const int block_threads = compact_non_math ? 384 : 512;
@@ -144,6 +138,7 @@ static void fp8_mono_ep_forward_sm90(
             original_w1_layout ? "original_w1" : "interleaved_w1",
             phase_trace_ptr != 0 ? "_phasetrace" : "",
             (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
+                (custom_stages ? std::format("_stages{}", num_stages) : std::string()) +
                 (vector_scatter ? "_vecscatter" : "") + (defer_fence ? "_deferfence" : "") +
                 (vector_swiglu ? "_vecswiglu" : "") + (vector_hquant ? "_vechquant" : "") +
                 (swizzle_accum ? "_swizzleacc" : "")),
@@ -151,10 +146,10 @@ static void fp8_mono_ep_forward_sm90(
 #include <deep_gemm/impls/sm90_fp8_mono_ep_forward.cuh>
 static void instantiate() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm90_fp8_mono_ep_forward_impl<
-        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, 2, {}, {}, {}, 256, {}, {}, 0x7f7fffffu, false, {}, {}{}>);
+        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, {}, {}, {}, {}, 256, {}, {}, 0x7f7fffffu, false, {}, {}{}>);
 }}
 )", trap_timeouts ? "#define DG_TRAP_ONLY_TIMEOUTS 1" : "",
-            max_tokens, hidden, inner, experts * world, topk, ring_tokens, pull,
+            max_tokens, hidden, inner, experts * world, topk, ring_tokens, num_stages, pull,
             dispatch_threads, non_epilogue_threads, sms, world,
             compact_non_math ? "true" : "false", original_w1_layout ? "true" : "false", diag_suffix));
     jit->launch(kernel, {.num_smem_bytes = SM90ArchSpec::smem_capacity, .grid_dim = dim3(sms),
