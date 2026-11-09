@@ -280,6 +280,12 @@ CUTLASS_DEVICE uint32_t ld_acq(const uint32_t* ptr) {
     return ret;
 }
 
+CUTLASS_DEVICE uint32_t ld_relaxed_gpu(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
 CUTLASS_DEVICE uint64_t ld_acq_sys(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.acquire.sys.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");

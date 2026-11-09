@@ -57,6 +57,7 @@ template <
     uint32_t kVectorHdzPack = 0,
     uint32_t kVectorDzQuant = 0,
     uint32_t kDxCombineMode = 0,
+    uint32_t kDispatchSpinMode = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -586,7 +587,24 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             const uint64_t trace_ring0 = trace_clock();
             if (l1_empty_count_target > 0) {
                 const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
-                while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                if constexpr (kDispatchSpinMode == 0) {
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                } else {
+                    // Relaxed polls avoid the per-iteration L1 invalidation of ld.acquire; the
+                    // counter is monotonic within a launch, so one acquire re-read still orders
+                    // the ring writes after the consumer's release.
+                    constexpr uint32_t kMinBackoff = kDispatchSpinMode == 2 ? 32 : (kDispatchSpinMode == 3 ? 64 : 128);
+                    constexpr uint32_t kMaxBackoff = kDispatchSpinMode == 2 ? 256 : (kDispatchSpinMode == 3 ? 1024 : 4096);
+                    [[maybe_unused]] uint32_t backoff_ns = kMinBackoff;
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target) {
+                        while (ptx::ld_relaxed_gpu(empty_ptr) < l1_empty_count_target) {
+                            if constexpr (kDispatchSpinMode >= 2) {
+                                __nanosleep(backoff_ns);
+                                backoff_ns = cute::min(backoff_ns * 2, kMaxBackoff);
+                            }
+                        }
+                    }
+                }
             }
             trace_ring_wait += trace_clock() - trace_ring0;
             ++ trace_rows;

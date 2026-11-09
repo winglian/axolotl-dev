@@ -188,11 +188,17 @@ static void fp8_mono_ep_backward_sm90(
     const uint32_t dx_combine_mode = dx_combine_selector == nullptr or not fp8_combine ? 0 :
         static_cast<uint32_t>(std::strtoul(dx_combine_selector, nullptr, 10));
     DG_HOST_ASSERT(dx_combine_mode < 8);
+    // 0 = ld.acquire spin on ring-slot release, 1 = relaxed poll + one acquire,
+    // 2/3/4 = relaxed poll with nanosleep backoff (32-256 / 64-1024 / 128-4096 ns).
+    const char* spin_selector = std::getenv("MONO_EP_SM90_FP8_DISPATCH_SPIN");
+    const uint32_t dispatch_spin = spin_selector == nullptr ? 0 :
+        static_cast<uint32_t>(std::strtoul(spin_selector, nullptr, 10));
+    DG_HOST_ASSERT(dispatch_spin <= 4);
     const std::string diag_suffix = xdy_vector_pack or vector_hdz_pack != 0 or vector_dz_quant != 0 or
-            dx_combine_mode != 0
-        ? std::format(", {}, {}u, {}, {}, {}u, {}u, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
+            dx_combine_mode != 0 or dispatch_spin != 0
+        ? std::format(", {}, {}u, {}, {}, {}u, {}u, {}u, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
             dscore_warp_reduce ? "true" : "false", xdy_vector_pack ? "true" : "false",
-            vector_hdz_pack, vector_dz_quant, dx_combine_mode)
+            vector_hdz_pack, vector_dz_quant, dx_combine_mode, dispatch_spin)
         : dscore_warp_reduce
         ? std::format(", {}, {}u, true", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
         : diag_ablate != 0
@@ -219,7 +225,8 @@ static void fp8_mono_ep_backward_sm90(
                 (dscore_warp_reduce ? "_dscorewarp" : "") + (xdy_vector_pack ? "_xdyvec" : "") +
                 (vector_hdz_pack ? std::format("_vechdz{}", vector_hdz_pack) : std::string()) +
                 (vector_dz_quant ? std::format("_vecdzq{}", vector_dz_quant) : std::string()) +
-                (dx_combine_mode != 0 ? std::format("_dxcombine{}", dx_combine_mode) : std::string())),
+                (dx_combine_mode != 0 ? std::format("_dxcombine{}", dx_combine_mode) : std::string()) +
+                (dispatch_spin != 0 ? std::format("_spin{}", dispatch_spin) : std::string())),
         std::format(R"({}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{
