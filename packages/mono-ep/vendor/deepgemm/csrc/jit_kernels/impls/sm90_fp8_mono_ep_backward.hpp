@@ -156,6 +156,10 @@ static void fp8_mono_ep_backward_sm90(
     if (compact_non_math) {
         DG_HOST_ASSERT(world <= 32 and experts <= 64);
     }
+    // Diagnostic only: a device pointer to a zeroed uint64 phase-trace buffer (sms x 1088 entries).
+    const char* phase_trace_selector = std::getenv("MONO_EP_SM90_FP8_PHASE_TRACE");
+    const uint64_t phase_trace_ptr = phase_trace_selector == nullptr ? 0 :
+        std::strtoull(phase_trace_selector, nullptr, 10);
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
     const int block_threads = compact_non_math ? 384 : 512;
@@ -168,21 +172,22 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(hidden_bytes % pull == 0 and pull % 16 == 0);
     const int smem = SM90ArchSpec::smem_capacity;
     const auto kernel = jit->compile(
-        std::format("sm90_fp8_mono_ep_backward_{}_{}_{}",
+        std::format("sm90_fp8_mono_ep_backward_{}_{}_{}{}",
             compact_non_math ? "compact384" : "baseline512",
             trap_timeouts ? "trap" : "diagnostic",
-            transport_fp8 ? (fp8_combine ? "fp8transport_fp8combine" : "fp8transport_bf16combine") : "bf16transport"),
+            transport_fp8 ? (fp8_combine ? "fp8transport_fp8combine" : "fp8transport_bf16combine") : "bf16transport",
+            phase_trace_ptr != 0 ? "_phasetrace" : ""),
         std::format(R"({}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm90_fp8_mono_ep_backward_impl<
-        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, 2, {}, {}, {}, 256, {}, {}, true, {}, {}, {}, {}, {}>);
+        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, 2, {}, {}, {}, 256, {}, {}, true, {}, {}, {}, {}, {}{}>);
 }}
 )", trap_timeouts ? "#define DG_TRAP_ONLY_TIMEOUTS 1" : "",
             max_tokens, hidden, inner, experts * world, topk, ring_tokens, pull,
             dispatch_threads, non_epilogue_threads, sms, world, cached, cached_dz,
             compact_non_math ? "true" : "false", transport_fp8 ? "true" : "false",
-            fp8_combine ? "true" : "false"));
+            fp8_combine ? "true" : "false", phase_trace_ptr != 0 ? ", true" : ""));
     layout::MoEBackwardBuffers buffers{
         layout::SymBuffer<>(dy_ptrs, rank), layout::SymBuffer<>(ds_ptrs, rank),
         reinterpret_cast<__nv_bfloat16*>(pools[0].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[1].data_ptr()),
@@ -216,7 +221,7 @@ static void instantiate() {{
         .block_dim = dim3(block_threads), .cluster_dim = dim3(1, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),
         tx, tw1, tx, tz, tw1t, tx, tw1, tx, tz, tw1t,
-        static_cast<const uint8_t*>(nullptr), static_cast<__nv_bfloat16*>(nullptr), ty, tw2t, buffers,
+        static_cast<const uint8_t*>(nullptr), reinterpret_cast<__nv_bfloat16*>(phase_trace_ptr), ty, tw2t, buffers,
         scales[0].data_ptr<float>(), scales[1].data_ptr<float>(), scales[2].data_ptr<float>());
 }
 
