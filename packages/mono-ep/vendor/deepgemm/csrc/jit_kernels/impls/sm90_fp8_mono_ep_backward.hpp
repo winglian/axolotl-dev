@@ -165,7 +165,13 @@ static void fp8_mono_ep_backward_sm90(
     const char* ablate_selector = std::getenv("MONO_EP_SM90_FP8_DIAG_ABLATE");
     const uint32_t diag_ablate = ablate_selector == nullptr ? 0 :
         static_cast<uint32_t>(std::strtoul(ablate_selector, nullptr, 10));
-    const std::string diag_suffix = diag_ablate != 0
+    const char* dscore_selector = std::getenv("MONO_EP_SM90_FP8_DSCORE_WARP_REDUCE");
+    DG_HOST_ASSERT(dscore_selector == nullptr or std::string_view(dscore_selector) == "0" or
+        std::string_view(dscore_selector) == "1");
+    const bool dscore_warp_reduce = dscore_selector != nullptr and std::string_view(dscore_selector) == "1";
+    const std::string diag_suffix = dscore_warp_reduce
+        ? std::format(", {}, {}u, true", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
+        : diag_ablate != 0
         ? std::format(", {}, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
         : (phase_trace_ptr != 0 ? std::string(", true") : std::string());
     const int dispatch_threads = compact_non_math ? 32 : 128;
@@ -185,7 +191,8 @@ static void fp8_mono_ep_backward_sm90(
             trap_timeouts ? "trap" : "diagnostic",
             transport_fp8 ? (fp8_combine ? "fp8transport_fp8combine" : "fp8transport_bf16combine") : "bf16transport",
             phase_trace_ptr != 0 ? "_phasetrace" : "",
-            diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()),
+            (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
+                (dscore_warp_reduce ? "_dscorewarp" : "")),
         std::format(R"({}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{

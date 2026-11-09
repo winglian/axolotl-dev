@@ -45,6 +45,7 @@ template <
     bool kFP8Combine = false,
     bool kPhaseTrace = false,
     uint32_t kDiagAblate = 0,
+    bool kWarpReduceDscore = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1227,8 +1228,19 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     backward.dz_pool[scratch * (2 * kIntermediateHidden) + n] = __float2bfloat16_rn(valid ? dg : 0.0f);
                     backward.dz_pool[scratch * (2 * kIntermediateHidden) + kIntermediateHidden + n] =
                         __float2bfloat16_rn(valid ? du : 0.0f);
-                    if (valid and not (kDiagAblate & 2u))
+                    if constexpr (kWarpReduceDscore) {
+                        // A warp covers 32 columns of one row, so reduce before the shared atomic.
+                        DG_STATIC_ASSERT((BLOCK_N / 2) % 32 == 0 and kNumEpilogueThreads % (BLOCK_N / 2) == 0,
+                                         "dscore warp reduction needs row-uniform warps");
+                        float contribution = valid ? dh * silu * up : 0.0f;
+                        #pragma unroll
+                        for (uint32_t delta = 16; delta > 0; delta /= 2)
+                            contribution += __shfl_xor_sync(0xffffffff, contribution, delta);
+                        if (valid and lane_idx == 0 and not (kDiagAblate & 2u))
+                            atomicAdd(shared_storage.dscore + row, contribution);
+                    } else if (valid and not (kDiagAblate & 2u)) {
                         atomicAdd(shared_storage.dscore + row, dh * silu * up);
+                    }
                     if (backward.qh_col != nullptr) {
                         shared_storage.smem_d.raw[row * BLOCK_N + gate_col] =
                             d_dtype_t(valid ? h : 0.0f);
