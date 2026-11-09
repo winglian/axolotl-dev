@@ -182,10 +182,17 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(dz_quant_selector == nullptr or std::string_view(dz_quant_selector) == "0" or
         std::string_view(dz_quant_selector) == "1" or std::string_view(dz_quant_selector) == "2");
     const int vector_dz_quant = dz_quant_selector == nullptr ? 0 : std::atoi(dz_quant_selector);
-    const std::string diag_suffix = xdy_vector_pack or vector_hdz_pack != 0 or vector_dz_quant != 0
-        ? std::format(", {}, {}u, {}, {}, {}u, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
+    // Opt-in FP8 dx combine bitmask: 1 vectorized scatter, 2 one system fence per CTA, 4 vectorized tail.
+    const char* dx_combine_selector = std::getenv("MONO_EP_SM90_FP8_DX_COMBINE");
+    // Only the FP8 combine path has these variants; BF16 combine launches stay on the default kernel.
+    const uint32_t dx_combine_mode = dx_combine_selector == nullptr or not fp8_combine ? 0 :
+        static_cast<uint32_t>(std::strtoul(dx_combine_selector, nullptr, 10));
+    DG_HOST_ASSERT(dx_combine_mode < 8);
+    const std::string diag_suffix = xdy_vector_pack or vector_hdz_pack != 0 or vector_dz_quant != 0 or
+            dx_combine_mode != 0
+        ? std::format(", {}, {}u, {}, {}, {}u, {}u, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
             dscore_warp_reduce ? "true" : "false", xdy_vector_pack ? "true" : "false",
-            vector_hdz_pack, vector_dz_quant)
+            vector_hdz_pack, vector_dz_quant, dx_combine_mode)
         : dscore_warp_reduce
         ? std::format(", {}, {}u, true", phase_trace_ptr != 0 ? "true" : "false", diag_ablate)
         : diag_ablate != 0
@@ -211,7 +218,8 @@ static void fp8_mono_ep_backward_sm90(
             (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
                 (dscore_warp_reduce ? "_dscorewarp" : "") + (xdy_vector_pack ? "_xdyvec" : "") +
                 (vector_hdz_pack ? std::format("_vechdz{}", vector_hdz_pack) : std::string()) +
-                (vector_dz_quant ? std::format("_vecdzq{}", vector_dz_quant) : std::string())),
+                (vector_dz_quant ? std::format("_vecdzq{}", vector_dz_quant) : std::string()) +
+                (dx_combine_mode != 0 ? std::format("_dxcombine{}", dx_combine_mode) : std::string())),
         std::format(R"({}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{

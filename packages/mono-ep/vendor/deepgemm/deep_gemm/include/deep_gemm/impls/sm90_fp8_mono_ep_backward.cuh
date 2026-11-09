@@ -56,6 +56,7 @@ template <
     bool kVectorXdyPack = false,
     uint32_t kVectorHdzPack = 0,
     uint32_t kVectorDzQuant = 0,
+    uint32_t kDxCombineMode = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1767,6 +1768,78 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 }
             } else {
                 if constexpr (kDiagAblate & 16u) {
+                } else if constexpr (kFP8Combine and (kDxCombineMode & 1u)) {
+                    // 8 lanes per row, 16 columns per lane, 4 rows per warp step; same values as the scalar path
+                    DG_STATIC_ASSERT(BLOCK_N == 128, "Vectorized dx combine expects one 128-column scale group");
+                    constexpr uint32_t kRowsPerStep = 4;
+                    constexpr uint32_t kNumSteps = BLOCK_M / (kRowsPerStep * kNumEpilogueWarps);
+                    DG_STATIC_ASSERT(kNumSteps * kRowsPerStep <= 32, "Metadata prefetch needs one lane per row");
+                    const uint32_t sub = lane_idx / 8, part = lane_idx % 8;
+                    layout::TokenSrcMetadata meta{0, 0, 0};
+                    {
+                        const uint32_t meta_row = ((lane_idx / kRowsPerStep) * kNumEpilogueWarps +
+                            epilogue_warp_idx) * kRowsPerStep + lane_idx % kRowsPerStep;
+                        if (lane_idx < kNumSteps * kRowsPerStep and meta_row < valid_m)
+                            meta = *workspace.get_token_src_metadata_ptr(pool_m_idx + meta_row);
+                    }
+                    #pragma unroll
+                    for (uint32_t step = 0; step < kNumSteps; ++step) {
+                        const uint32_t row_base = (step * kNumEpilogueWarps + epilogue_warp_idx) * kRowsPerStep;
+                        if (row_base >= valid_m)
+                            break;
+                        const uint32_t row = row_base + sub;
+                        // Lanes 4-7 of each row load their two 16-byte halves in swapped order: conflict-free LDS.128
+                        const uint32_t swap = (part >> 2) & 1u;
+                        const auto* src = reinterpret_cast<const uint4*>(
+                            shared_storage.smem_d.raw + row * BLOCK_N) + 2 * part;
+                        const uint4 first = src[swap], second = src[swap ^ 1u];
+                        uint4 halves[2];
+                        halves[0] = swap ? second : first;
+                        halves[1] = swap ? first : second;
+                        const auto* pairs = reinterpret_cast<const nv_bfloat162*>(halves);
+                        // BF16 max is exact, so this equals the FP32 max of the widened values
+                        nv_bfloat162 pair_max = __habs2(pairs[0]);
+                        #pragma unroll
+                        for (uint32_t j = 1; j < 8; ++j)
+                            pair_max = __hmax2(pair_max, __habs2(pairs[j]));
+                        float amax = fmaxf(1.0e-4f, fmaxf(__low2float(pair_max), __high2float(pair_max)));
+                        #pragma unroll
+                        for (uint32_t delta = 4; delta > 0; delta /= 2)
+                            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+                        const uint32_t bits = __float_as_uint(amax / 448.0f);
+                        const uint32_t exponent = ((bits >> 23) & 255u) + ((bits & 0x7fffffu) != 0);
+                        const float inv = exponent == 255u ? 0.0f :
+                            __uint_as_float((254u - exponent) << 23);
+                        const uint32_t meta_lane = step * kRowsPerStep + sub;
+                        const uint32_t src_rank = __shfl_sync(0xffffffff, meta.rank_idx, meta_lane);
+                        const uint32_t src_token = __shfl_sync(0xffffffff, meta.token_idx, meta_lane);
+                        const uint32_t src_topk = __shfl_sync(0xffffffff, meta.topk_idx, meta_lane);
+                        if (row < valid_m) {
+                            uint32_t packed[4];
+                            #pragma unroll
+                            for (uint32_t w = 0; w < 4; ++w) {
+                                const float2 a = __bfloat1622float2(pairs[2 * w]);
+                                const float2 b = __bfloat1622float2(pairs[2 * w + 1]);
+                                const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(
+                                    make_float2(a.x * inv, a.y * inv), __NV_SATFINITE, __NV_E4M3);
+                                const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(
+                                    make_float2(b.x * inv, b.y * inv), __NV_SATFINITE, __NV_E4M3);
+                                packed[w] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+                            }
+                            auto dst = buffer.combine_token_buffer.get_rank_buffer(src_topk)
+                                .get_data_buffer(src_token);
+                            auto* q = sym_buffer.map(dst.template get_base_ptr<uint8_t>() +
+                                n_block_idx * BLOCK_N, src_rank);
+                            *reinterpret_cast<uint4*>(q + part * 16) =
+                                make_uint4(packed[0], packed[1], packed[2], packed[3]);
+                            if (part == 0) {
+                                auto dst_sf = buffer.combine_sf_buffer.get_rank_buffer(src_topk)
+                                    .get_data_buffer(src_token);
+                                sym_buffer.map(dst_sf.template get_base_ptr<float>() + n_block_idx,
+                                               src_rank)[0] = __uint_as_float(exponent << 23);
+                            }
+                        }
+                    }
                 } else if constexpr (kFP8Combine) {
                     for (uint32_t row = epilogue_warp_idx; row < valid_m; row += kNumEpilogueWarps) {
                         d_dtype_t values[4];
@@ -1810,7 +1883,9 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                                        src.rank_idx)[0] = shared_storage.smem_d.raw[row * BLOCK_N + col];
                     }
                 }
-                __threadfence_system();
+                // The combine readiness flag is only published after the epilogue grid sync
+                if constexpr (not (kDxCombineMode & 2u))
+                    __threadfence_system();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (epilogue_thread_idx == 0)
                     ptx::red_add(workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
@@ -1935,6 +2010,9 @@ sm90_fp8_mono_ep_backward_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
+        if constexpr (kDxCombineMode & 2u)
+            __threadfence_system();
+
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
             workspace, sm_idx, epilogue_thread_idx,
@@ -1949,7 +2027,86 @@ sm90_fp8_mono_ep_backward_impl(void* y,
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         const auto grid_idx = ptx::get_grid_idx() + 1;
-        if constexpr (kFP8Combine) {
+        if constexpr (kFP8Combine and (kDxCombineMode & 4u)) {
+            // One warp per token; per slot, lane l reads bytes [v * 512 + l * 16, +16) for v < 4 (coalesced)
+            constexpr uint32_t kNumVecs = kHidden / 512;
+            DG_STATIC_ASSERT(kHidden % 512 == 0, "Vectorized FP8 combine tail needs hidden % 512 == 0");
+            for (uint32_t token_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_idx < num_tokens;
+                 token_idx += kNumSMs * kNumEpilogueWarps) {
+                const int stored_topk_slot_idx = lane_idx < kNumTopk ?
+                    static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[
+                        token_idx * kNumTopk + lane_idx]) : -1;
+                const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+                const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
+                const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
+                    is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+                comm::wait_until(
+                    [&]() { return __all_sync(0xffffffff, not is_routed or
+                        ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                    [&]() { printf("DeepGEMM FP8 combine peers timeout: rank=%u, token=%u\n",
+                                   sym_buffer.rank_idx, token_idx); });
+                if (lane_idx < kNumTopk) {
+                    const auto offset = static_cast<uint64_t>(token_idx) * kNumTopk + lane_idx;
+                    const auto partials = backward.dscore_partials.get_base_ptr<float*>();
+                    backward.dscore[offset] = stored_topk_slot_idx >= 0 ?
+                        partials[offset * 2] + partials[offset * 2 + 1] : 0.0f;
+                }
+                // Two passes of two 16-byte vectors per slot bound the FP32 accumulators to 32 per lane
+                constexpr uint32_t kVecsPerPass = 2;
+                DG_STATIC_ASSERT(kNumVecs % kVecsPerPass == 0, "Invalid FP8 combine tail pass split");
+                auto* dst = reinterpret_cast<nv_bfloat16*>(y) + static_cast<uint64_t>(token_idx) * kHidden;
+                #pragma unroll 1
+                for (uint32_t pass = 0; pass < kNumVecs / kVecsPerPass; ++pass) {
+                    float reduced[kVecsPerPass][16];
+                    #pragma unroll
+                    for (uint32_t v = 0; v < kVecsPerPass; ++v) {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 16; ++j)
+                            reduced[v][j] = 0.0f;
+                    }
+                    uint32_t mask = total_mask;
+                    while (mask) {
+                        const uint32_t slot_idx = __ffs(mask) - 1;
+                        mask ^= 1u << slot_idx;
+                        const auto* q = buffer.combine_token_buffer.get_rank_buffer(slot_idx)
+                            .get_data_buffer(token_idx).template get_base_ptr<uint8_t>();
+                        const auto* sf = buffer.combine_sf_buffer.get_rank_buffer(slot_idx)
+                            .get_data_buffer(token_idx).template get_base_ptr<float>();
+                        uint4 raw[kVecsPerPass];
+                        float scale[kVecsPerPass];
+                        #pragma unroll
+                        for (uint32_t v = 0; v < kVecsPerPass; ++v) {
+                            const uint32_t byte = (pass * kVecsPerPass + v) * 512 + lane_idx * 16;
+                            raw[v] = *reinterpret_cast<const uint4*>(q + byte);
+                            scale[v] = sf[byte / 128];
+                        }
+                        #pragma unroll
+                        for (uint32_t v = 0; v < kVecsPerPass; ++v) {
+                            const auto* pairs = reinterpret_cast<const __nv_fp8x2_storage_t*>(&raw[v]);
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 8; ++j) {
+                                const float2 decoded = __half22float2(__half2(
+                                    __nv_cvt_fp8x2_to_halfraw2(pairs[j], __NV_E4M3)));
+                                reduced[v][2 * j] += decoded.x * scale[v];
+                                reduced[v][2 * j + 1] += decoded.y * scale[v];
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (uint32_t v = 0; v < kVecsPerPass; ++v) {
+                        uint4 out[2];
+                        auto* out_bf16 = reinterpret_cast<nv_bfloat162*>(out);
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 8; ++j)
+                            out_bf16[j] = __floats2bfloat162_rn(reduced[v][2 * j], reduced[v][2 * j + 1]);
+                        auto* dst_vec = reinterpret_cast<uint4*>(
+                            dst + (pass * kVecsPerPass + v) * 512 + lane_idx * 16);
+                        dst_vec[0] = out[0];
+                        dst_vec[1] = out[1];
+                    }
+                }
+            }
+        } else if constexpr (kFP8Combine) {
             constexpr uint32_t kNumKBlocks = kHidden / 128;
             for (uint32_t token_k_idx = epilogue_warp_idx * kNumSMs + sm_idx;
                  token_k_idx < num_tokens * kNumKBlocks;
