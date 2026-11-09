@@ -111,10 +111,11 @@ static void fp8_mono_ep_forward_sm90(
     const bool swizzle_accum = env_flag("MONO_EP_SM90_FP8_FORWARD_SWIZZLE_ACCUM_SMEM",
         vector_scatter and vector_swiglu);
     DG_HOST_ASSERT(not swizzle_accum or (vector_scatter and vector_swiglu));
-    // 3 BF16-sized A stages still fit the unchanged layout; 4-5 switch to FP8-sized A stages (routed-only).
+    // 3 BF16-sized A stages (the default) still fit the unchanged layout; 4-5 switch to FP8-sized A
+    // stages (routed-only).
     const char* stages_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_STAGES");
     const bool custom_stages = stages_selector != nullptr and std::string_view(stages_selector) != "";
-    const int num_stages = custom_stages ? std::atoi(stages_selector) : 2;
+    const int num_stages = custom_stages ? std::atoi(stages_selector) : 3;
     DG_HOST_ASSERT(num_stages >= 2 and num_stages <= 5);
     const bool fp8_only_stages = num_stages > 3;
     const std::string diag_suffix = std::format(", {}, {}u, {}, {}, {}, {}, {}, {}",
@@ -138,7 +139,7 @@ static void fp8_mono_ep_forward_sm90(
             original_w1_layout ? "original_w1" : "interleaved_w1",
             phase_trace_ptr != 0 ? "_phasetrace" : "",
             (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
-                (custom_stages ? std::format("_stages{}", num_stages) : std::string()) +
+                (num_stages != 2 ? std::format("_stages{}", num_stages) : std::string()) +
                 (vector_scatter ? "_vecscatter" : "") + (defer_fence ? "_deferfence" : "") +
                 (vector_swiglu ? "_vecswiglu" : "") + (vector_hquant ? "_vechquant" : "") +
                 (swizzle_accum ? "_swizzleacc" : "")),

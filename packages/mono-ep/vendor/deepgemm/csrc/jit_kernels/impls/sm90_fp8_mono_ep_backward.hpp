@@ -185,8 +185,9 @@ static void fp8_mono_ep_backward_sm90(
     // 0 = ld.acquire spin on ring-slot release, 1 = relaxed poll + one acquire,
     // 2/3/4 = relaxed poll with nanosleep backoff (32-256 / 64-1024 / 128-4096 ns).
     const int dispatch_spin = env_mode("MONO_EP_SM90_FP8_DISPATCH_SPIN", 4, 4);
-    // FP8-sized A stages (cached dZ only); 0 keeps two BF16-sized stages.
-    const int fp8_stages = env_mode("MONO_EP_SM90_FP8_BACKWARD_STAGES", 0, 8);
+    // FP8-sized A stages (cached dZ only); 0 keeps two BF16-sized stages. Three FP8 stages use the
+    // same shared memory as two BF16 stages.
+    const int fp8_stages = env_mode("MONO_EP_SM90_FP8_BACKWARD_STAGES", cached_dz ? 3 : 0, 8);
     DG_HOST_ASSERT(fp8_stages == 0 or (fp8_stages >= 2 and cached_dz));
     const bool fp8_only_stages = fp8_stages != 0;
     const int num_stages = fp8_only_stages ? fp8_stages : 2;

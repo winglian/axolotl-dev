@@ -81,6 +81,20 @@ def validate(suite, env):
     )
 
 
+def _records(stdout):
+    decoder, records = json.JSONDecoder(), []
+    for line in stdout.splitlines():
+        position = line.find("{")
+        while position != -1 and position < len(line):
+            try:
+                record, end = decoder.raw_decode(line, position)
+            except json.JSONDecodeError:
+                break
+            records.append(record)
+            position = line.find("{", end)
+    return records
+
+
 @app.local_entrypoint()
 def main(out: str, suite: str, env: str = ""):
     """env: "KEY=V+KEY2=V2" passed to the validator processes."""
@@ -92,11 +106,7 @@ def main(out: str, suite: str, env: str = ""):
         suite=suite,
         env=values,
         modal_app_id=os.environ.get("MODAL_APP_ID") or app.app_id,
-        records=[
-            json.loads(line)
-            for line in result["stdout"].splitlines()
-            if line.startswith("{")
-        ],
+        records=_records(result["stdout"]),
     )
     Path(out).write_text(json.dumps(result, indent=1))
     print(json.dumps({k: result[k] for k in ("returncode", "devices", "modal_app_id")}))
