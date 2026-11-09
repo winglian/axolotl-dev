@@ -23,15 +23,15 @@ if modal.is_local():
     root = Path(__file__).resolve().parents[1]
     base_vendor = os.environ["MONO_EP_BASE_VENDOR_DIR"]
     image = (
-        base_image.add_local_dir(base_vendor, "/opt/base-mega/vendor", copy=True)
+        base_image.add_local_dir(base_vendor, "/opt/base-mono-ep/vendor", copy=True)
         .add_local_file(
             root / "tools/fetch_build_dependencies.py",
-            "/opt/base-mega/tools/fetch_build_dependencies.py",
+            "/opt/base-mono-ep/tools/fetch_build_dependencies.py",
             copy=True,
         )
         .run_commands(
-            "python /opt/base-mega/tools/fetch_build_dependencies.py",
-            "cd /opt/base-mega/vendor/deepgemm && DG_USE_LOCAL_VERSION=0 DG_FORCE_BUILD=1 "
+            "python /opt/base-mono-ep/tools/fetch_build_dependencies.py",
+            "cd /opt/base-mono-ep/vendor/deepgemm && DG_USE_LOCAL_VERSION=0 DG_FORCE_BUILD=1 "
             'CC=gcc-13 CXX=g++-13 MAX_JOBS=4 uv pip install --python "$(command -v python)" '
             "--no-build-isolation --no-deps --target /opt/dg_base .",
         )

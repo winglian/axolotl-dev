@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
-from mono_ep.runtime import MonoEP
+from mono_ep.runtime import PersistentMoE
 
 _COMPACT_FORWARD_ENV = "MONO_EP_SM90_FP8_COMPACT_FORWARD"
 _COMPACT_BACKWARD_ENV = "MONO_EP_SM90_FP8_COMPACT_BACKWARD"
@@ -89,7 +89,7 @@ def run(
         torch.randn(experts // world, hidden, inner, device="cuda") / inner**0.5
     ).requires_grad_()
     dy = torch.randn_like(x)
-    runtime = MonoEP(
+    runtime = PersistentMoE(
         dist.group.WORLD,
         experts,
         tokens,
@@ -472,7 +472,7 @@ def run(
                         y.backward(dy)
                     torch.cuda.synchronize()
                 trace_path = Path(
-                    f"/tmp/ultra-{profile_scope}-{transport}-rank-{rank}.json"
+                    f"/tmp/ultra-{profile_scope}-{transport}-rank-{rank}.json"  # nosec B108
                 )
                 trace.export_chrome_trace(str(trace_path))
                 raw_events = json.loads(trace_path.read_text())["traceEvents"]

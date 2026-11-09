@@ -4,7 +4,7 @@
 """Reproducible DeepGEMM kernel validation on Hopper and Blackwell."""
 
 import os
-import subprocess
+import subprocess  # nosec B404
 from pathlib import Path
 
 import modal
@@ -68,7 +68,7 @@ def compare_h200(profile=False):
         "--nproc-per-node=8",
         "/probe/benchmark_h200.py",
     ]
-    with subprocess.Popen(
+    with subprocess.Popen(  # nosec B603
         command,
         env={
             **os.environ,
@@ -95,7 +95,7 @@ fft_image = image.add_local_dir(ROOT / "../../src", "/probe/framework").add_loca
 
 
 def run_fp8_fft(format, resume=False):
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603 B607
         [
             "python",
             "-m",
@@ -167,7 +167,7 @@ def validate(
         command.append("--framework-ep")
     if changing_routing:
         command.append("--changing-routing")
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603
         command,
         env={**os.environ, "PYTHONPATH": "/probe/src"},
         capture_output=True,
@@ -243,7 +243,7 @@ def blackwell_sonic_ep():
 
 @app.function(image=comparison_image, gpu="B200:2", timeout=3600)
 def compare_sonic_ep(compare_fused=False, profile=False):
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603 B607
         [
             "python",
             "-m",
@@ -277,7 +277,7 @@ def compare_blackwell():
         ("deepgemm", ["--unfused-backward"]),
         ("deepgemm", []),
     ):
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 B607
             ["python", "/probe/benchmark.py", "--backend", backend, *flags],
             env={**os.environ, "PYTHONPATH": "/probe/src"},
             capture_output=True,

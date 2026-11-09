@@ -11,7 +11,7 @@ import time
 
 import torch
 import torch.distributed as dist
-from mono_ep import FP8Experts, MonoEP
+from mono_ep import FP8Experts, PersistentMoE
 from mono_ep.pipeline import pipelined_moe
 from mono_ep.sonic import SonicExperts, sonic_experts, sonic_fp8_experts
 
@@ -126,7 +126,7 @@ def run(args):
         if backend.startswith("sonic") and "retained" in backend:
             compute = SonicExperts(fp8="fp8" in backend, compile_local=True)
         if backend.startswith("fused_"):
-            runtime = MonoEP(
+            runtime = PersistentMoE(
                 dist.group.WORLD,
                 args.experts,
                 args.tokens,

@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from mono_ep import MonoEP, PersistentMoE
+from mono_ep import PersistentMoE
 from mono_ep.runtime import _RUNTIMES, _check_sm_budget
 
 
@@ -122,7 +122,6 @@ def test_constructor_selects_backend_and_close_releases_handle(
     )
     try:
         assert runtime.num_sms == 132 - reserved_sms
-        assert MonoEP is PersistentMoE
         assert _RUNTIMES[runtime._key] is runtime
         if backend == "native":
             native.assert_called_once_with(runtime)

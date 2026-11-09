@@ -164,7 +164,7 @@ def quantize_tokens_into(x, q_out, s_out, block_cols):
     return q_out, s_out
 
 
-def prepare_mega_fp8(x, *, weights=False, interleave=False):
+def prepare_persistent_mxfp8(x, *, weights=False, interleave=False):
     """Quantize into the fused SM100 kernel's value and packed E8M0 layouts."""
     if (
         x.ndim not in (2, 3)

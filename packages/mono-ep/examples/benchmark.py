@@ -144,13 +144,13 @@ def run(args):
                 concat_layout=True,
             )[0]
     else:
-        from mono_ep import MonoEP
+        from mono_ep import PersistentMoE
 
         rendezvous = os.path.join(tempfile.mkdtemp(prefix="moe-bench-"), "rendezvous")
         dist.init_process_group(
             "nccl", init_method=f"file://{rendezvous}", rank=0, world_size=1
         )
-        runtime = MonoEP(
+        runtime = PersistentMoE(
             dist.group.WORLD,
             args.experts,
             args.tokens,

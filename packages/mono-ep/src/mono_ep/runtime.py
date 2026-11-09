@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch.autograd.function import once_differentiable
 
-_RUNTIMES = {}
+_RUNTIMES: dict[int, "PersistentMoE"] = {}
 _RUNTIME_KEYS = count(1)
 
 
@@ -76,7 +76,7 @@ class PersistentMoE:
             raise ValueError("SM100 persistent kernels require an even active SM count")
         if deep_gemm.get_num_sms() != self.num_sms:
             raise ValueError(
-                "call deep_gemm.set_num_sms(physical_sms - reserved_sms) before constructing MonoEP"
+                "call deep_gemm.set_num_sms(physical_sms - reserved_sms) before constructing PersistentMoE"
             )
         self._fixed_capacity_backward = True
         self._peer_backward = None
@@ -153,9 +153,6 @@ class PersistentMoE:
         return persistent_forward(x, indices, scores, w1, w2, self._key)
 
 
-MonoEP = PersistentMoE
-
-
 def _check_sm_budget(runtime):
     import deep_gemm
 
@@ -203,13 +200,13 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
         )
         return y, None
     if runtime.compute_dtype == "mxfp8":
-        from .token_quantization import prepare_mega_fp8
+        from .token_quantization import prepare_persistent_mxfp8
 
-        qx, sx = prepare_mega_fp8(x)
+        qx, sx = prepare_persistent_mxfp8(x)
         buffer.x[:tokens].copy_(qx)
         buffer.x_sf[:tokens].copy_(sx)
-        tw1 = prepare_mega_fp8(w1, weights=True, interleave=True)
-        tw2 = prepare_mega_fp8(w2, weights=True)
+        tw1 = prepare_persistent_mxfp8(w1, weights=True, interleave=True)
+        tw2 = prepare_persistent_mxfp8(w2, weights=True)
     else:
         buffer.x[:tokens].copy_(x)
         tw1, tw2 = deep_gemm.transform_weights_for_mono_ep(

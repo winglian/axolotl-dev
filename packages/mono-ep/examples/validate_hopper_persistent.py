@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Axolotl AI
 
-"""Validate the SM90 persistent BF16 mono-ep prototype."""
+"""Validate the SM90 persistent BF16 fused-MoE prototype."""
 
 import argparse
 import json

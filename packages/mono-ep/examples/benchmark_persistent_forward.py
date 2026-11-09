@@ -12,7 +12,7 @@ import time
 import deep_gemm
 import torch
 import torch.distributed as dist
-from mono_ep.token_quantization import prepare_mega_fp8
+from mono_ep.token_quantization import prepare_persistent_mxfp8
 
 
 def run(retain_activations=False, include_router=False):
@@ -91,12 +91,12 @@ def run(retain_activations=False, include_router=False):
                     w1.bfloat16(), w2.bfloat16()
                 )
             else:
-                qx, sx = prepare_mega_fp8(x)
+                qx, sx = prepare_persistent_mxfp8(x)
                 buffer.x[:tokens].copy_(qx)
                 buffer.x_sf[:tokens].copy_(sx)
                 weights = (
-                    prepare_mega_fp8(w1, weights=True, interleave=True),
-                    prepare_mega_fp8(w2, weights=True),
+                    prepare_persistent_mxfp8(w1, weights=True, interleave=True),
+                    prepare_persistent_mxfp8(w2, weights=True),
                 )
             buffer.topk_idx[:tokens].copy_(current_ids)
             buffer.topk_weights[:tokens].copy_(current_scores)

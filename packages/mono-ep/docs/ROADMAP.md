@@ -45,7 +45,7 @@ source/results snapshot is `/private/tmp/mono-ep-progress-2026-11-09.tar.gz`
 (excludes build and cache directories); it supplements this worktree, not a remote
 backup. Do not delete experimental paths or evidence as a consequence of the brief.
 
-Verified against Prime's public `trainer/models/layers/mono_ep.py`: autograd saves
+Verified against prime-rl's public MoE layer (`src/prime_rl/trainer/models/layers/`): autograd saves
 only input, routing and weights; backward receives no forward z/h; precision modes
 include BF16, MXFP8, blockwise FP8 and BF16-forward/FP8-backward. Its wrapper reuses
 buffers across layers and reserves compute resources for concurrent NCCL. These
@@ -86,15 +86,65 @@ and license-compatible multi-node transport. The brief does not revoke these.
 Existing milestones below remain historical requirements; this section sets the
 near-term emphasis without discarding prior work.
 
+## SM120 (RTX PRO 6000 / RTX 50-series Blackwell): what carries over
+
+Analysis only; nothing below has been measured on SM120 yet. SM120 has neither
+SM100's tcgen05/TMEM (UMMA, 2-CTA pairs) nor SM90's WGMMA: tensor cores are driven
+by warp-level `mma.sync` (including block-scaled FP8/FP4 variants) with register
+accumulators. Shared memory per block is far smaller than H100/B200, device memory
+is GDDR7 (well under half of H200's HBM bandwidth), and multi-GPU boxes are
+PCIe-only with platform-dependent peer access. Today `unsupported_reason` rejects
+SM120 and Axolotl falls back to `torch` dispatch with the configured local kernel
+(SonicMoE/ScatterMoE/grouped_mm).
+
+Carries over (architecture-independent):
+
+- The op contract: two custom ops with fake impls and an int key, nothing retained
+  from the forward, restage-and-recompute backward, one workspace per process,
+  routing saved under SAC. Recompute is relatively cheaper where bandwidth is the
+  scarce resource, so not retaining z/h matters more on GDDR7, not less.
+- GPU-resident, fixed-capacity expert layouts (expert starts/padded counts on
+  device, no `.item()`/`.tolist()`), the K-grouped weight-gradient formulation, FP32
+  combine accumulation, and capacity/padding sentinels.
+- Fused epilogues: SwiGLU backward (dz, gate/up gradients, score partials),
+  weighted activation and recompute-from-accumulators. The SM90 port already uses
+  register accumulators, so its epilogues are the closest template; only the
+  fragment layout changes from WGMMA to `mma.sync`.
+- Quantize-on-pack (FP8 x/dy/dz written once while packing) and per-call weight
+  quantization. Byte reduction is worth more on GDDR7/PCIe. Block-scaled
+  `mma.sync` consumes 32-element E8M0 scales natively, so the MXFP8 recipe maps
+  more directly than Hopper's 1x128/128x128 blockwise FP8 with FP32 promotion.
+
+Does not carry over:
+
+- In-kernel dispatch/combine over NVLink symmetric memory. Over PCIe, remote stores
+  and atomics are slow and peer access may be disabled; keep NCCL all-to-all with
+  chunked overlap (the `torch` backend's `expert_parallel_dispatch_chunks`). SM
+  reservation and `NCCL_MAX_CTAS` then stop being correctness requirements.
+- tcgen05/TMEM mainloops, 2-CTA scheduling, WGMMA async pipelines, and ring depths
+  sized for 228 KB of shared memory (fewer stages, smaller tiles).
+- Register-redistribution warp specialization tuned for 512-thread SM90 CTAs;
+  re-derive role counts for `mma.sync` occupancy.
+
+Next steps, in order, on the local 2x RTX PRO 6000 host before any kernel work:
+check peer access and topology; profile `torch` + SonicMoE/grouped_mm at the Qwen
+shape to find whether GEMMs, memory traffic or PCIe dominate; then decide between
+(a) a fused `mma.sync` grouped GEMM carrying the SwiGLU/recompute and
+quantize-on-pack epilogues behind the same two ops with NCCL transport, and
+(b) MXFP8/NVFP4 local GEMMs only. Report results per section 6 of the redirect
+brief's reporting rules (hardware, geometry, dtypes, scope, samples).
+
 ## Current implementation boundary
 
 ### Follow-up integration brief assessment (2026-11-09)
 
 Read the external Axolotl composition follow-up. Use `_MonoEPBackend`
 (user's requested MonoEP naming), `mono_ep` as the backend value, and
-MonoEP names for new public runtime APIs; do not introduce the brief's
-`mono_ep` module, config or operator namespace. Existing internal names can
-remain until a compatibility-preserving migration.
+MonoEP names for every public runtime API, config key and operator namespace.
+The project is not called after Prime Intellect's kernels; cite their published
+numbers as "Prime Intellect (prime-rl)". The vendored DeepGEMM fused-MoE file
+and API names carry the `mono_ep` prefix as well; `vendor/sources.json` and
+`tools/rename_vendor_names.py` record how to re-apply that when the pin moves.
 
 The proposed fused backend seam is the intended integration: it bypasses local
 dispatch/compute/combine while torch/deep_ep retain their independent SonicMoE
@@ -1959,7 +2009,7 @@ further shape/routing stress, Hopper port, then FP8 and adapter sequence.
 ### 2026-11-09 explicit persistent runtime selection
 
 Added `PersistentMoE(..., backward_backend="native")`; `nccl` remains the
-reference default and legacy `MonoEP` is an alias. Native selection rejects
+reference default (the former class alias has since been removed). Native selection rejects
 FP8 or retained activations before allocation; the backend still enforces
 SM100/single-host/shape/alignment restrictions. Existing training validator
 now uses this constructor instead of attaching its private backend manually.

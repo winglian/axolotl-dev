@@ -73,7 +73,8 @@
         "license": "MIT",
         "scope": "BF16 chunk queue and scheduler design adapted to current DeepJIT and epilogue APIs; original DeepSeek MIT notice retained"
       }
-    ]
+    ],
+    "vendored_name_mapping": "Upstream's fused-MoE feature prefix (file names, C++ and Python identifiers, pybind names) is spelled mono_ep / MonoEP throughout vendor/deepgemm in this tree. After moving the pin, run `python tools/rename_vendor_names.py vendor/deepgemm` to re-apply the mapping before re-applying local_modifications."
   },
   "sonic_fp8": {
     "url": "https://github.com/bdepyzy/sonic-moe.git",

@@ -1,12 +1,51 @@
 # mono-ep
 
-Independent open-source MoE training kernels and expert-parallel scheduling.
+Open-source fused expert-parallel MoE training kernels for Hopper (SM90) and
+Blackwell (SM100). Each direction runs as one persistent kernel that dispatches
+tokens over NVLink symmetric memory, runs the expert GEMMs and combines the
+results back, built on a vendored DeepGEMM fork (`vendor/deepgemm`, pinned in
+`vendor/sources.json`). The op contract follows the one prime-rl's public code
+calls: forward and backward are `torch.library` custom ops with fake impls and an
+integer runtime key, nothing from the forward is retained (backward restages `x`
+and `dy` and recomputes), one symmetric buffer per process, SMs reserved for
+NCCL, and `NCCL_MAX_CTAS` exported before process-group initialization.
 
-Experimental SonicMoE- and DeepGEMM-based MoE training kernels. This standalone package has no
-Axolotl, Transformers, or TRL dependency. Axolotl's experimental expert-parallel FP8 adapter
-imports this package; model configuration and FSDP policy stay in Axolotl.
+This package has no Axolotl, Transformers or TRL dependency. Axolotl selects it
+with `expert_parallel_backend: mono_ep` (see
+`src/axolotl/integrations/expert_parallel/README.md`); model configuration, FSDP
+policy and fallback decisions stay in Axolotl. The integration surface is:
 
-The common training entry point is `from mono_ep import MonoEP`:
+```python
+from mono_ep import MonoEPRuntime, check_nccl_env, nccl_env, unsupported_reason
+
+reason = unsupported_reason(
+    capability=(9, 0),
+    hidden=2048,
+    intermediate=768,
+    has_bias=False,
+    activation="silu",
+    precision="bf16",
+)
+env = nccl_env(reserved_sms=16, dp_replicate=1)  # export before NCCL init
+runtime = MonoEPRuntime(
+    group=ep_group,
+    num_experts=128,
+    max_tokens_per_rank=16384,
+    top_k=8,
+    hidden=2048,
+    intermediate=768,
+    precision="auto",
+)
+y = runtime.forward(x, topk_idx, topk_weights, w1, w2)  # autograd via the op pair
+runtime.destroy()
+```
+
+`precision="auto"` resolves to `bf16` on SM90 and `mxfp8` on SM100; `fp8`
+(blockwise E4M3 forward and backward) is SM90 only and `fp8_bwd` is not
+implemented yet. SM120 and older architectures are unsupported.
+
+The lower-level entry point used by the benchmarks is
+`from mono_ep import MonoEP`:
 
 ```python
 runtime = MonoEP(dtype="fp8", compile_local=True, retain_activations=True)
@@ -19,9 +58,6 @@ With the default `backend="pipeline"`, `dtype="bf16"` selects SonicMoE.
 Both dtypes use the same NCCL chunk scheduler;
 the experimental peer-ready queue and UniEP work are not selected here yet.
 Compilation covers local expert callbacks, not whole-graph communication.
-The Axolotl FP8 adapter now delegates to this entry point. Its existing explicit
-format configuration remains accepted and checked for hardware compatibility.
-SM120 remains unsupported by this entry point.
 
 Select `MonoEP(backend="persistent", dtype="bf16", retain_activations=False,
 max_tokens=16384)` to use native persistent forward/backward through the same
@@ -51,9 +87,14 @@ The fixed-geometry runtime is also available directly:
 from mono_ep import PersistentMoE
 
 runtime = PersistentMoE(
-    ep_group, experts=128, max_tokens=16384, topk=8,
-    hidden=2048, intermediate=768,
-    compute_dtype="bf16", retain_activations=False,
+    ep_group,
+    experts=128,
+    max_tokens=16384,
+    topk=8,
+    hidden=2048,
+    intermediate=768,
+    compute_dtype="bf16",
+    retain_activations=False,
     backward_backend="native",
 )
 y = runtime(x, indices, scores, w1, w2)
@@ -69,8 +110,7 @@ SwiGLU/dscore and dX/combine. Both use native dispatch and TMA pipelines;
 Hopper uses WGMMA and Blackwell uses UMMA. dH stays CTA-local; h/dZ are
 written to the workspace for grouped weight gradients. The constructor fails
 explicitly for unsupported native combinations. `backward_backend="nccl"`
-(the default) selects the fixed-capacity grouped reference path. The historical
-`MonoEP` name remains an alias for `PersistentMoE`.
+(the default) selects the fixed-capacity grouped reference path.
 
 Hopper's direct weight-gradient path now emits column-scaled FP8 operands from
 the owning block, using 128-token scale groups. BF16 staging is bounded by the
@@ -92,8 +132,8 @@ two outstanding forwards backpropagated in reverse order, unequal rank token
 counts and empty experts. See
 [training validation](benchmarks/b200_native_persistent_training_validation.json).
 The compiled correctness and timing runs are separate. The
-default `MonoEP` mode and Axolotl FP8 adapter still select the NCCL chunk
-pipeline; persistent execution requires explicit selection.
+default `MonoEP` mode still selects the NCCL chunk pipeline; persistent
+execution requires explicit selection (`MonoEPRuntime` always uses it).
 
 A same-allocation eight-B200 comparison used 16384 tokens/rank,
 H2048/I768/E128/top8, FP32 master weights, BF16 compute, five warmups and
@@ -214,8 +254,14 @@ from mono_ep import FP8Experts, pipelined_moe
 
 compute = FP8Experts("blockwise")  # "mxfp8" on SM100
 y = pipelined_moe(
-    x, global_indices, scores, local_w1, local_w2,
-    group=ep_group, local_kernel=compute, local_backward=compute.backward,
+    x,
+    global_indices,
+    scores,
+    local_w1,
+    local_w2,
+    group=ep_group,
+    local_kernel=compute,
+    local_backward=compute.backward,
 )
 ```
 
@@ -291,7 +337,7 @@ checks with BF16 and FP32 master weights. Hopper's separate activation path also
 passes regression checks. Reports are in `benchmarks/bf16_validation.json`.
 The measurements above predate this epilogue extension. A same-B200 comparison
 measured 8.47 ms without the epilogue and 9.24 ms with it; SonicMoE measured
-1.42 ms. The epilogue is therefore opt-in through `MonoEP(...,
+1.42 ms. The epilogue is therefore opt-in through `PersistentMoE(...,
 fuse_activation=True)` while further tuning is needed. Removing an intermediate
 tensor alone did not improve performance in this workload.
 

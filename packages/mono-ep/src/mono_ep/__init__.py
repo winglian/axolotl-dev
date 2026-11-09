@@ -1,26 +1,46 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Axolotl AI
 
-"""Experimental DeepGEMM training primitives; not yet a production EP backend."""
+"""Fused expert-parallel MoE training kernels for Hopper and Blackwell."""
 
 __all__ = [
+    "DEFAULT_RESERVED_SMS",
     "FP8Experts",
-    "MonoEP",
     "PersistentMoE",
     "SonicExperts",
     "MonoEP",
+    "MonoEPRuntime",
+    "check_nccl_env",
+    "nccl_env",
     "pipelined_moe",
+    "resolve_precision",
     "sonic_experts",
     "sonic_fp8_experts",
+    "unsupported_reason",
 ]
+
+_API = frozenset(
+    {
+        "DEFAULT_RESERVED_SMS",
+        "MonoEPRuntime",
+        "check_nccl_env",
+        "nccl_env",
+        "resolve_precision",
+        "unsupported_reason",
+    }
+)
 
 
 def __getattr__(name):
+    if name in _API:
+        from . import api
+
+        return getattr(api, name)
     if name == "MonoEP":
         from .mono_ep import MonoEP
 
         return MonoEP
-    if name in ("PersistentMoE", "MonoEP"):
+    if name == "PersistentMoE":
         from .runtime import PersistentMoE
 
         return PersistentMoE

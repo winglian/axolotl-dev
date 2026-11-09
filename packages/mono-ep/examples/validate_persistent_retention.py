@@ -45,12 +45,14 @@ def run(compute_dtype="bf16"):
         w1[rank * local : (rank + 1) * local], w2[rank * local : (rank + 1) * local]
     )
     if compute_dtype == "mxfp8":
-        from mono_ep.token_quantization import prepare_mega_fp8
+        from mono_ep.token_quantization import prepare_persistent_mxfp8
 
-        tw1 = prepare_mega_fp8(
+        tw1 = prepare_persistent_mxfp8(
             w1[rank * local : (rank + 1) * local], weights=True, interleave=True
         )
-        tw2 = prepare_mega_fp8(w2[rank * local : (rank + 1) * local], weights=True)
+        tw2 = prepare_persistent_mxfp8(
+            w2[rank * local : (rank + 1) * local], weights=True
+        )
     buffer = deep_gemm.get_symm_buffer_for_mono_ep(
         dist.group.WORLD,
         experts,
@@ -71,7 +73,7 @@ def run(compute_dtype="bf16"):
         )
         scores = torch.rand(world, tokens, topk, device="cuda")
         if compute_dtype == "mxfp8":
-            qx, sx = prepare_mega_fp8(inputs[rank])
+            qx, sx = prepare_persistent_mxfp8(inputs[rank])
             buffer.x[:tokens].copy_(qx)
             buffer.x_sf[:tokens].copy_(sx)
             reference_x = quantized_reference(inputs)

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Axolotl AI
 
-"""Build and validate the SM90 persistent BF16 mono-ep prototype."""
+"""Build and validate the SM90 persistent BF16 fused-MoE prototype."""
 
 import os
-import subprocess
+import subprocess  # nosec B404
 from pathlib import Path
 
 import modal
@@ -38,7 +38,7 @@ def _run(world, tokens, experts=8, topk=4, skewed=False):
     ]
     if skewed:
         command.append("--skewed")
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603
         command,
         env={**os.environ, "OMP_NUM_THREADS": "1"},
         capture_output=True,
@@ -70,7 +70,7 @@ def _run_diagnostic():
         "--tokens",
         "137",
     ]
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603
         command,
         env={
             **os.environ,
@@ -85,7 +85,7 @@ def _run_diagnostic():
     print(result.stdout, flush=True)
     print(result.stderr, flush=True)
     for cubin in Path("/root/.dj/tmp").glob("*/kernel.cubin"):
-        sass = subprocess.run(
+        sass = subprocess.run(  # nosec B603
             ["/usr/local/cuda/bin/cuobjdump", "--dump-sass", str(cubin)],
             capture_output=True,
             text=True,

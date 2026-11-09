@@ -68,7 +68,7 @@ def render(result, baseline=None):
             "",
             "Prime's H200 FP8 figures are an external reference, not a precision-matched "
             "control. The NCCL columns come from the same run. "
-            "[Prime benchmark](https://www.primeintellect.ai/blog/prime-mono-ep).",
+            "[Prime Intellect published numbers, prime-rl](https://www.primeintellect.ai/blog/prime-mono-ep).",
         ]
     )
     if baseline is not None:

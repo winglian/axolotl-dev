@@ -465,7 +465,7 @@ def validate_quantization():
 
     from deep_gemm import transform_weights_for_mono_ep
     from deep_gemm.utils.math import pack_ue8m0_to_int
-    from mono_ep.token_quantization import prepare_mega_fp8
+    from mono_ep.token_quantization import prepare_persistent_mxfp8
 
     for dtype in (torch.bfloat16, torch.float32):
         w1 = torch.randn(3, 512, 256, device="cuda", dtype=dtype)
@@ -476,8 +476,8 @@ def validate_quantization():
             *[(q, pack_ue8m0_to_int(s)) for q, s in pairs]
         )
         for mode, op in (
-            ("eager", prepare_mega_fp8),
-            ("fullgraph", torch.compile(prepare_mega_fp8, fullgraph=True)),
+            ("eager", prepare_persistent_mxfp8),
+            ("fullgraph", torch.compile(prepare_persistent_mxfp8, fullgraph=True)),
         ):
             for w, interleave, ref in zip(
                 (w1, w2), (True, False), expected, strict=True
@@ -493,7 +493,11 @@ def validate_quantization():
             torch.testing.assert_close(sf, pack_ue8m0_to_int(rs), atol=0, rtol=0)
             print(
                 json.dumps(
-                    {"mega_operand_layout": mode, "dtype": str(dtype), "exact": True}
+                    {
+                        "persistent_operand_layout": mode,
+                        "dtype": str(dtype),
+                        "exact": True,
+                    }
                 ),
                 flush=True,
             )
@@ -627,7 +631,7 @@ def validate():
 def validate_distributed(
     sonic_pipeline=False, fp8_pipeline=False, fused_fp8=False, framework_ep=False
 ):
-    from mono_ep.runtime import MonoEP
+    from mono_ep.runtime import PersistentMoE
 
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
@@ -676,7 +680,7 @@ def validate_distributed(
     runtime = (
         None
         if sonic_pipeline or fp8_pipeline
-        else MonoEP(
+        else PersistentMoE(
             dist.group.WORLD,
             experts,
             tokens,

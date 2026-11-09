@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 DeepSeek
+// Copyright (c) 2026 Axolotl AI
 #pragma once
 
 #include <format>
