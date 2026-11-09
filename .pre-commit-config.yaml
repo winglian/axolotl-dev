@@ -1,7 +1,7 @@
 default_language_version:
     python: python3
 
-exclude: ^src/axolotl/core/trainers/prm/
+exclude: ^(src/axolotl/core/trainers/prm/|packages/mono-ep/vendor/)
 
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks

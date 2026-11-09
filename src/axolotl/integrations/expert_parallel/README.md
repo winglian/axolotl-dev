@@ -1,6 +1,6 @@
 # Expert Parallelism Integration
 
-Replaces the MoE dispatch/combine path with token-parallel expert dispatch, on one of two backends.
+Replaces the MoE dispatch/combine path with token-parallel expert dispatch, on one of three backends.
 
 ## Backends
 
@@ -8,9 +8,10 @@ Replaces the MoE dispatch/combine path with token-parallel expert dispatch, on o
 |----------------------------|----------|-------|
 | `deep_ep`                  | DeepEP's fused NVSHMEM kernels | NVLink (intranode) or RDMA (internode); the `deep_ep` build — see [Installation](#installation) |
 | `torch`                     | Plain `all_to_all_single` over the EP process group | Any NCCL or gloo fabric — no extra build, works over PCIe |
-| `auto` (default)            | `deep_ep` if importable, else `torch` | — |
+| `mono_ep`               | Fused: dispatch, SwiGLU experts and combine in one persistent kernel per direction | Hopper or Blackwell, one NVLink node, the `mono_ep` package — see [Fused `mono_ep` backend](#fused-mono_ep-backend) |
+| `auto` (default)            | `deep_ep` if importable, else `torch` (never `mono_ep`) | — |
 
-Both backends compose with the same local-experts kernel (ScatterMoE, SonicMoE, grouped_mm, eager), the same FSDP mesh, and the same sharding/save-load path — only the token dispatch/combine collective differs. Set explicitly to pin one:
+`deep_ep` and `torch` compose with the same local-experts kernel (ScatterMoE, SonicMoE, grouped_mm, eager), the same FSDP mesh, and the same sharding/save-load path — only the token dispatch/combine collective differs. Set explicitly to pin one:
 
 ```yaml
 expert_parallel_backend: torch  # or deep_ep; omit for auto
@@ -33,6 +34,54 @@ The dispatched/combined rows are recomputed by default. `expert_parallel_save_di
 `expert_parallel_dispatch_chunks: N` (default `1`, `torch` backend only) splits each MoE layer's tokens into `N` chunks and pipelines them: chunk `i+1`'s dispatch `all_to_all` is in flight while chunk `i`'s expert GEMMs run, and chunk `i`'s combine is consumed only after chunk `i+1`'s GEMMs are enqueued, so the collectives can overlap compute. All chunks' split counts come from one count exchange and one device-to-host copy per layer. Only the forward overlaps: autograd runs each chunk's backward chain back to back. An explicit `expert_parallel_backend: deep_ep` with `N > 1` is rejected at config validation.
 
 Overlap is not a speedup guarantee: each chunk adds its own collectives and kernel launches, and that per-chunk overhead can exceed what the overlap hides. On 2x PCIe GPUs (16k tokens, hidden 4096), `N: 2` was 12-18% faster when expert compute dominated and ~5% slower when communication-bound; `N: 4` helped only in the most compute-heavy case, and `N: 8` was never faster and up to 3x slower. Benchmark your model's forward before raising `N`, and start from `2`.
+
+### Fused `mono_ep` backend
+
+`mono_ep` (from `packages/mono-ep`) replaces dispatch, the local experts kernel and combine with one persistent kernel per direction that moves tokens over NVLink symmetric memory. The local-kernel axis does not apply: `use_sonicmoe`, `use_scattermoe` and `experts_implementation` are ignored (config validation warns) and are used only if the backend falls back to `torch`.
+
+```yaml
+plugins:
+  - axolotl.integrations.expert_parallel.ExpertParallelPlugin
+expert_parallel_size: 8
+expert_parallel_backend: mono_ep
+expert_parallel_mono_ep_precision: auto  # bf16 | mxfp8 | fp8 | fp8_bwd
+fsdp_version: 2
+fsdp_config:
+  state_dict_type: FULL_STATE_DICT
+```
+
+Install the package and its pinned DeepGEMM build with `bash cicd/install_mono_ep.sh` (builds `packages/mono-ep/vendor/deepgemm`, then installs `packages/mono-ep`).
+
+| Precision | SM90 (Hopper) | SM100 (Blackwell) |
+|-----------|---------------|-------------------|
+| `auto`    | `bf16`        | `mxfp8`           |
+| `bf16`    | yes           | yes               |
+| `mxfp8`   | no            | yes               |
+| `fp8` (blockwise E4M3 forward and backward) | yes | no |
+| `fp8_bwd` (BF16 forward, blockwise FP8 backward) | not implemented yet | no |
+
+Master weights keep their own dtype (BF16 or FP32) and weight gradients come back in it. SM120 (RTX PRO 6000, RTX 50-series) and older GPUs are unsupported and fall back.
+
+**Fallback matrix.** When `mono_ep` cannot run, `expert_parallel_fallback_on_unsupported: true` (the default) logs the reason and degrades to `expert_parallel_backend: torch` with whichever local kernel the config names (so LoRA with `use_sonicmoe: true` lands on `torch` + SonicMoE); with `false` it raises with the reason.
+
+| Condition | Checked |
+|-----------|---------|
+| `mono_ep` package not installed | config load |
+| an adapter (`adapter: lora`, `qlora`, ...) is configured | config load |
+| quantized loading (`load_in_4bit`, `load_in_8bit`, `gptq`, `model_quantization_config`) | config load |
+| no CUDA, or compute capability other than SM90/SM100 | after model build |
+| `hidden_size % 256 != 0` or expert intermediate size `% 128 != 0` | after model build |
+| expert biases, a non-SiLU gate, a custom `_apply_gate` (e.g. `alpha`), or a clamped SwiGLU (`limit`/`swiglu_limit`; the fused backward has no clamp yet) | after model build |
+| experts not in HF `gate_up_proj [E, 2I, H]` / `down_proj [E, H, I]` layout (non-gated, transposed, interleaved, post-expert norm), or MoE layers with different shapes | after model build |
+| the precision does not match the architecture (table above) | after model build |
+
+There is no `model_type` gate: any HF MoE whose experts match the layout above is accepted.
+
+**Runtime.** The plugin builds one runtime per process in `post_model_load` on the resolved EP group, sized for `sequence_len * max(micro_batch_size, eval_batch_size) / context_parallel_size` tokens per rank (rounded up to the kernel's token alignment), with one symmetric buffer shared by every MoE layer. It is destroyed in `post_train_unload`. Under FSDP2 the expert weights are read with `.to_local()` and keep the usual expert grad scaling. The forward and backward are `torch.library` custom ops (`mono_ep::persistent_forward` / `persistent_backward`) with fake implementations and no host syncs in the seam, so the EP layer is meant to compile under `torch_compile: true` without graph breaks (the four-GPU compile parity test has not been run yet); nothing from the forward is retained (backward restages the inputs and recomputes). Selective checkpointing always saves the fused op's output and the router `topk`, and reentrant checkpointing is rejected as for `torch`.
+
+**SM reservation.** The persistent kernels spin on all but 16 SMs. FSDP's NCCL collectives must fit in the reserved SMs or they deadlock against the spinning grid, so the plugin exports `NCCL_MAX_CTAS = 16 // 2 = 8` (`16 // 3 = 5` under HSDP, `dp_replicate_size > 1`) through the plugin `get_distributed_env` hook, before any process group exists. A user-set `NCCL_MAX_CTAS` wins but must not exceed that value; `pre_model_load` raises otherwise. Launchers that create the process group before Axolotl loads its config must export the variable themselves.
+
+`expert_parallel_dispatch_chunks` and `expert_parallel_save_dispatch` do not apply (communication overlaps inside the kernels). The native fused backward currently needs a single host, `intermediate % 256 == 0` and BF16 (or blockwise FP8 on SM90); otherwise the runtime uses its NCCL reference backward behind the same op.
 
 ## Requirements
 

@@ -11,14 +11,18 @@
 Dispatches tokens to the ranks owning their experts (DeepEP or torch all-to-all), runs
 whichever experts implementation the user configured on the received rows, and combines
 the results back. Slots owned by another rank reach the local implementation as expert id
-``num_experts`` with weight 0.
+``num_experts`` with weight 0. The fused ``mono_ep`` backend replaces all three stages
+with one persistent kernel per direction, so the local implementation does not apply.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from . import torch_dispatch
 from .buffer import barrier_ep, get_buffer, get_combine_config, get_dispatch_config
@@ -98,9 +102,10 @@ def _get_valid_token_mask() -> torch.Tensor | None:
 
 
 EXPERT_PARALLEL = "expert_parallel"
+MONO_EP = "mono_ep"
 
-# Dispatch backend (``deep_ep`` | ``torch``) and the wrapped local experts implementation,
-# both set by the EP plugin before the model is built.
+# Dispatch backend (``deep_ep`` | ``torch`` | ``mono_ep``) and the wrapped local experts
+# implementation, both set by the EP plugin before the model is built.
 _BACKEND: str | None = None
 _LOCAL_IMPLEMENTATION: str = "grouped_mm"
 
@@ -127,6 +132,26 @@ def set_local_implementation(name: str) -> None:
 
 def get_local_implementation() -> str:
     return _LOCAL_IMPLEMENTATION
+
+
+# The process-wide fused runtime (``mono_ep.MonoEPRuntime`` or a test double), built
+# by the EP plugin in ``post_model_load`` and shared by every MoE layer.
+_MONO_EP_RUNTIME = None
+
+
+def set_mono_ep_runtime(runtime) -> None:
+    global _MONO_EP_RUNTIME
+    _MONO_EP_RUNTIME = runtime
+
+
+def get_mono_ep_runtime():
+    if _MONO_EP_RUNTIME is None:
+        raise RuntimeError(
+            "expert_parallel_backend=mono_ep: no runtime built; the "
+            "ExpertParallelPlugin builds it in post_model_load (or call "
+            "experts_fn.set_mono_ep_runtime)."
+        )
+    return _MONO_EP_RUNTIME
 
 
 def _eager_local(experts, recv_x, recv_topk_idx, recv_topk_weights):
@@ -366,9 +391,43 @@ class _TorchBackend:
         return torch_dispatch.combine(local_out, handle)
 
 
-_BACKENDS: dict[str, type[_DeepEPBackend] | type[_TorchBackend]] = {
+def _local_expert_weights(experts):
+    """HF-layout ``gate_up_proj [E_local, 2I, H]`` / ``down_proj [E_local, H, I]`` as local
+    tensors; ``to_local`` is autograd-aware, so gradients flow back into the FSDP2 shards."""
+    weights = []
+    for name in ("gate_up_proj", "down_proj"):
+        weight = getattr(experts, name)
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        weights.append(weight)
+    return weights
+
+
+class _MonoEPBackend:
+    cast_bf16 = True
+    fused = True  # dispatch, local experts and combine run inside the runtime's kernels
+
+    @staticmethod
+    def forward(
+        experts,
+        hidden_states,
+        topk_idx,
+        topk_w,
+        *,
+        num_experts_global,
+        num_local_experts,
+    ):
+        w1, w2 = _local_expert_weights(experts)
+        return get_mono_ep_runtime().forward(
+            hidden_states, topk_idx, topk_w, w1, w2
+        )
+
+
+# duck-typed: ``fused`` backends expose ``forward``, the others ``dispatch``/``combine``
+_BACKENDS: dict[str, Any] = {
     "deep_ep": _DeepEPBackend,
     "torch": _TorchBackend,
+    MONO_EP: _MonoEPBackend,
 }
 
 
@@ -397,7 +456,6 @@ def _ep_forward(
             "in pre_model_load (or call experts_fn.set_backend)."
         )
     ep_backend = _BACKENDS[backend]
-    local_fn = resolve_local_implementation(local)
     _maybe_install_decorator_attrs(self)
     self._is_expert_parallel = True
     original_dtype = None
@@ -438,6 +496,20 @@ def _ep_forward(
             topk_idx_i64, topk_w_f32, _TOKEN_CAPACITY
         )
 
+    if getattr(ep_backend, "fused", False):
+        combined = ep_backend.forward(
+            self,
+            hidden_states,
+            topk_idx_i64,
+            topk_w_f32,
+            num_experts_global=E_global,
+            num_local_experts=E_local,
+        )
+        if original_dtype is not None:
+            combined = combined.to(original_dtype)
+        return combined
+
+    local_fn = resolve_local_implementation(local)
     group = (
         _TorchBackend.group(E_global, E_local)
         if backend == "torch" and _DISPATCH_CHUNKS > 1

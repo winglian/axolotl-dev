@@ -7,8 +7,9 @@ python -c "import torch; assert '$PYTORCH_VERSION' in torch.__version__, torch._
 
 case "${MULTIGPU_TEST_SUITE}" in
   gpu_slow_kernels)
+    bash cicd/install_mono_ep.sh
     required_gpus=1
-    tests=(tests/e2e/kernels/ tests/utils/lora/test_merge_lora.py)
+    tests=(tests/e2e/kernels/ tests/utils/lora/test_merge_lora.py packages/mono-ep/tests/test_hopper_wgrad.py packages/mono-ep/tests/test_quantization.py)
     selection=(--ignore=tests/e2e/kernels/lora_patching/)
     bash ./cicd/prepare_hf_cache.sh
     ;;
@@ -21,9 +22,10 @@ case "${MULTIGPU_TEST_SUITE}" in
     selection=(-k "not test_axolotl_gdn_cp_parity and not test_fla_cp_four_rank_parity")
     ;;
   gpu_slow_four_rank)
+    bash cicd/install_mono_ep.sh
     required_gpus=4
-    tests=(tests/e2e/multigpu/test_ringmaster.py)
-    selection=(-k test_fla_cp_four_rank_parity)
+    tests=(tests/e2e/multigpu/test_ringmaster.py tests/e2e/multigpu/test_ep_mono_ep.py)
+    selection=(-k "test_fla_cp_four_rank_parity or test_mono_ep_fsdp2_parity")
     ;;
   *) echo "Unknown slow GPU suite: $MULTIGPU_TEST_SUITE" >&2; exit 1 ;;
 esac

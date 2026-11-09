@@ -23,10 +23,19 @@ class ExpertParallelArgs(BaseModel):
     expert_parallel_size: int = 1
     """Number of EP ranks. 1 = disabled (default), > 1 = enabled."""
 
-    expert_parallel_backend: Literal["auto", "deep_ep", "torch"] = "auto"
+    expert_parallel_backend: Literal["auto", "deep_ep", "torch", "mono_ep"] = "auto"
     """Token dispatch backend. ``deep_ep``: DeepEP fused kernels (NVLink/RDMA). ``torch``: plain
-    ``all_to_all_single`` over the EP process group (any NCCL/gloo setup). ``auto``: ``deep_ep``
-    when importable, else ``torch``."""
+    ``all_to_all_single`` over the EP process group (any NCCL/gloo setup). ``mono_ep``: one
+    persistent kernel per direction fusing dispatch, SwiGLU experts and combine (Hopper/Blackwell,
+    single NVLink node; the local experts implementation is not used). ``auto``: ``deep_ep`` when
+    importable, else ``torch``; it never selects ``mono_ep``."""
+
+    expert_parallel_mono_ep_precision: Literal[
+        "auto", "bf16", "mxfp8", "fp8", "fp8_bwd"
+    ] = "auto"
+    """Compute precision of the ``mono_ep`` backend. ``auto``: ``bf16`` on SM90, ``mxfp8`` on
+    SM100. ``fp8`` is blockwise E4M3 forward and backward (SM90); ``fp8_bwd`` is BF16 forward with
+    blockwise FP8 backward. Master weights stay in their own dtype."""
 
     expert_parallel_num_nvl_bytes: int = 256 << 20
 

@@ -213,7 +213,7 @@ version = { file = "VERSION" }
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-extend-exclude = ["src/axolotl/core/trainers/prm"]
+extend-exclude = ["src/axolotl/core/trainers/prm", "packages/mono-ep/vendor"]
 force-exclude = true
 
 [tool.ruff.lint]

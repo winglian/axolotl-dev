@@ -2288,13 +2288,14 @@ class ModelCompatibilityValidationMixin:
     def check_torch_expert_parallel_checkpointing(self):
         if (getattr(self, "expert_parallel_size", 1) or 1) <= 1:
             return self
-        if self._resolved_expert_parallel_backend() != "torch":
+        backend = self._resolved_expert_parallel_backend()
+        if backend not in ("torch", "mono_ep"):
             return self
         # recompute has to replay the forward's routing through a SAC policy
         checkpointing = self.activation_checkpointing
         if checkpointing.enabled and checkpointing.reentrant:
             raise ValueError(
-                "expert_parallel_backend: torch requires non-reentrant activation "
+                f"expert_parallel_backend: {backend} requires non-reentrant activation "
                 "checkpointing (activation_checkpointing.reentrant: false): "
                 "recompute must reuse the forward's routing, which reentrant "
                 "checkpointing cannot guarantee"
@@ -2308,6 +2309,43 @@ class ModelCompatibilityValidationMixin:
             raise ValueError(
                 "expert_parallel_dispatch_chunks > 1 requires expert_parallel_backend: "
                 "torch (DeepEP dispatches the whole batch in one fused kernel)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_expert_parallel_mono_ep(self):
+        if (getattr(self, "expert_parallel_size", 1) or 1) <= 1:
+            return self
+        if getattr(self, "expert_parallel_backend", None) != "mono_ep":
+            if (
+                getattr(self, "expert_parallel_mono_ep_precision", None) or "auto"
+            ) != "auto":
+                LOG.warning(
+                    "expert_parallel_mono_ep_precision only applies to "
+                    "expert_parallel_backend: mono_ep; ignored."
+                )
+            return self
+        ignored = [
+            key
+            for key in ("use_sonicmoe", "use_scattermoe")
+            if getattr(self, key, False)
+        ]
+        if getattr(self, "experts_implementation", None) not in (
+            None,
+            "grouped_mm",
+            "expert_parallel",
+        ):
+            ignored.append(f"experts_implementation: {self.experts_implementation}")
+        if ignored:
+            LOG.warning(
+                f"expert_parallel_backend: mono_ep fuses dispatch, experts and combine, "
+                f"so the local experts kernel ({', '.join(ignored)}) is ignored; it is used "
+                "only if mono_ep falls back to the torch backend."
+            )
+        if (getattr(self, "expert_parallel_dispatch_chunks", None) or 1) > 1:
+            LOG.warning(
+                "expert_parallel_dispatch_chunks is ignored by expert_parallel_backend: "
+                "mono_ep (communication overlaps inside the fused kernels)."
             )
         return self
 

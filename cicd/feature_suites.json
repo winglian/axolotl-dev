@@ -138,6 +138,7 @@
       "audited_tests": [
         "tests/e2e/multigpu/test_deepspeed_context_parallel.py",
         "tests/e2e/multigpu/test_dist_muon_fsdp2.py",
+        "tests/e2e/multigpu/test_ep_mono_ep.py",
         "tests/e2e/multigpu/test_eval.py",
         "tests/e2e/multigpu/test_expert_parallel_activation_offload.py",
         "tests/e2e/multigpu/test_expert_parallel_sac_offload.py",
@@ -274,11 +275,13 @@
     },
     "gpu_slow_four_rank": {
       "paths": [
+        "tests/e2e/multigpu/test_ep_mono_ep.py",
         "tests/e2e/multigpu/test_ringmaster.py"
       ],
       "exclude": [],
       "features": [],
       "audited_tests": [
+        "tests/e2e/multigpu/test_ep_mono_ep.py",
         "tests/e2e/multigpu/test_ringmaster.py"
       ]
     }

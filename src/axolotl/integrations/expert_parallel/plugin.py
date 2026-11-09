@@ -6,12 +6,14 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Expert-Parallel plugin for axolotl (DeepEP or torch all-to-all dispatch)."""
+"""Expert-Parallel plugin for axolotl (DeepEP, torch all-to-all or fused mono_ep)."""
 
 from __future__ import annotations
 
+import math
 import os
 from importlib.util import find_spec
+from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -41,6 +43,17 @@ KERNEL_IMPLEMENTATION_FLAGS = {
 
 # transformers' deepgemm forward writes into torch.empty outputs with no autograd path
 NO_BACKWARD_EXPERTS_IMPLEMENTATIONS = frozenset({"deepgemm"})
+
+MONO_EP = "mono_ep"
+_TOP_K_KEYS = ("num_experts_per_tok", "num_experts_per_token", "moe_topk", "top_k")
+
+
+class MonoEPGeometry(NamedTuple):
+    num_experts: int
+    hidden: int
+    intermediate: int
+    top_k: int
+    activation_clamp: float | None
 
 
 def expert_fsdp_mesh(mesh):
@@ -115,6 +128,24 @@ class ExpertParallelPlugin(BasePlugin):
     def get_input_args(self):
         return "axolotl.integrations.expert_parallel.ExpertParallelArgs"
 
+    _mono_ep_geometry: MonoEPGeometry | None = None
+
+    def get_distributed_env(self, cfg) -> dict[str, str]:
+        """``NCCL_MAX_CTAS`` sized to the SMs ``mono_ep`` leaves free, so FSDP collectives
+        cannot deadlock behind the persistent kernels. Pure: no CUDA or process group."""
+        if (
+            not self._is_ep_enabled(cfg)
+            or getattr(cfg, "expert_parallel_backend", None) != MONO_EP
+            or self._mono_ep_config_reason(cfg) is not None
+        ):
+            return {}
+        from mono_ep import DEFAULT_RESERVED_SMS, nccl_env
+
+        return nccl_env(
+            reserved_sms=DEFAULT_RESERVED_SMS,
+            dp_replicate=getattr(cfg, "dp_replicate_size", None) or 1,
+        )
+
     def pre_model_load(self, cfg):
         if not self._is_ep_enabled(cfg):
             return
@@ -137,16 +168,30 @@ class ExpertParallelPlugin(BasePlugin):
 
         register_all()
 
+        # mono_ep ignores the local implementation, but a later model-level fallback
+        # to torch runs it, so it is validated and registered all the same
         local = self._infer_local_implementation(cfg)
         self._check_local_implementation(local)
         self._register_kernel_implementation(local)
         set_backend(backend)
         set_local_implementation(local)
+        if backend == MONO_EP:
+            from mono_ep import DEFAULT_RESERVED_SMS, check_nccl_env
+
+            check_nccl_env(
+                reserved_sms=DEFAULT_RESERVED_SMS,
+                dp_replicate=getattr(cfg, "dp_replicate_size", None) or 1,
+            )
         previous = getattr(cfg, "experts_implementation", None)
         cfg.experts_implementation = EXPERT_PARALLEL
         LOG.info(
             f"expert_parallel: backend={backend!r}, experts_implementation "
-            f"{previous!r} -> {EXPERT_PARALLEL!r} wrapping {local!r}"
+            f"{previous!r} -> {EXPERT_PARALLEL!r} "
+            + (
+                f"(fused; {local!r} only on fallback)"
+                if backend == MONO_EP
+                else f"wrapping {local!r}"
+            )
         )
 
     def post_model_build(self, cfg, model):
@@ -159,6 +204,8 @@ class ExpertParallelPlugin(BasePlugin):
         from .shard import shard_expert_weights
 
         self._reject_transformers_distributed_model(model)
+        if backend == MONO_EP:
+            backend = self._resolve_mono_ep_model(cfg, model)
         ep_group = self._resolve_ep_group(cfg)
         ep_world = dist.get_world_size(ep_group) if ep_group is not None else 1
         # rank zero streams every expert slice to its peers here; on a 500B MoE this
@@ -205,6 +252,8 @@ class ExpertParallelPlugin(BasePlugin):
                     "expert_parallel_dispatch_chunks only applies to the torch backend; "
                     "ignored under deep_ep."
                 )
+        elif backend == MONO_EP:
+            self._register_checkpoint_saves(cfg, model)
         else:
             from .experts_fn import set_dispatch_chunks
             from .torch_dispatch import set_ep_group
@@ -234,6 +283,8 @@ class ExpertParallelPlugin(BasePlugin):
             return
 
         self._register_padding_dispatch_hook(model)
+        if getattr(cfg, "expert_parallel_backend", None) == MONO_EP:
+            self._build_mono_ep_runtime(cfg)
         if self._uses_torch_backend(cfg):
             self._install_required_checkpoint_policy(cfg, model)
 
@@ -413,10 +464,221 @@ class ExpertParallelPlugin(BasePlugin):
 
     @classmethod
     def _uses_torch_backend(cls, cfg) -> bool:
+        """Whether the backend needs the routing replayed under checkpointing (torch's
+        collectives; mono_ep's saved fused output)."""
         backend = getattr(cfg, "expert_parallel_backend", None) or "auto"
         if backend == "auto":
             backend = cls._resolve_backend(cfg)
-        return backend == "torch"
+        return backend in ("torch", MONO_EP)
+
+    def post_train_unload(self, cfg):
+        from .experts_fn import set_mono_ep_runtime
+
+        runtime = self.__dict__.pop("_mono_ep_runtime", None)
+        set_mono_ep_runtime(None)
+        if runtime is not None:
+            runtime.destroy()
+
+    @staticmethod
+    def _mono_ep_config_reason(cfg) -> str | None:
+        """Config-only reasons ``mono_ep`` cannot run (pure: no CUDA)."""
+        if find_spec("mono_ep") is None:
+            return "the mono_ep package is not installed (packages/mono-ep)"
+        if getattr(cfg, "adapter", None):
+            return (
+                f"adapter {cfg.adapter!r} is configured; the fused kernels train full "
+                "expert weights only"
+            )
+        quantized = [
+            key
+            for key in (
+                "load_in_4bit",
+                "load_in_8bit",
+                "gptq",
+                "model_quantization_config",
+            )
+            if getattr(cfg, key, None)
+        ]
+        if quantized:
+            return f"quantized model loading ({', '.join(quantized)}) is unsupported"
+        return None
+
+    @staticmethod
+    def _mono_ep_fallback(cfg, reason: str) -> str:
+        """Degrade to torch dispatch with the configured local kernel, or raise."""
+        msg = f"expert_parallel_backend=mono_ep is unsupported here: {reason}."
+        if not getattr(cfg, "expert_parallel_fallback_on_unsupported", True):
+            error = ImportError if "not installed" in reason else ValueError
+            raise error(
+                msg + " Set expert_parallel_fallback_on_unsupported: true to fall back "
+                "to expert_parallel_backend=torch."
+            )
+        LOG.warning(
+            msg + " Falling back to expert_parallel_backend=torch with the configured "
+            "local experts implementation."
+        )
+        cfg.expert_parallel_backend = "torch"
+        return "torch"
+
+    @staticmethod
+    def _expert_activation(experts) -> tuple[str, float | None, str | None]:
+        """``(activation, clamp, reason)`` for a gated experts module's epilogue."""
+        from transformers.activations import SiLUActivation
+
+        for attr in ("alpha", "swiglu_alpha"):
+            if getattr(experts, attr, None) is not None:
+                return "custom", None, f"gated activation with {attr} is unsupported"
+        clamp = getattr(experts, "limit", None)
+        if clamp is None:
+            clamp = getattr(experts, "swiglu_limit", None)
+        apply_gate = getattr(type(experts), "_apply_gate", None)
+        if apply_gate is not None and clamp is None:
+            from transformers.integrations.moe import _default_apply_gate
+
+            if apply_gate is not _default_apply_gate:
+                return "custom", None, "custom gated activation (_apply_gate)"
+        act_fn = getattr(experts, "act_fn", None)
+        silu = isinstance(act_fn, (torch.nn.SiLU, SiLUActivation))
+        return ("silu" if silu else type(act_fn).__name__), clamp, None
+
+    @classmethod
+    def _mono_ep_model_reason(
+        cls, cfg, model
+    ) -> tuple[MonoEPGeometry | None, str | None]:
+        """The fused geometry shared by every Experts module, or why there is none."""
+        from .experts_fn import _maybe_install_decorator_attrs
+        from .shard import _detect_experts_modules
+
+        if not torch.cuda.is_available():
+            return None, "CUDA is unavailable"
+        capability = torch.cuda.get_device_capability()
+        if capability < (9, 0):
+            return None, f"compute capability sm_{capability[0]}{capability[1]} < SM90"
+        config = getattr(model, "config", None)
+        get_text_config = getattr(config, "get_text_config", None)
+        text_config = get_text_config() if callable(get_text_config) else config
+        top_k = next(
+            (
+                getattr(text_config, key)
+                for key in _TOP_K_KEYS
+                if isinstance(getattr(text_config, key, None), int)
+            ),
+            None,
+        )
+        if top_k is None:
+            return None, "the model config does not name its router top-k"
+        geometries = set()
+        for name, experts in _detect_experts_modules(model):
+            _maybe_install_decorator_attrs(experts)
+            gate_up = getattr(experts, "gate_up_proj", None)
+            down = getattr(experts, "down_proj", None)
+            if (
+                gate_up is None
+                or down is None
+                or gate_up.dim() != 3
+                or down.dim() != 3
+                or not experts.has_gate
+            ):
+                return None, f"{name}: experts are not gated gate_up_proj/down_proj"
+            if experts.is_transposed or not getattr(experts, "is_concatenated", True):
+                return None, f"{name}: transposed or interleaved expert weights"
+            if experts.has_post_expert_norm:
+                return None, f"{name}: post-expert normalization is unsupported"
+            num_experts, two_i, hidden = gate_up.shape
+            intermediate = down.shape[-1]
+            if two_i != 2 * intermediate or tuple(down.shape) != (
+                num_experts,
+                hidden,
+                intermediate,
+            ):
+                return None, f"{name}: gate_up_proj/down_proj shapes do not match"
+            activation, clamp, reason = cls._expert_activation(experts)
+            if reason is not None:
+                return None, f"{name}: {reason}"
+            from mono_ep import unsupported_reason
+
+            reason = unsupported_reason(
+                capability=capability,
+                hidden=hidden,
+                intermediate=intermediate,
+                has_bias=bool(experts.has_bias),
+                activation=activation,
+                activation_clamp=clamp,
+                precision=getattr(cfg, "expert_parallel_mono_ep_precision", None)
+                or "auto",
+            )
+            if reason is not None:
+                return None, f"{name}: {reason}"
+            geometries.add(
+                MonoEPGeometry(num_experts, hidden, intermediate, top_k, clamp)
+            )
+        if len(geometries) != 1:
+            return None, (
+                "no Experts modules found"
+                if not geometries
+                else "Experts modules differ in geometry; one runtime serves every layer"
+            )
+        return geometries.pop(), None
+
+    def _resolve_mono_ep_model(self, cfg, model) -> str:
+        geometry, reason = self._mono_ep_model_reason(cfg, model)
+        if reason is not None:
+            from .experts_fn import set_backend
+
+            backend = self._mono_ep_fallback(cfg, reason)
+            set_backend(backend)
+            return backend
+        self._mono_ep_geometry = geometry
+        return MONO_EP
+
+    def _build_mono_ep_runtime(self, cfg) -> None:
+        """One runtime (and symmetric buffer) per process, shared by every MoE layer."""
+        from mono_ep import DEFAULT_RESERVED_SMS, MonoEPRuntime
+
+        from axolotl.monkeypatch.selective_checkpointing import register_mandatory_save
+
+        from .experts_fn import set_mono_ep_runtime
+
+        geometry = self._mono_ep_geometry
+        if geometry is None:
+            raise RuntimeError(
+                "expert_parallel: mono_ep geometry was not resolved in post_model_build"
+            )
+        if self.__dict__.get("_mono_ep_runtime") is not None:
+            return
+        batch = max(
+            getattr(cfg, "micro_batch_size", None) or 1,
+            getattr(cfg, "eval_batch_size", None) or 1,
+        )
+        tokens = math.ceil(
+            cfg.sequence_len
+            * batch
+            / (getattr(cfg, "context_parallel_size", None) or 1)
+        )
+        alignment = MonoEPRuntime.token_alignment()
+        tokens = -(-tokens // alignment) * alignment
+        runtime = MonoEPRuntime(
+            group=self._resolve_ep_group(cfg),
+            num_experts=geometry.num_experts,
+            max_tokens_per_rank=tokens,
+            top_k=geometry.top_k,
+            hidden=geometry.hidden,
+            intermediate=geometry.intermediate,
+            precision=getattr(cfg, "expert_parallel_mono_ep_precision", None)
+            or "auto",
+            reserved_sms=DEFAULT_RESERVED_SMS,
+            activation_clamp=geometry.activation_clamp,
+        )
+        self._mono_ep_runtime = runtime
+        set_mono_ep_runtime(runtime)
+        # the op saves only its inputs and recomputes in its own backward; SAC must keep
+        # its output instead of replaying a collective kernel
+        register_mandatory_save(ops={runtime.forward_op})
+        LOG.info(
+            f"expert_parallel: mono_ep runtime, {tokens} tokens/rank, "
+            f"{geometry.num_experts} experts, top-{geometry.top_k}, "
+            f"precision={getattr(runtime, 'precision', '?')}"
+        )
 
     @staticmethod
     def _migrate_deprecated_experts_implementation(cfg) -> None:
@@ -829,16 +1091,21 @@ class ExpertParallelPlugin(BasePlugin):
 
     @classmethod
     def _resolve_backend(cls, cfg) -> str | None:
-        """Resolve ``expert_parallel_backend`` to ``"deep_ep"`` / ``"torch"`` and store it on cfg.
+        """Resolve ``expert_parallel_backend`` and store it on cfg.
 
-        ``auto`` picks DeepEP when importable, else torch. Returns ``None`` when an explicit
-        ``deep_ep`` is unavailable and the fallback is enabled (EP is then skipped)."""
+        ``auto`` picks DeepEP when importable, else torch (never ``mono_ep``). Returns
+        ``None`` when an explicit ``deep_ep`` is unavailable and the fallback is enabled (EP is
+        then skipped). An unusable ``mono_ep`` degrades to ``torch`` under the fallback."""
         backend = getattr(cfg, "expert_parallel_backend", None) or "auto"
         if backend == "auto":
             backend = "deep_ep" if find_spec("deep_ep") is not None else "torch"
             cfg.expert_parallel_backend = backend
         if backend == "deep_ep" and not cls._deep_ep_available(cfg):
             return None
+        if backend == MONO_EP:
+            reason = cls._mono_ep_config_reason(cfg)
+            if reason is not None:
+                return cls._mono_ep_fallback(cfg, reason)
         return backend
 
     @staticmethod
