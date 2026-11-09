@@ -39,6 +39,13 @@ template <
     bool kFastMath,
     bool kCompactNonMath = false,
     bool kOriginalW1Layout = false,
+    bool kPhaseTrace = false,
+    uint32_t kDiagAblate = 0,
+    bool kVectorScatter = false,
+    bool kDeferCombineFence = false,
+    bool kVectorSwiGLU = false,
+    bool kVectorHQuant = false,
+    bool kSwizzleAccumSmem = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -234,6 +241,34 @@ sm90_fp8_mono_ep_forward_impl(void* y,
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
 
+    // Diagnostic per-CTA phase trace (kPhaseTrace only); the pointer rides in the unused recv-stats argument.
+    constexpr uint32_t kTraceHeader = 64, kTraceTaskSlots = 64, kTraceTaskFields = 16;
+    constexpr uint32_t kTraceCTAStride = kTraceHeader + kTraceTaskSlots * kTraceTaskFields;
+    int* const recv_stats = kPhaseTrace ? nullptr : cumulative_local_expert_recv_stats;
+    unsigned long long* const phase_trace = kPhaseTrace
+        ? reinterpret_cast<unsigned long long*>(cumulative_local_expert_recv_stats) +
+          static_cast<uint64_t>(sm_idx) * kTraceCTAStride : nullptr;
+    const auto trace_clock = [&]() -> uint64_t {
+        if constexpr (kPhaseTrace) return clock64(); else return 0;
+    };
+    const auto trace_add = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kPhaseTrace) atomicAdd(phase_trace + slot, static_cast<unsigned long long>(value));
+    };
+    const auto trace_set = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kPhaseTrace) phase_trace[slot] = value;
+    };
+    const auto trace_globaltimer = [&]() -> uint64_t {
+        uint64_t t = 0;
+        if constexpr (kPhaseTrace) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        return t;
+    };
+    if constexpr (kPhaseTrace) {
+        if (thread_idx == 0) {
+            trace_set(0, trace_globaltimer());
+            trace_set(1, trace_clock());
+        }
+    }
+
     // Task scheduler
     auto scheduler = sched::MonoEPScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
@@ -409,6 +444,8 @@ sm90_fp8_mono_ep_forward_impl(void* y,
         scheduler.fetch_expert_recv_count();
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
+        const uint64_t trace_pull_start = trace_clock();
+        uint64_t trace_ring_wait = 0, trace_pull_wait = 0, trace_meta_wait = 0, trace_rows = 0;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
@@ -509,10 +546,14 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             // Wait for ring buffer slot to be available (previous consumer must have finished all N blocks)
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
             const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
+            const uint64_t trace_ring0 = trace_clock();
             if (l1_empty_count_target > 0) {
                 const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
+            const uint64_t trace_ring1 = trace_clock();
+            trace_ring_wait += trace_ring1 - trace_ring0;
+            ++ trace_rows;
 
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
@@ -543,6 +584,8 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 }
             }
             __syncwarp();
+            const uint64_t trace_pull1 = trace_clock();
+            trace_pull_wait += trace_pull1 - trace_ring1;
 
             // Store weights and metadata
             if (cute::elect_one_sync()) {
@@ -572,6 +615,20 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 );
             }
             __syncwarp();
+            trace_meta_wait += trace_clock() - trace_pull1;
+        }
+
+        if constexpr (kPhaseTrace) {
+            if (lane_idx == 0 and warp_idx < 4) {
+                const uint64_t trace_pull_end = trace_clock();
+                trace_set(40 + warp_idx * 4, trace_pull_end - trace_pull_start);
+                trace_set(41 + warp_idx * 4, trace_ring_wait);
+                trace_set(42 + warp_idx * 4, trace_pull_wait);
+                trace_set(43 + warp_idx * 4, trace_meta_wait);
+                trace_set(56 + warp_idx, trace_pull_end);
+                if (warp_idx == 0) trace_set(2, trace_pull_start);
+            }
+            if (lane_idx == 0) trace_add(60, trace_rows);
         }
 
         // Clean workspace for the next usage, and also do cumulative stats
@@ -613,8 +670,8 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 if constexpr (kCompactNonMath) {
                     if (cute::elect_one_sync()) {
                         *workspace.get_expert_recv_count_sum_ptr(i) = 0;
-                        if (cumulative_local_expert_recv_stats != nullptr)
-                            ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
+                        if (recv_stats != nullptr)
+                            ptx::red_add(recv_stats + i, static_cast<int>(num_recv_tokens));
                     }
                     __syncwarp();
                 } else {
@@ -622,8 +679,8 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                     if (warp_idx == 0) {
                         *workspace.get_expert_recv_count_sum_ptr(i) = 0;
                     } else if (warp_idx == 1) {
-                        if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
-                            ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
+                        if (cute::elect_one_sync() and recv_stats != nullptr)
+                            ptx::red_add(recv_stats + i, static_cast<int>(num_recv_tokens));
                         __syncwarp();
                     }
                 }
@@ -652,9 +709,13 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+        if constexpr (kPhaseTrace) {
+            if (thread_idx == 0) trace_set(62, trace_clock());
+        }
     } else if (warp_idx == kNumDispatchWarps) {
         // GEMM TMA load warp for tokens
         task_info_t task_info;
+        uint64_t trace_l1_spin = 0, trace_l2_dep = 0, trace_a_empty = 0;
         while (scheduler.get_next_task(task_info)) {
             scheduler.release_task_info();
             const auto tensor_map_a_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_acts :
@@ -669,10 +730,12 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
 
             // Wait the token arrival
+            const uint64_t trace_spin0 = trace_clock();
             if (task_info.block_phase == sched::BlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
+                trace_l1_spin += trace_clock() - trace_spin0;
             } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
                 const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
                 const auto num_expected_blocks = SHARED_L2_SHAPE_K / (BLOCK_N / 2);
@@ -683,11 +746,15 @@ sm90_fp8_mono_ep_forward_impl(void* y,
 
             // Issue TMA
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                const uint64_t trace_dep0 = trace_clock();
                 if (task_info.block_phase == sched::BlockPhase::Linear2)
                     l2_k_block_dependency.wait(k_block_idx);
+                const uint64_t trace_empty0 = trace_clock();
+                trace_l2_dep += trace_empty0 - trace_dep0;
 
                 // Wait consumer release
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
+                trace_a_empty += trace_clock() - trace_empty0;
 
                 // Compute token offset from ring block index
                 uint32_t m_idx = block_idx * BLOCK_M;
@@ -730,9 +797,18 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 __syncwarp();
             }
         }
+        if constexpr (kPhaseTrace) {
+            if (lane_idx == 0) {
+                trace_set(30, trace_l1_spin);
+                trace_set(31, trace_l2_dep);
+                trace_set(32, trace_a_empty);
+                trace_set(33, trace_clock());
+            }
+        }
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // GEMM TMA load warp for weights
         task_info_t task_info;
+        uint64_t trace_b_empty = 0;
         while (scheduler.get_next_task(task_info)) {
             scheduler.release_task_info();
             const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights :
@@ -749,7 +825,9 @@ sm90_fp8_mono_ep_forward_impl(void* y,
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
+                const uint64_t trace_empty0 = trace_clock();
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
+                trace_b_empty += trace_clock() - trace_empty0;
 
                 // Compute weight offset
                 uint32_t k_idx = k_block_idx * BLOCK_K;
@@ -782,6 +860,9 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 __syncwarp();
             }
         }
+        if constexpr (kPhaseTrace) {
+            if (lane_idx == 0) trace_set(34, trace_b_empty);
+        }
     } else if (not kCompactNonMath and warp_idx == kNumDispatchWarps + 2) {
     } else if (warp_idx == kNumDispatchWarps + (kCompactNonMath ? 2 : 3)) {
         scheduler.mainloop(num_tokens, sm_locality_domains);
@@ -810,9 +891,17 @@ sm90_fp8_mono_ep_forward_impl(void* y,
 
         // Persistently schedule over blocks
         task_info_t task_info;
+        const bool trace_leader = epilogue_thread_idx == 0;
+        uint32_t trace_task = 0;
+        uint64_t trace_prev_end = trace_clock();
+        if constexpr (kPhaseTrace) {
+            if (trace_leader) trace_set(3, trace_prev_end);
+        }
         while (scheduler.get_next_task(task_info)) {
             // Copy task metadata before releasing the scheduler slot.
             scheduler.release_task_info();
+            const uint64_t trace_got = trace_clock();
+            uint64_t trace_full_first = 0, trace_full_rest = 0;
 
             float accum[WGMMA::kNumAccum] = {0};
             float partial[WGMMA::kNumAccum];
@@ -833,7 +922,12 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             const uint32_t num_k_blocks = task_info.shape_k / BLOCK_K;
             const uint32_t num_n_blocks = task_info.shape_n / BLOCK_N;
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                const uint64_t trace_fw0 = trace_clock();
                 shared_storage.full_barriers[stage_idx].wait(phase);
+                if constexpr (kPhaseTrace) {
+                    const uint64_t trace_fw = trace_clock() - trace_fw0;
+                    if (k_block_idx == 0) trace_full_first = trace_fw; else trace_full_rest += trace_fw;
+                }
                 if (task_info.block_phase != sched::BlockPhase::Linear1 and
                     task_info.block_phase != sched::BlockPhase::Linear2) {
                     for (uint32_t row = epilogue_wg_idx * WG_BLOCK_M + warp_idx_in_wg;
@@ -908,9 +1002,27 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                     shared_storage.empty_barriers[stage_idx].arrive();
             }
 
+            const uint64_t trace_ml_end = trace_clock();
+            uint64_t trace_mark[5] = {};
             constexpr uint32_t kWGMMAStoreRowsPerWarp = WGMMA::M / 4;
+            // 16-byte column chunks of a 256-byte row are XOR-swizzled by row % 8 so the 8 rows of a store are bank-disjoint.
+            DG_STATIC_ASSERT(not kSwizzleAccumSmem or (kVectorSwiGLU and kVectorScatter),
+                             "Swizzled accumulator staging requires the vector SwiGLU and scatter readers");
+            const auto smem_d_chunk = [&](const uint32_t& row, const uint32_t& col) {
+                return shared_storage.smem_d.raw + row * BLOCK_N +
+                    (kSwizzleAccumSmem ? (((col / 8) ^ (row % 8)) * 8 + col % 8) : col);
+            };
             #pragma unroll
-            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4 and kSwizzleAccumSmem and not (kDiagAblate & 8u); ++ i) {
+                const uint32_t row = epilogue_wg_idx * WG_BLOCK_M + warp_idx_in_wg * kWGMMAStoreRowsPerWarp + lane_idx / 4;
+                const uint32_t col = (lane_idx % 4) * 2 + i * 8;
+                *reinterpret_cast<__nv_bfloat162*>(smem_d_chunk(row, col)) =
+                    __floats2bfloat162_rn(accum[i * 4 + 0], accum[i * 4 + 1]);
+                *reinterpret_cast<__nv_bfloat162*>(smem_d_chunk(row + 8, col)) =
+                    __floats2bfloat162_rn(accum[i * 4 + 2], accum[i * 4 + 3]);
+            }
+            #pragma unroll
+            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4 and not kSwizzleAccumSmem and not (kDiagAblate & 8u); ++ i) {
                 const uint32_t row = epilogue_wg_idx * WG_BLOCK_M + warp_idx_in_wg * kWGMMAStoreRowsPerWarp + lane_idx / 4;
                 const uint32_t col = (lane_idx % 4) * 2 + i * 8;
                 shared_storage.smem_d.raw[row * BLOCK_N + col] = d_dtype_t(accum[i * 4 + 0]);
@@ -919,6 +1031,7 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 shared_storage.smem_d.raw[(row + 8) * BLOCK_N + col + 1] = d_dtype_t(accum[i * 4 + 3]);
             }
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            trace_mark[0] = trace_clock();
 
             // Compute offsets
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen
@@ -939,9 +1052,55 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                     const auto expected = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
                     while (ptx::ld_acq(l2_empty_ptr) != expected) {}
                 }
+                trace_mark[1] = trace_clock();
                 const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
                 auto output = task_info.is_shared() ? buffer.shared_l2_token_buffer : buffer.l2_token_buffer;
-                for (uint32_t linear = epilogue_thread_idx; linear < valid_m * L1_OUT_BLOCK_N;
+                if constexpr (kVectorSwiGLU) {
+                    // Eight consecutive outputs per thread: 16-byte gate/up reads and 16-byte stores.
+                    constexpr uint32_t kVec = sizeof(uint4) / sizeof(d_dtype_t);
+                    constexpr uint32_t kVecsPerRow = L1_OUT_BLOCK_N / kVec;
+                    DG_STATIC_ASSERT(L1_OUT_BLOCK_N % kVec == 0 and kVec == 8, "Invalid vector SwiGLU");
+                    for (uint32_t linear = epilogue_thread_idx; linear < valid_m * kVecsPerRow and not (kDiagAblate & 1u);
+                         linear += kNumEpilogueThreads) {
+                        const uint32_t row = linear / kVecsPerRow;
+                        const uint32_t p0 = (linear % kVecsPerRow) * kVec;
+                        const uint32_t gate_col = kOriginalW1Layout ? p0 : 2 * p0;
+                        const uint32_t up_col = kOriginalW1Layout ? p0 + 64 : gate_col + 8;
+                        const auto gate_vec = *reinterpret_cast<const uint4*>(smem_d_chunk(row, gate_col));
+                        const auto up_vec = *reinterpret_cast<const uint4*>(smem_d_chunk(row, up_col));
+                        const auto gates = reinterpret_cast<const d_dtype_t*>(&gate_vec);
+                        const auto ups = reinterpret_cast<const d_dtype_t*>(&up_vec);
+                        const float score = task_info.is_shared() ? 1.0f :
+                            *buffer.l1_topk_weights_buffer.get_data_buffer(ring_m_idx + row).template get_base_ptr<float>();
+                        uint4 out_vec, z_gate_vec, z_up_vec;
+                        auto outs = reinterpret_cast<d_dtype_t*>(&out_vec);
+                        auto z_gates = reinterpret_cast<__nv_bfloat16*>(&z_gate_vec);
+                        auto z_ups = reinterpret_cast<__nv_bfloat16*>(&z_up_vec);
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kVec; ++ j) {
+                            const float gate = static_cast<float>(gates[j]);
+                            const float up = static_cast<float>(ups[j]);
+                            const float clamped_gate = fminf(gate, kActivationClamp);
+                            const float clamped_up = fmaxf(fminf(up, kActivationClamp), -kActivationClamp);
+                            const float sigmoid = kFastMath ? math::fast_rcp(1.0f + __expf(-clamped_gate)) :
+                                                             1.0f / (1.0f + expf(-clamped_gate));
+                            outs[j] = d_dtype_t(clamped_gate * sigmoid * clamped_up * score);
+                            z_gates[j] = __float2bfloat16(clamped_gate);
+                            z_ups[j] = __float2bfloat16(clamped_up);
+                        }
+                        *reinterpret_cast<uint4*>(output.get_data_buffer(m_idx + row).template get_base_ptr<d_dtype_t>() +
+                                                  out_n_idx + p0) = out_vec;
+                        if (saved_z != nullptr and not task_info.is_shared()) {
+                            const auto src = *workspace.get_token_src_metadata_ptr(pool_m_idx + row);
+                            const uint64_t offset = ((static_cast<uint64_t>(src.rank_idx) * kNumMaxTokensPerRank + src.token_idx) *
+                                kNumTopk + src.topk_idx) * (2 * kIntermediateHidden);
+                            *reinterpret_cast<uint4*>(saved_z + offset + out_n_idx + p0) = z_gate_vec;
+                            *reinterpret_cast<uint4*>(saved_z + offset + kIntermediateHidden + out_n_idx + p0) = z_up_vec;
+                        }
+                    }
+                }
+                for (uint32_t linear = epilogue_thread_idx;
+                     linear < valid_m * L1_OUT_BLOCK_N and not (kDiagAblate & 1u) and not kVectorSwiGLU;
                      linear += kNumEpilogueThreads) {
                     const uint32_t row = linear / L1_OUT_BLOCK_N;
                     const uint32_t p = linear % L1_OUT_BLOCK_N;
@@ -967,18 +1126,75 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 }
                 __threadfence();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                trace_mark[2] = trace_clock();
+                trace_mark[3] = trace_mark[4] = trace_mark[2];
                 if (not task_info.is_shared() and (n_block_idx & 1u)) {
                     const auto mask_ptr = workspace.get_l2_full_mask_ptr(ring_block_idx);
                     const uint64_t even_bit = 1ull << (n_block_idx - 1);
                     const uint64_t expected_even = (pool_block_idx / kNumRingBlocks) & 1u ? 0ull : even_bit;
                     while ((ptx::ld_acq_gpu(mask_ptr) & even_bit) != expected_even) {}
+                    trace_mark[3] = trace_clock();
 
                     constexpr uint32_t kScaleRowStride =
                         math::constexpr_align(kIntermediateHidden / 32, 16u) / sizeof(float);
                     const uint32_t cache_k_block = n_block_idx / 2;
                     const uint32_t cache_col = cache_k_block * BLOCK_K;
                     const uint32_t math_warp_idx = epilogue_thread_idx / 32;
-                    for (uint32_t row = math_warp_idx; row < BLOCK_M; row += kNumEpilogueWarps) {
+                    if constexpr (kVectorHQuant and not (kDiagAblate & 2u)) {
+                        // A half-warp quantizes one 128-column row: all row loads are issued before any store.
+                        constexpr uint32_t kVec = sizeof(uint4) / sizeof(d_dtype_t);
+                        constexpr uint32_t kLanesPerRow = BLOCK_K / kVec;
+                        constexpr uint32_t kRowsPerPass = kNumEpilogueThreads / kLanesPerRow;
+                        constexpr uint32_t kNumPasses = BLOCK_M / kRowsPerPass;
+                        DG_STATIC_ASSERT(kLanesPerRow == 16 and BLOCK_M % kRowsPerPass == 0, "Invalid vector h quantization");
+                        const uint32_t lane_in_row = epilogue_thread_idx % kLanesPerRow;
+                        constexpr uint32_t kBatch = 4;
+                        DG_STATIC_ASSERT(kNumPasses % kBatch == 0, "Invalid h quantization batch");
+                        #pragma unroll
+                        for (uint32_t batch = 0; batch < kNumPasses; batch += kBatch) {
+                        uint4 packed[kBatch];
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kBatch; ++ j) {
+                            const uint32_t row = (batch + j) * kRowsPerPass + epilogue_thread_idx / kLanesPerRow;
+                            packed[j] = row < valid_m ? *reinterpret_cast<const uint4*>(
+                                buffer.l2_token_buffer.get_data_buffer(ring_m_idx + row).
+                                    template get_base_ptr<d_dtype_t>() + cache_col + lane_in_row * kVec) :
+                                make_uint4(0, 0, 0, 0);
+                        }
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kBatch; ++ j) {
+                            const uint32_t row = (batch + j) * kRowsPerPass + epilogue_thread_idx / kLanesPerRow;
+                            const auto elems = reinterpret_cast<const d_dtype_t*>(&packed[j]);
+                            float values[kVec];
+                            float amax = 1.0e-4f;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kVec; ++i) {
+                                values[i] = static_cast<float>(elems[i]);
+                                amax = fmaxf(amax, fabsf(values[i]));
+                            }
+                            #pragma unroll
+                            for (uint32_t delta = kLanesPerRow / 2; delta > 0; delta /= 2)
+                                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+                            const uint32_t bits = __float_as_uint(amax / 448.0f);
+                            const uint32_t exponent = ((bits >> 23) & 255u) + ((bits & 0x7fffffu) != 0);
+                            const float scale = __uint_as_float(exponent << 23);
+                            const float scale_inv = exponent == 255u ? 0.0f :
+                                __uint_as_float((254u - exponent) << 23);
+                            if (lane_in_row == 0)
+                                buffer.l2_cached_sf_buffer.get_base_ptr<float>()[
+                                    (ring_m_idx + row) * kScaleRowStride + cache_k_block] = scale;
+                            uint2 quantized;
+                            auto bytes = reinterpret_cast<__nv_fp8_e4m3*>(&quantized);
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kVec; ++i)
+                                bytes[i] = __nv_fp8_e4m3(values[i] * scale_inv);
+                            *reinterpret_cast<uint2*>(buffer.l2_cached_token_buffer.get_data_buffer(ring_m_idx + row).
+                                template get_base_ptr<__nv_fp8_e4m3>() + cache_col + lane_in_row * kVec) = quantized;
+                        }
+                        }
+                    }
+                    for (uint32_t row = math_warp_idx; row < BLOCK_M and not (kDiagAblate & 2u) and not kVectorHQuant;
+                         row += kNumEpilogueWarps) {
                         float values[4];
                         float amax = 1.0e-4f;
                         #pragma unroll
@@ -1011,6 +1227,7 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                     asm volatile("fence.proxy.async.global;" ::: "memory");
                     __threadfence();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    trace_mark[4] = trace_clock();
                 }
                 if (epilogue_thread_idx == 0) {
                     if (task_info.is_shared())
@@ -1020,8 +1237,33 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                         ptx::red_add(workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
                     }
                 }
+            } else if constexpr (kVectorScatter) {
+                // A half-warp moves one BF16 row as 16-byte vectors; metadata is read once per row.
+                constexpr uint32_t kChunksPerRow = BLOCK_N * sizeof(d_dtype_t) / sizeof(uint4);
+                constexpr uint32_t kRowsPerPass = kNumEpilogueThreads / kChunksPerRow;
+                constexpr uint32_t kNumElemsPerChunk = sizeof(uint4) / sizeof(d_dtype_t);
+                DG_STATIC_ASSERT(32 % kChunksPerRow == 0 and BLOCK_M % kRowsPerPass == 0, "Invalid vector scatter");
+                const uint32_t chunk = epilogue_thread_idx % kChunksPerRow;
+                #pragma unroll
+                for (uint32_t pass = 0; pass < BLOCK_M / kRowsPerPass and not (kDiagAblate & 36u); ++ pass) {
+                    const uint32_t row = pass * kRowsPerPass + epilogue_thread_idx / kChunksPerRow;
+                    if (row < valid_m) {
+                        const auto src = task_info.is_shared() ?
+                            layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + row, kNumTopk) :
+                            *workspace.get_token_src_metadata_ptr(pool_m_idx + row);
+                        auto dst = buffer.combine_token_buffer.get_rank_buffer(src.topk_idx).get_data_buffer(src.token_idx);
+                        const auto values = *reinterpret_cast<const uint4*>(smem_d_chunk(row, chunk * kNumElemsPerChunk));
+                        *reinterpret_cast<uint4*>(sym_buffer.map(
+                            dst.template get_base_ptr<d_dtype_t>() + n_idx + chunk * kNumElemsPerChunk, src.rank_idx)) = values;
+                    }
+                }
+                if constexpr (not (kDiagAblate & 4u) and not kDeferCombineFence)
+                    __threadfence_system();
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if (epilogue_thread_idx == 0 and not task_info.is_shared())
+                    ptx::red_add(workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
             } else {
-                for (uint32_t linear = epilogue_thread_idx; linear < valid_m * BLOCK_N;
+                for (uint32_t linear = epilogue_thread_idx; linear < valid_m * BLOCK_N and not (kDiagAblate & 36u);
                      linear += kNumEpilogueThreads) {
                     const uint32_t row = linear / BLOCK_N;
                     const uint32_t col = linear % BLOCK_N;
@@ -1032,11 +1274,68 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                     sym_buffer.map(dst.template get_base_ptr<d_dtype_t>() + n_idx + col, src.rank_idx)[0] =
                         shared_storage.smem_d.raw[row * BLOCK_N + col];
                 }
-                __threadfence_system();
+                if constexpr (not (kDiagAblate & 4u) and not kDeferCombineFence)
+                    __threadfence_system();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (epilogue_thread_idx == 0 and not task_info.is_shared())
                     ptx::red_add(workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
             }
+            if constexpr (kPhaseTrace) {
+                const uint64_t trace_end = trace_clock();
+                const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
+                if (epilogue_thread_idx == 128) {
+                    trace_add(28, trace_ml_end - trace_got);
+                    trace_add(29, trace_full_first + trace_full_rest);
+                }
+                if (trace_leader) {
+                    const uint64_t mainloop = trace_ml_end - trace_got;
+                    const uint64_t epilogue = trace_end - trace_ml_end;
+                    const uint64_t sched_wait = trace_got - trace_prev_end;
+                    trace_add(6, sched_wait);
+                    trace_add(7, trace_full_first);
+                    trace_add(8, trace_full_rest);
+                    trace_add(is_l1 ? 9 : 10, mainloop);
+                    trace_add(is_l1 ? 13 : 14, epilogue);
+                    trace_add(is_l1 ? 15 : 16, 1);
+                    trace_add(17, 1);
+                    trace_add(20, trace_mark[0] - trace_ml_end);
+                    if (is_l1) {
+                        trace_add(21, trace_mark[1] - trace_mark[0]);
+                        trace_add(22, trace_mark[2] - trace_mark[1]);
+                        trace_add(23, trace_mark[3] - trace_mark[2]);
+                        trace_add(24, trace_mark[4] - trace_mark[3]);
+                        trace_add(25, trace_end - trace_mark[4]);
+                        trace_add(27, n_block_idx & 1u);
+                        trace_add(11, trace_full_first);
+                    } else {
+                        trace_add(26, trace_end - trace_mark[0]);
+                        trace_add(12, trace_full_first);
+                    }
+                    if (trace_task < kTraceTaskSlots) {
+                        const uint32_t base = kTraceHeader + trace_task * kTraceTaskFields;
+                        trace_set(base + 0, 1 + (is_l1 ? 0 : 1) + (n_block_idx << 8));
+                        trace_set(base + 1, trace_got);
+                        trace_set(base + 2, trace_end);
+                        trace_set(base + 3, pool_block_idx);
+                        trace_set(base + 4, mainloop);
+                        trace_set(base + 5, epilogue);
+                        trace_set(base + 6, sched_wait);
+                        trace_set(base + 7, trace_full_first + trace_full_rest);
+                        trace_set(base + 8, trace_mark[0] - trace_ml_end);
+                        trace_set(base + 9, is_l1 ? trace_mark[2] - trace_mark[1] : trace_end - trace_mark[0]);
+                        trace_set(base + 10, is_l1 ? trace_mark[3] - trace_mark[2] : 0);
+                        trace_set(base + 11, is_l1 ? trace_mark[4] - trace_mark[3] : 0);
+                        trace_set(base + 12, is_l1 ? trace_mark[1] - trace_mark[0] : 0);
+                        trace_set(base + 13, valid_m);
+                        trace_set(base + 14, trace_full_first);
+                    }
+                    ++ trace_task;
+                }
+                trace_prev_end = trace_end;
+            }
+        }
+        if constexpr (kPhaseTrace) {
+            if (trace_leader) trace_set(4, trace_clock());
         }
 
         // Combine: reduce top-k results and write back
@@ -1086,6 +1385,10 @@ sm90_fp8_mono_ep_forward_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
+        // Publish this thread's combine writes once, before the grid sync that precedes the readiness flag.
+        if constexpr (kDeferCombineFence and not (kDiagAblate & 4u))
+            __threadfence_system();
+
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
             workspace, sm_idx, epilogue_thread_idx,
@@ -1098,10 +1401,17 @@ sm90_fp8_mono_ep_forward_impl(void* y,
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        const uint64_t trace_tail_start = trace_clock();
+        uint64_t trace_peer_wait = 0;
+        if constexpr (kPhaseTrace) {
+            if (trace_leader) trace_set(35, trace_tail_start);
+        }
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = ptx::get_grid_idx() + 1;
-        for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
+        for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx;
+             token_chunk_idx < num_tokens * kNumChunks and not (kDiagAblate & 16u);
+             token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
 
@@ -1115,8 +1425,10 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+            const uint64_t trace_peer0 = trace_clock();
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            trace_peer_wait += trace_clock() - trace_peer0;
 
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
 
@@ -1195,6 +1507,14 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 cute::tma_store_arrive();
             }
             __syncwarp();
+        }
+        if constexpr (kPhaseTrace) {
+            if (lane_idx == 0) trace_add(37, trace_peer_wait);
+            if (trace_leader) {
+                trace_set(36, trace_clock() - trace_tail_start);
+                trace_set(5, trace_clock());
+                trace_set(18, trace_globaltimer());
+            }
         }
     }
 #else

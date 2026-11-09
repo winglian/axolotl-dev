@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <format>
+#include <string>
 #include <string_view>
 #include <torch/python.h>
 #include <deep_gemm/layout/mono_ep.cuh>
@@ -87,6 +88,46 @@ static void fp8_mono_ep_forward_sm90(
     if (compact_non_math) {
         DG_HOST_ASSERT(world <= 32 and experts <= 64);
     }
+    // Diagnostic only: a device pointer to a zeroed uint64 phase-trace buffer (sms x 1088 entries).
+    const char* phase_trace_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_PHASE_TRACE");
+    const uint64_t phase_trace_ptr = phase_trace_selector == nullptr ? 0 :
+        std::strtoull(phase_trace_selector, nullptr, 10);
+    // Diagnostic only: bitmask removing epilogue constructs to time them (outputs become invalid).
+    const char* ablate_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_DIAG_ABLATE");
+    const uint32_t diag_ablate = ablate_selector == nullptr ? 0 :
+        static_cast<uint32_t>(std::strtoul(ablate_selector, nullptr, 10));
+    const char* vector_scatter_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_VECTOR_SCATTER");
+    DG_HOST_ASSERT(vector_scatter_selector == nullptr or std::string_view(vector_scatter_selector) == "0" or
+        std::string_view(vector_scatter_selector) == "1");
+    const bool vector_scatter =
+        vector_scatter_selector != nullptr and std::string_view(vector_scatter_selector) == "1";
+    const char* defer_fence_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_DEFER_COMBINE_FENCE");
+    DG_HOST_ASSERT(defer_fence_selector == nullptr or std::string_view(defer_fence_selector) == "0" or
+        std::string_view(defer_fence_selector) == "1");
+    const bool defer_fence =
+        defer_fence_selector != nullptr and std::string_view(defer_fence_selector) == "1";
+    const char* vector_swiglu_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_VECTOR_SWIGLU");
+    DG_HOST_ASSERT(vector_swiglu_selector == nullptr or std::string_view(vector_swiglu_selector) == "0" or
+        std::string_view(vector_swiglu_selector) == "1");
+    const bool vector_swiglu =
+        vector_swiglu_selector != nullptr and std::string_view(vector_swiglu_selector) == "1";
+    const char* vector_hquant_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_VECTOR_HQUANT");
+    DG_HOST_ASSERT(vector_hquant_selector == nullptr or std::string_view(vector_hquant_selector) == "0" or
+        std::string_view(vector_hquant_selector) == "1");
+    const bool vector_hquant =
+        vector_hquant_selector != nullptr and std::string_view(vector_hquant_selector) == "1";
+    const char* swizzle_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_SWIZZLE_ACCUM_SMEM");
+    DG_HOST_ASSERT(swizzle_selector == nullptr or std::string_view(swizzle_selector) == "0" or
+        std::string_view(swizzle_selector) == "1");
+    const bool swizzle_accum = swizzle_selector != nullptr and std::string_view(swizzle_selector) == "1";
+    DG_HOST_ASSERT(not swizzle_accum or (vector_scatter and vector_swiglu));
+    const bool diag = phase_trace_ptr != 0 or diag_ablate != 0 or vector_scatter or defer_fence or
+        vector_swiglu or vector_hquant or swizzle_accum;
+    const std::string diag_suffix = diag
+        ? std::format(", {}, {}u, {}, {}, {}, {}, {}", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
+            vector_scatter ? "true" : "false", defer_fence ? "true" : "false",
+            vector_swiglu ? "true" : "false", vector_hquant ? "true" : "false",
+            swizzle_accum ? "true" : "false") : std::string();
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
     const int block_threads = compact_non_math ? 384 : 512;
@@ -97,23 +138,28 @@ static void fp8_mono_ep_forward_sm90(
     while (hidden % pull != 0) pull /= 2;
     DG_HOST_ASSERT(hidden % pull == 0 and pull % 16 == 0);
     const auto kernel = jit->compile(
-        std::format("sm90_fp8_mono_ep_forward_{}_{}_{}",
+        std::format("sm90_fp8_mono_ep_forward_{}_{}_{}{}{}",
             compact_non_math ? "compact384" : "baseline512",
             trap_timeouts ? "trap" : "diagnostic",
-            original_w1_layout ? "original_w1" : "interleaved_w1"),
+            original_w1_layout ? "original_w1" : "interleaved_w1",
+            phase_trace_ptr != 0 ? "_phasetrace" : "",
+            (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
+                (vector_scatter ? "_vecscatter" : "") + (defer_fence ? "_deferfence" : "") +
+                (vector_swiglu ? "_vecswiglu" : "") + (vector_hquant ? "_vechquant" : "") +
+                (swizzle_accum ? "_swizzleacc" : "")),
         std::format(R"({}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_forward.cuh>
 static void instantiate() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm90_fp8_mono_ep_forward_impl<
-        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, 2, {}, {}, {}, 256, {}, {}, 0x7f7fffffu, false, {}, {}>);
+        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, 2, {}, {}, {}, 256, {}, {}, 0x7f7fffffu, false, {}, {}{}>);
 }}
 )", trap_timeouts ? "#define DG_TRAP_ONLY_TIMEOUTS 1" : "",
             max_tokens, hidden, inner, experts * world, topk, ring_tokens, pull,
             dispatch_threads, non_epilogue_threads, sms, world,
-            compact_non_math ? "true" : "false", original_w1_layout ? "true" : "false"));
+            compact_non_math ? "true" : "false", original_w1_layout ? "true" : "false", diag_suffix));
     jit->launch(kernel, {.num_smem_bytes = SM90ArchSpec::smem_capacity, .grid_dim = dim3(sms),
         .block_dim = dim3(block_threads), .cluster_dim = dim3(1, 1, 1)},
-        y.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),
+        y.data_ptr(), reinterpret_cast<int*>(phase_trace_ptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),
         tx, tw1, th_out, th, th_cached, tw2, tx, tw1, th_out, th, tw2,
         static_cast<const uint8_t*>(nullptr), saved_z.has_value() ? saved_z->data_ptr() : nullptr,
         scales[0].data_ptr<float>(), scales[1].data_ptr<float>());
