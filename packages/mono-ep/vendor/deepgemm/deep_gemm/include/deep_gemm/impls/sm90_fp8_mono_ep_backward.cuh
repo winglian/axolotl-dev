@@ -197,6 +197,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
         Barrier combine_barriers[kNumEpilogueWarps * 2];
         Barrier task_info_full_barriers[kNumScheduleStages];
         Barrier task_info_empty_barriers[kNumScheduleStages];
+        alignas(128) uint8_t xdy_stage[kVectorXdyPack ? 2 * BLOCK_M * 128 + 2 * BLOCK_M * sizeof(float) : 16];
     };
     DG_STATIC_ASSERT(sizeof(SharedStorage) <= 232448, "SM90 backward exceeds Hopper shared memory capacity");
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
@@ -1178,69 +1179,94 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 __threadfence();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             };
-            // Same numerics as pack_cached_columns (max reductions are order free), restaged per
-            // 128-column scale group with 16-byte loads/stores; reuses smem_d.raw, so the caller
-            // must have consumed the dh accumulator first.
+            // Same numerics as pack_cached_columns (max reductions are order free), staged per
+            // 128-column scale group through two cp.async buffers. Stage 1 aliases smem_d.raw, so
+            // the caller must have consumed the dh accumulator first.
             auto pack_cached_xdy_vectorized = [&]() {
                 constexpr uint32_t kChunk = 128;
+                constexpr uint32_t kNumChunks = kHidden / kChunk;
                 constexpr uint32_t kChunkBytes = BLOCK_M * kChunk;
                 constexpr uint32_t kNumVectors = 2 * kChunkBytes / 16;
                 DG_STATIC_ASSERT(sizeof(shared_storage.smem_d) >= 2 * kChunkBytes, "x/dy staging needs 32 KB");
                 DG_STATIC_ASSERT(sizeof(shared_storage.quantized_a) >= 2 * BLOCK_M * sizeof(float), "scale staging");
-                DG_STATIC_ASSERT(kNumEpilogueThreads == 256 and BLOCK_M == 128 and kHidden % kChunk == 0,
+                DG_STATIC_ASSERT(not kVectorXdyPack or
+                                 sizeof(shared_storage.xdy_stage) >= 2 * kChunkBytes + 2 * BLOCK_M * sizeof(float),
+                                 "x/dy second stage");
+                DG_STATIC_ASSERT(kNumEpilogueThreads == 2 * BLOCK_M and BLOCK_M == 128 and kNumChunks >= 2,
                                  "vectorized x/dy pack assumes 8 warps over 128x128 chunks");
                 DG_STATIC_ASSERT(kNumVectors % kNumEpilogueThreads == 0, "Invalid staging split");
                 const uint32_t expert_start = pool_m_idx - task_info.m_block_idx * BLOCK_M;
                 const uint32_t padded_count = shared_storage.expert_padded_counts[task_info.local_expert_idx];
                 const uint32_t local_row = pool_m_idx - expert_start;
-                auto* stage = reinterpret_cast<uint8_t*>(shared_storage.smem_d.raw);
-                auto* stage_scales = reinterpret_cast<float*>(shared_storage.quantized_a);
-                const uint8_t* sources[2] = {backward.qx_pool, backward.qdy_pool};
-                const float* source_scales[2] = {backward.sx_pool, backward.sdy_pool};
-                uint8_t* packed[2] = {backward.qx_col, backward.qdy_col};
-                float* packed_scales[2] = {backward.sx_col, backward.sdy_col};
+                // Ternaries rather than pointer arrays keep the selections out of local memory.
+                auto stage_data = [&](uint32_t stage) {
+                    return stage == 0 ? shared_storage.xdy_stage : reinterpret_cast<uint8_t*>(shared_storage.smem_d.raw);
+                };
+                auto stage_scales = [&](uint32_t stage) {
+                    return stage == 0 ? reinterpret_cast<float*>(shared_storage.xdy_stage + 2 * kChunkBytes)
+                                      : reinterpret_cast<float*>(shared_storage.quantized_a);
+                };
                 const uint32_t col_group = 4 * epilogue_warp_idx + lane_idx / 8;
                 const uint32_t row_group = lane_idx % 8;
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                for (uint32_t chunk = 0; chunk < kHidden / kChunk; ++chunk) {
+                auto issue = [&](uint32_t chunk, uint32_t stage) {
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumVectors / kNumEpilogueThreads; ++i) {
-                        const uint32_t linear = epilogue_thread_idx + i * kNumEpilogueThreads;
-                        const uint32_t tensor = linear / (kChunkBytes / 16);
-                        const uint32_t row = (linear / 8) % BLOCK_M;
+                        constexpr uint32_t kPerTensor = kChunkBytes / 16 / kNumEpilogueThreads;
+                        const uint32_t tensor = i / kPerTensor;
+                        const uint32_t linear = epilogue_thread_idx + (i % kPerTensor) * kNumEpilogueThreads;
+                        const uint32_t row = linear / 8;
                         const uint32_t vec = linear % 8;
-                        uint4 value = make_uint4(0, 0, 0, 0);
-                        if (row < valid_m)
-                            value = *reinterpret_cast<const uint4*>(sources[tensor] +
-                                static_cast<uint64_t>(pool_m_idx + row) * kHidden + chunk * kChunk + vec * 16);
-                        *reinterpret_cast<uint4*>(stage + tensor * kChunkBytes + row * kChunk +
-                            ((vec ^ ((row / 16) % 8)) * 16)) = value;
+                        const bool valid = row < valid_m;
+                        const uint8_t* src = (tensor == 0 ? backward.qx_pool : backward.qdy_pool) + (valid
+                            ? static_cast<uint64_t>(pool_m_idx + row) * kHidden + chunk * kChunk + vec * 16 : 0);
+                        const auto dst = static_cast<uint32_t>(__cvta_generic_to_shared(
+                            stage_data(stage) + tensor * kChunkBytes + row * kChunk + ((vec ^ ((row / 16) % 8)) * 16)));
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                                     :: "r"(dst), "l"(src), "r"(valid ? 16u : 0u) : "memory");
                     }
-                    {
-                        const uint32_t tensor = epilogue_thread_idx / BLOCK_M;
-                        const uint32_t row = epilogue_thread_idx % BLOCK_M;
-                        stage_scales[epilogue_thread_idx] = row < valid_m
-                            ? source_scales[tensor][static_cast<uint64_t>(pool_m_idx + row) * (kHidden / 128) + chunk]
-                            : 0.0f;
-                    }
+                    const uint32_t tensor = epilogue_thread_idx / BLOCK_M;
+                    const uint32_t row = epilogue_thread_idx % BLOCK_M;
+                    const bool valid = row < valid_m;
+                    const float* src = (tensor == 0 ? backward.sx_pool : backward.sdy_pool) + (valid
+                        ? static_cast<uint64_t>(pool_m_idx + row) * (kHidden / 128) + chunk : 0);
+                    const auto dst = static_cast<uint32_t>(__cvta_generic_to_shared(
+                        stage_scales(stage) + epilogue_thread_idx));
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;"
+                                 :: "r"(dst), "l"(src), "r"(valid ? 4u : 0u) : "memory");
+                    asm volatile("cp.async.commit_group;" ::: "memory");
+                };
+                auto dequant2 = [](uint32_t word, uint32_t half, float scale) {
+                    const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(
+                        static_cast<__nv_fp8x2_storage_t>(word >> (16 * half)), __NV_E4M3);
+                    const float2 f = __half22float2(__half2(raw));
+                    return __bfloat1622float2(__floats2bfloat162_rn(f.x * scale, f.y * scale));
+                };
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                issue(0, 0);
+                issue(1, 1);
+                for (uint32_t chunk = 0; chunk < kNumChunks; ++chunk) {
+                    const uint32_t stage = chunk % 2;
+                    if (chunk + 1 < kNumChunks)
+                        asm volatile("cp.async.wait_group 1;" ::: "memory");
+                    else
+                        asm volatile("cp.async.wait_group 0;" ::: "memory");
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     #pragma unroll
                     for (uint32_t tensor = 0; tensor < 2; ++tensor) {
-                        const auto* words = reinterpret_cast<const uint32_t*>(stage + tensor * kChunkBytes);
+                        const auto* words = reinterpret_cast<const uint32_t*>(stage_data(stage) + tensor * kChunkBytes);
                         const uint32_t word_idx = col_group ^ (4 * row_group);
-                        const float* row_scales = stage_scales + tensor * BLOCK_M + row_group * 16;
-                        auto dequant = [&](uint32_t word, uint32_t k, float scale) {
-                            __nv_fp8_e4m3 fp8;
-                            fp8.__x = static_cast<__nv_fp8_storage_t>((word >> (8 * k)) & 0xffu);
-                            return __bfloat162float(__float2bfloat16_rn(static_cast<float>(fp8) * scale));
-                        };
+                        const float* row_scales = stage_scales(stage) + tensor * BLOCK_M + row_group * 16;
                         float amax[4] = {1.0e-4f, 1.0e-4f, 1.0e-4f, 1.0e-4f};
                         #pragma unroll
                         for (uint32_t j = 0; j < 16; ++j) {
                             const uint32_t word = words[(row_group * 16 + j) * (kChunk / 4) + word_idx];
+                            const float scale = row_scales[j];
                             #pragma unroll
-                            for (uint32_t k = 0; k < 4; ++k)
-                                amax[k] = fmaxf(amax[k], fabsf(dequant(word, k, row_scales[j])));
+                            for (uint32_t h = 0; h < 2; ++h) {
+                                const float2 v = dequant2(word, h, scale);
+                                amax[2 * h] = fmaxf(amax[2 * h], fabsf(v.x));
+                                amax[2 * h + 1] = fmaxf(amax[2 * h + 1], fabsf(v.y));
+                            }
                         }
                         float inv[4], scale_out[4];
                         #pragma unroll
@@ -1255,28 +1281,34 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                         }
                         const uint32_t col = chunk * kChunk + 4 * col_group;
                         if (row_group == 0)
-                            *reinterpret_cast<float4*>(packed_scales[tensor] +
+                            *reinterpret_cast<float4*>((tensor == 0 ? backward.sx_col : backward.sdy_col) +
                                 static_cast<uint64_t>(pool_block_idx) * kHidden + col) =
                                 make_float4(scale_out[0], scale_out[1], scale_out[2], scale_out[3]);
                         uint32_t out[4][4] = {};
                         #pragma unroll
                         for (uint32_t j = 0; j < 16; ++j) {
                             const uint32_t word = words[(row_group * 16 + j) * (kChunk / 4) + word_idx];
+                            const float scale = row_scales[j];
                             #pragma unroll
-                            for (uint32_t k = 0; k < 4; ++k) {
-                                const __nv_fp8_e4m3 q(dequant(word, k, row_scales[j]) * inv[k]);
-                                out[k][j / 4] |= static_cast<uint32_t>(q.__x) << (8 * (j % 4));
+                            for (uint32_t h = 0; h < 2; ++h) {
+                                const float2 v = dequant2(word, h, scale);
+                                const uint32_t q = __nv_cvt_float2_to_fp8x2(
+                                    make_float2(v.x * inv[2 * h], v.y * inv[2 * h + 1]), __NV_SATFINITE, __NV_E4M3);
+                                out[2 * h][j / 4] |= (q & 0xffu) << (8 * (j % 4));
+                                out[2 * h + 1][j / 4] |= (q >> 8) << (8 * (j % 4));
                             }
                         }
                         #pragma unroll
                         for (uint32_t k = 0; k < 4; ++k) {
                             const uint64_t dst = static_cast<uint64_t>(expert_start) * kHidden +
                                 static_cast<uint64_t>(col + k) * padded_count + local_row + row_group * 16;
-                            *reinterpret_cast<uint4*>(packed[tensor] + dst) =
+                            *reinterpret_cast<uint4*>((tensor == 0 ? backward.qx_col : backward.qdy_col) + dst) =
                                 make_uint4(out[k][0], out[k][1], out[k][2], out[k][3]);
                         }
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (chunk + 2 < kNumChunks)
+                        issue(chunk + 2, stage);
                 }
                 asm volatile("fence.proxy.async.global;" ::: "memory");
                 __threadfence();
