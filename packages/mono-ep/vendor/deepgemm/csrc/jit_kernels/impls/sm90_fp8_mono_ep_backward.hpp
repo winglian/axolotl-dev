@@ -193,7 +193,9 @@ static void fp8_mono_ep_backward_sm90(
     const std::string diag_suffix = std::format(", {}, {}u, {}, {}u, {}u, {}u, {}u, {}",
         phase_trace_ptr != 0 ? "true" : "false", diag_ablate, xdy_vector_pack ? "true" : "false",
         vector_hdz_pack, vector_dz_quant, dx_combine_mode, dispatch_spin, fp8_only_stages ? "true" : "false");
-    const int role_registers_mode = env_mode("MONO_EP_SM90_FP8_ROLE_REGISTERS", 0, 2);
+    // 2 = role-scoped setmaxnreg plus a split math region before the combine (removes C7507 and the
+    // epilogue spills); compact 384-thread launches keep the shared register budget.
+    const int role_registers_mode = env_mode("MONO_EP_SM90_FP8_ROLE_REGISTERS", compact_non_math ? 0 : 2, 2);
     const bool role_registers = role_registers_mode != 0;
     const bool split_combine_registers = role_registers_mode == 2;
     DG_HOST_ASSERT(not (role_registers and compact_non_math));
