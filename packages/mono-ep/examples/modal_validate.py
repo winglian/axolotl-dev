@@ -37,10 +37,9 @@ base_image = (
 image = base_image.add_local_dir(ROOT / "src", "/probe/src").add_local_file(
     ROOT / "examples/validate.py", "/probe/validate.py"
 )
-image = image.add_local_file(
-    ROOT / "../../src/axolotl/integrations/expert_parallel/mono_ep.py",
-    "/probe/axolotl_mono_ep_adapter.py",
-)
+_ADAPTER = ROOT / "../../src/axolotl/integrations/expert_parallel/mono_ep.py"
+if _ADAPTER.exists():
+    image = image.add_local_file(_ADAPTER, "/probe/axolotl_mono_ep_adapter.py")
 comparison_image = (
     base_image.run_commands(
         'uv pip install --python "$(command -v python)" '

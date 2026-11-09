@@ -115,14 +115,37 @@ static void fp8_mono_ep_forward_sm90(
     // stages (routed-only).
     const char* stages_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_STAGES");
     const bool custom_stages = stages_selector != nullptr and std::string_view(stages_selector) != "";
-    const int num_stages = custom_stages ? std::atoi(stages_selector) : 3;
+    // Default: 5 FP8-sized A stages on the 512-thread launch (routed-only; the shared-expert count is fixed at 0
+    // here), 3 on compact384.
+    const int num_stages = custom_stages ? std::atoi(stages_selector) : (compact_non_math ? 3 : 5);
     DG_HOST_ASSERT(num_stages >= 2 and num_stages <= 5);
     const bool fp8_only_stages = num_stages > 3;
-    const std::string diag_suffix = std::format(", {}, {}u, {}, {}, {}, {}, {}, {}",
+    // Relaxed polls plus one acquire on the dispatch ring, A-loader, epilogue and combine spins.
+    const bool relaxed_spins = env_flag("MONO_EP_SM90_FP8_FORWARD_RELAXED_SPINS", not compact_non_math);
+    // Mainloop bits: 1 skips the per-K-block proxy fence and named barrier on routed phases,
+    // 2 loads a task's weight scales once per lane, 4 overlaps WGMMA with promotion through two
+    // partial fragments, 8 through two 64-column halves (4 and 8 need 1, exclusive).
+    const char* mainloop_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_MAINLOOP");
+    const int mainloop_mode = mainloop_selector == nullptr or *mainloop_selector == '\0' ? (compact_non_math ? 0 : 1) :
+        std::atoi(mainloop_selector);
+    DG_HOST_ASSERT(mainloop_mode >= 0 and mainloop_mode <= 15 and (not (mainloop_mode & 12) or (mainloop_mode & 1)) and
+        (mainloop_mode & 12) != 12);
+    // 1 nests each setmaxnreg in its warpgroup's role branch, 2 also drops to 160 before combine.
+    const char* role_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_ROLE_REGISTERS");
+    const int role_registers_mode = role_selector == nullptr or *role_selector == '\0' ? (compact_non_math ? 0 : 2) :
+        std::atoi(role_selector);
+    DG_HOST_ASSERT(role_registers_mode >= 0 and role_registers_mode <= 2);
+    DG_HOST_ASSERT(role_registers_mode == 0 or not compact_non_math);
+    const std::string diag_suffix = std::format(", {}, {}u, {}, {}, {}, {}, {}, {}, {}u, {}",
         phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
         vector_scatter ? "true" : "false", defer_fence ? "true" : "false",
         vector_swiglu ? "true" : "false", vector_hquant ? "true" : "false",
-        swizzle_accum ? "true" : "false", fp8_only_stages ? "true" : "false");
+        swizzle_accum ? "true" : "false", fp8_only_stages ? "true" : "false", mainloop_mode,
+        relaxed_spins ? "true" : "false");
+    // Diagnostic only: multi-rank extension of the phase trace (sms x 64 more entries after the CTA records).
+    const char* dist_trace_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_DIST_TRACE");
+    const bool dist_trace = dist_trace_selector != nullptr and std::string_view(dist_trace_selector) == "1";
+    DG_HOST_ASSERT(not dist_trace or (phase_trace_ptr != 0 and world <= 8));
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
     const int block_threads = compact_non_math ? 384 : 512;
@@ -137,22 +160,28 @@ static void fp8_mono_ep_forward_sm90(
             compact_non_math ? "compact384" : "baseline512",
             trap_timeouts ? "trap" : "diagnostic",
             original_w1_layout ? "original_w1" : "interleaved_w1",
-            phase_trace_ptr != 0 ? "_phasetrace" : "",
+            phase_trace_ptr != 0 ? (dist_trace ? "_phasetrace_dist" : "_phasetrace") : "",
             (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
                 (num_stages != 2 ? std::format("_stages{}", num_stages) : std::string()) +
                 (vector_scatter ? "_vecscatter" : "") + (defer_fence ? "_deferfence" : "") +
                 (vector_swiglu ? "_vecswiglu" : "") + (vector_hquant ? "_vechquant" : "") +
-                (swizzle_accum ? "_swizzleacc" : "")),
-        std::format(R"({}
+                (swizzle_accum ? "_swizzleacc" : "") + (relaxed_spins ? "_relaxedspins" : "") +
+                (mainloop_mode != 0 ? std::format("_mainloop{}", mainloop_mode) : std::string()) +
+                (role_registers_mode == 2 ? "_rolereg_split" : role_registers_mode == 1 ? "_rolereg" : "")),
+        std::format(R"({}{}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_forward.cuh>
 static void instantiate() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm90_fp8_mono_ep_forward_impl<
         {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, {}, {}, {}, {}, 256, {}, {}, 0x7f7fffffu, false, {}, {}{}>);
 }}
 )", trap_timeouts ? "#define DG_TRAP_ONLY_TIMEOUTS 1" : "",
+            role_registers_mode == 2 ? "\n#define DG_MonoEP_FORWARD_ROLE_REGISTERS 1\n"
+                "#define DG_MonoEP_FORWARD_SPLIT_COMBINE_REGISTERS 160" :
+            role_registers_mode == 1 ? "\n#define DG_MonoEP_FORWARD_ROLE_REGISTERS 1" : "",
             max_tokens, hidden, inner, experts * world, topk, ring_tokens, num_stages, pull,
             dispatch_threads, non_epilogue_threads, sms, world,
-            compact_non_math ? "true" : "false", original_w1_layout ? "true" : "false", diag_suffix));
+            compact_non_math ? "true" : "false", original_w1_layout ? "true" : "false",
+            diag_suffix + (dist_trace ? ", true" : "")));
     jit->launch(kernel, {.num_smem_bytes = SM90ArchSpec::smem_capacity, .grid_dim = dim3(sms),
         .block_dim = dim3(block_threads), .cluster_dim = dim3(1, 1, 1)},
         y.data_ptr(), reinterpret_cast<int*>(phase_trace_ptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),

@@ -22,6 +22,32 @@
 
 namespace deep_gemm {
 
+#ifndef DG_MonoEP_RELAXED_SPIN_HELPERS
+#define DG_MonoEP_RELAXED_SPIN_HELPERS
+// Relaxed polls compile to LDG.STRONG without the per-iteration CCTL.IVALL of ld.acquire.
+__device__ __forceinline__ uint64_t mono_ep_ld_relaxed_gpu_u64(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
+__device__ __forceinline__ uint64_t mono_ep_ld_relaxed_sys_u64(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
+__device__ __forceinline__ bool mono_ep_mbarrier_test(const void* barrier, const uint32_t parity) {
+    uint32_t ready;
+    asm volatile(
+        "{\n\t.reg .pred p;\n\t"
+        "mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, p;\n\t}"
+        : "=r"(ready) : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(barrier))), "r"(parity) : "memory");
+    return ready != 0;
+}
+#endif
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -47,6 +73,9 @@ template <
     bool kVectorHQuant = false,
     bool kSwizzleAccumSmem = false,
     bool kFP8OnlyStages = false,
+    uint32_t kMainloopMode = 0,
+    bool kRelaxedSpins = false,
+    bool kDistTrace = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -271,6 +300,22 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             trace_set(1, trace_clock());
         }
     }
+    // Diagnostic multi-rank extension (kDistTrace only): 64 slots per CTA after all CTA records,
+    // globaltimer stamps (comparable across ranks of one node) and per-peer pull statistics.
+    DG_STATIC_ASSERT(not kDistTrace or (kPhaseTrace and kNumRanks <= 8), "Distributed trace needs the phase trace and <= 8 ranks");
+    constexpr uint32_t kDistTraceStride = 64;
+    unsigned long long* const dist_trace = kDistTrace
+        ? reinterpret_cast<unsigned long long*>(cumulative_local_expert_recv_stats) +
+          static_cast<uint64_t>(kNumSMs) * kTraceCTAStride + static_cast<uint64_t>(sm_idx) * kDistTraceStride : nullptr;
+    const auto dist_set = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kDistTrace) dist_trace[slot] = value;
+    };
+    const auto dist_add = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kDistTrace) atomicAdd(dist_trace + slot, static_cast<unsigned long long>(value));
+    };
+    const auto dist_max = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kDistTrace) atomicMax(dist_trace + slot, static_cast<unsigned long long>(value));
+    };
 
     // Task scheduler
     auto scheduler = sched::MonoEPScheduler<
@@ -327,7 +372,16 @@ sm90_fp8_mono_ep_forward_impl(void* y,
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
+#ifndef DG_MonoEP_FORWARD_ROLE_REGISTERS
+#define DG_MonoEP_FORWARD_ROLE_REGISTERS 0
+#endif
+    // ptxas drops every setmaxnreg (C7507) when a CFG path leads from a dealloc to the
+    // math role; the role-scoped layout places each directive inside its warpgroup's branch.
+    DG_STATIC_ASSERT(not DG_MonoEP_FORWARD_ROLE_REGISTERS or not kCompactNonMath,
+                     "Role-scoped registers require the 512-thread layout");
+
     // Register reconfiguration must execute convergently at one instruction per warpgroup.
+#if !DG_MonoEP_FORWARD_ROLE_REGISTERS
     if constexpr (kCompactNonMath) {
         if (warp_idx < 4)
             cutlass::arch::warpgroup_reg_dealloc<88>();
@@ -341,9 +395,13 @@ sm90_fp8_mono_ep_forward_impl(void* y,
         else
             cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
     }
+#endif
 
     // Different warp roles
     if (warp_idx < kNumDispatchWarps) {
+#if DG_MonoEP_FORWARD_ROLE_REGISTERS
+        cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+#endif
         // Dispatch warps
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
@@ -380,6 +438,9 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(0, trace_globaltimer());
+        }
 
         // Write source indices (~2 us with 512 tokens)
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -395,6 +456,9 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(1, trace_globaltimer());
+        }
 
         // Write expert count
         if (sm_idx == 0) {
@@ -427,6 +491,9 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
             /* After the NVLink barrier, there is a grid sync */ true
         );
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(2, trace_globaltimer());
+        }
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -445,6 +512,9 @@ sm90_fp8_mono_ep_forward_impl(void* y,
 
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(3, trace_globaltimer());
+        }
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         const uint64_t trace_pull_start = trace_clock();
@@ -552,7 +622,19 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             const uint64_t trace_ring0 = trace_clock();
             if (l1_empty_count_target > 0) {
                 const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
-                while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                if constexpr (kRelaxedSpins) {
+                    // Relaxed polls with nanosleep backoff; the counter is monotonic within a launch, so
+                    // one acquire re-read orders the ring writes after the consumer's release.
+                    uint32_t backoff_ns = 128;
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target) {
+                        while (ptx::ld_relaxed_gpu(empty_ptr) < l1_empty_count_target) {
+                            __nanosleep(backoff_ns);
+                            backoff_ns = cute::min(backoff_ns * 2, 4096u);
+                        }
+                    }
+                } else {
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                }
             }
             const uint64_t trace_ring1 = trace_clock();
             trace_ring_wait += trace_ring1 - trace_ring0;
@@ -589,6 +671,15 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             __syncwarp();
             const uint64_t trace_pull1 = trace_clock();
             trace_pull_wait += trace_pull1 - trace_ring1;
+            if constexpr (kDistTrace) {
+                if (lane_idx == 0) {
+                    const uint64_t arrival = trace_globaltimer();
+                    dist_add(16 + current_rank_in_expert_idx, trace_pull1 - trace_ring1);
+                    dist_add(24 + current_rank_in_expert_idx, 1);
+                    dist_max(32 + current_rank_in_expert_idx, ~arrival);
+                    dist_max(40 + current_rank_in_expert_idx, arrival);
+                }
+            }
 
             // Store weights and metadata
             if (cute::elect_one_sync()) {
@@ -631,6 +722,7 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 trace_set(56 + warp_idx, trace_pull_end);
                 if (warp_idx == 0) trace_set(2, trace_pull_start);
             }
+            if (lane_idx == 0) dist_max(4, trace_globaltimer());
             if (lane_idx == 0) trace_add(60, trace_rows);
         }
 
@@ -704,6 +796,9 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             }
         }
 
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(6, trace_globaltimer());
+        }
         // Wait for all ranks to finish cleaning
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
@@ -712,10 +807,19 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(5, trace_globaltimer());
+        }
         if constexpr (kPhaseTrace) {
             if (thread_idx == 0) trace_set(62, trace_clock());
         }
+#if DG_MonoEP_FORWARD_ROLE_REGISTERS
+    } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
+        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        if (warp_idx == kNumDispatchWarps) {
+#else
     } else if (warp_idx == kNumDispatchWarps) {
+#endif
         // GEMM TMA load warp for tokens
         task_info_t task_info;
         uint64_t trace_l1_spin = 0, trace_l2_dep = 0, trace_a_empty = 0;
@@ -737,7 +841,12 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             if (task_info.block_phase == sched::BlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
-                while (ptx::ld_acq(ptr) != num_expected_tokens);
+                if constexpr (kRelaxedSpins) {
+                    while (ptx::ld_acq(ptr) != num_expected_tokens)
+                        while (ptx::ld_relaxed_gpu(ptr) != num_expected_tokens);
+                } else {
+                    while (ptx::ld_acq(ptr) != num_expected_tokens);
+                }
                 trace_l1_spin += trace_clock() - trace_spin0;
             } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
                 const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
@@ -750,8 +859,22 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             // Issue TMA
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 const uint64_t trace_dep0 = trace_clock();
-                if (task_info.block_phase == sched::BlockPhase::Linear2)
-                    l2_k_block_dependency.wait(k_block_idx);
+                if (task_info.block_phase == sched::BlockPhase::Linear2) {
+                    if constexpr (kRelaxedSpins) {
+                        // L2KBlockDependency::wait with relaxed re-reads; the K block's bits flip once per
+                        // generation, so the single acquire re-read (read-read coherence) sees them fed too.
+                        const auto k_block_mask = ((1ull << L2KBlockDependency::kNumL1BlockNsPerL2KBlock) - 1)
+                            << (k_block_idx * L2KBlockDependency::kNumL1BlockNsPerL2KBlock);
+                        if (l2_k_block_dependency.pending_mask & k_block_mask) {
+                            while ((mono_ep_ld_relaxed_gpu_u64(l2_k_block_dependency.mask_ptr) ^
+                                    l2_k_block_dependency.expected_mask) & k_block_mask);
+                            l2_k_block_dependency.pending_mask =
+                                ptx::ld_acq_gpu(l2_k_block_dependency.mask_ptr) ^ l2_k_block_dependency.expected_mask;
+                        }
+                    } else {
+                        l2_k_block_dependency.wait(k_block_idx);
+                    }
+                }
                 const uint64_t trace_empty0 = trace_clock();
                 trace_l2_dep += trace_empty0 - trace_dep0;
 
@@ -869,7 +992,13 @@ sm90_fp8_mono_ep_forward_impl(void* y,
     } else if (not kCompactNonMath and warp_idx == kNumDispatchWarps + 2) {
     } else if (warp_idx == kNumDispatchWarps + (kCompactNonMath ? 2 : 3)) {
         scheduler.mainloop(num_tokens, sm_locality_domains);
+#if DG_MonoEP_FORWARD_ROLE_REGISTERS
+        }
+    } else {
+        cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
+#else
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
+#endif
         // GEMM epilogue warps
         const auto epilogue_warp_idx = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
         const auto epilogue_wg_idx = epilogue_warp_idx / 4;
@@ -900,11 +1029,16 @@ sm90_fp8_mono_ep_forward_impl(void* y,
         if constexpr (kPhaseTrace) {
             if (trace_leader) trace_set(3, trace_prev_end);
         }
+        [[maybe_unused]] bool dist_first_task = true;
         while (scheduler.get_next_task(task_info)) {
             // Copy task metadata before releasing the scheduler slot.
             scheduler.release_task_info();
             const uint64_t trace_got = trace_clock();
             uint64_t trace_full_first = 0, trace_full_rest = 0;
+            if constexpr (kDistTrace) {
+                if (trace_leader and dist_first_task) dist_set(48, trace_globaltimer());
+                dist_first_task = false;
+            }
 
             float accum[WGMMA::kNumAccum] = {0};
             float partial[WGMMA::kNumAccum];
@@ -924,15 +1058,201 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             const float* weight_scales = task_info.block_phase == sched::BlockPhase::Linear1 ? w1_scales : w2_scales;
             const uint32_t num_k_blocks = task_info.shape_k / BLOCK_K;
             const uint32_t num_n_blocks = task_info.shape_n / BLOCK_N;
-            for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+            // Weight scales of one task are contiguous over K: one load per lane, broadcast per K-block.
+            const float* task_weight_scales =
+                weight_scales + (task_info.local_expert_idx * num_n_blocks + weight_n) * num_k_blocks;
+            DG_STATIC_ASSERT(not (kMainloopMode & 2u) or (L1_SHAPE_K / BLOCK_K <= 32 and L2_SHAPE_K / BLOCK_K <= 32),
+                             "Weight-scale prefetch holds one K-block per lane");
+            const float lane_weight_scale = (kMainloopMode & 2u) and lane_idx < num_k_blocks ?
+                __ldg(task_weight_scales + lane_idx) : 0.0f;
+            const auto weight_scale = [&](const uint32_t& k_block_idx) {
+                if constexpr ((kMainloopMode & 2u) != 0)
+                    return __shfl_sync(0xffffffff, lane_weight_scale, k_block_idx);
+                else
+                    return task_weight_scales[k_block_idx];
+            };
+            const bool routed = ((kMainloopMode & 1u) and not kHasShared) or
+                task_info.block_phase == sched::BlockPhase::Linear1 or
+                task_info.block_phase == sched::BlockPhase::Linear2;
+            if constexpr ((kMainloopMode & 4u) != 0) {
+                // Two partial fragments: K-block k+1 is issued before K-block k is promoted.
+                DG_STATIC_ASSERT(not kHasShared and (kMainloopMode & 1u),
+                                 "Ping-pong mainloop supports routed experts only");
+                DG_STATIC_ASSERT(L1_SHAPE_K % (2 * BLOCK_K) == 0 and L2_SHAPE_K % (2 * BLOCK_K) == 0,
+                                 "Ping-pong mainloop needs an even number of K-blocks");
+                float partial_odd[WGMMA::kNumAccum];
+                const uint32_t row0 = epilogue_wg_idx * WG_BLOCK_M + warp_idx_in_wg * 16 + lane_idx / 4;
+                const auto wait_full = [&](const uint32_t& k_block_idx) {
+                    const uint64_t trace_fw0 = trace_clock();
+                    shared_storage.full_barriers[stage_idx].wait(phase);
+                    if constexpr (kPhaseTrace) {
+                        const uint64_t trace_fw = trace_clock() - trace_fw0;
+                        if (k_block_idx == 0) trace_full_first = trace_fw; else trace_full_rest += trace_fw;
+                    }
+                };
+                const auto issue = [&](float (&frag)[WGMMA::kNumAccum]) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                        ptx::warpgroup_fence_operand(frag[i]);
+                    ptx::warpgroup_arrive();
+                    const uint32_t a_base = cached_a_desc_lo + stage_idx * sizeof(shared_storage.smem_a[0]) / 16;
+                    const uint32_t b_base = b_desc_lo + stage_idx * sizeof(shared_storage.smem_b[0]) / 16;
+                    #pragma unroll
+                    for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++k) {
+                        a_desc.reg32_[0] = mma::sm90::advance_gmma_desc_lo<
+                            cute::UMMA::Major::K, BLOCK_M, BLOCK_K, kSwizzleAMode, __nv_fp8_e4m3>(
+                                a_base, epilogue_wg_idx * WG_BLOCK_M, k * WGMMA::K, 0);
+                        b_desc.reg32_[0] = mma::sm90::advance_gmma_desc_lo<
+                            cute::UMMA::Major::K, BLOCK_N, BLOCK_K, kSwizzleBMode, __nv_fp8_e4m3>(
+                                b_base, 0, k * WGMMA::K, 0);
+                        WGMMA::wgmma(a_desc, b_desc, frag, k != 0);
+                    }
+                    ptx::warpgroup_commit_batch();
+                    #pragma unroll
+                    for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                        ptx::warpgroup_fence_operand(frag[i]);
+                };
+                const auto promote = [&](float (&frag)[WGMMA::kNumAccum], const float& scale0, const float& scale1) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                        ptx::warpgroup_fence_operand(frag[i]);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                        accum[i] += frag[i] * (i % 4 < 2 ? scale0 : scale1);
+                };
+                // Scales of the in-flight K-block are read before its stage can be released.
+                float cur_scale0, cur_scale1, next_scale0, next_scale1;
+                const auto read_scales = [&](const uint32_t& k_block_idx, float& scale0, float& scale1) {
+                    const float sb = weight_scale(k_block_idx);
+                    scale0 = shared_storage.cached_activation_scales[stage_idx][row0] * sb;
+                    scale1 = shared_storage.cached_activation_scales[stage_idx][row0 + 8] * sb;
+                };
+                uint32_t k_block_idx = 0, prev_stage_idx = stage_idx;
+                wait_full(k_block_idx);
+                read_scales(k_block_idx, cur_scale0, cur_scale1);
+                issue(partial);
+                advance_pipeline(k_block_idx);
+                while (true) {
+                    wait_full(k_block_idx);
+                    read_scales(k_block_idx, next_scale0, next_scale1);
+                    issue(partial_odd);
+                    ptx::warpgroup_wait<1>();
+                    promote(partial, cur_scale0, cur_scale1);
+                    if (lane_idx == 0)
+                        shared_storage.empty_barriers[prev_stage_idx].arrive();
+                    prev_stage_idx = stage_idx;
+                    cur_scale0 = next_scale0, cur_scale1 = next_scale1;
+                    advance_pipeline(k_block_idx);
+                    if (k_block_idx == num_k_blocks) {
+                        ptx::warpgroup_wait<0>();
+                        promote(partial_odd, cur_scale0, cur_scale1);
+                        if (lane_idx == 0)
+                            shared_storage.empty_barriers[prev_stage_idx].arrive();
+                        break;
+                    }
+                    wait_full(k_block_idx);
+                    read_scales(k_block_idx, next_scale0, next_scale1);
+                    issue(partial);
+                    ptx::warpgroup_wait<1>();
+                    promote(partial_odd, cur_scale0, cur_scale1);
+                    if (lane_idx == 0)
+                        shared_storage.empty_barriers[prev_stage_idx].arrive();
+                    prev_stage_idx = stage_idx;
+                    cur_scale0 = next_scale0, cur_scale1 = next_scale1;
+                    advance_pipeline(k_block_idx);
+                }
+            }
+            if constexpr ((kMainloopMode & 8u) != 0) {
+                // N-split pipeline: each K-block runs as two 64-column WGMMA groups, and one half is
+                // promoted while the other half (or the next K-block's first half) is in flight.
+                DG_STATIC_ASSERT(not kHasShared and (kMainloopMode & 1u) and not (kMainloopMode & 4u),
+                                 "N-split mainloop supports routed experts only");
+                using HalfWGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N / 2>::type;
+                constexpr uint32_t kHalfAccum = HalfWGMMA::kNumAccum;
+                DG_STATIC_ASSERT(2 * kHalfAccum == WGMMA::kNumAccum, "Invalid N-split fragment");
+                float half_lo[kHalfAccum], half_hi[kHalfAccum];
+                const uint32_t row0 = epilogue_wg_idx * WG_BLOCK_M + warp_idx_in_wg * 16 + lane_idx / 4;
+                const auto wait_full = [&](const uint32_t& k_block_idx) {
+                    const uint64_t trace_fw0 = trace_clock();
+                    shared_storage.full_barriers[stage_idx].wait(phase);
+                    if constexpr (kPhaseTrace) {
+                        const uint64_t trace_fw = trace_clock() - trace_fw0;
+                        if (k_block_idx == 0) trace_full_first = trace_fw; else trace_full_rest += trace_fw;
+                    }
+                };
+                const auto issue = [&](float (&frag)[kHalfAccum], const uint32_t& half) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kHalfAccum; ++i)
+                        ptx::warpgroup_fence_operand(frag[i]);
+                    ptx::warpgroup_arrive();
+                    const uint32_t a_base = cached_a_desc_lo + stage_idx * sizeof(shared_storage.smem_a[0]) / 16;
+                    const uint32_t b_base = b_desc_lo + stage_idx * sizeof(shared_storage.smem_b[0]) / 16;
+                    #pragma unroll
+                    for (uint32_t k = 0; k < BLOCK_K / HalfWGMMA::K; ++k) {
+                        a_desc.reg32_[0] = mma::sm90::advance_gmma_desc_lo<
+                            cute::UMMA::Major::K, BLOCK_M, BLOCK_K, kSwizzleAMode, __nv_fp8_e4m3>(
+                                a_base, epilogue_wg_idx * WG_BLOCK_M, k * HalfWGMMA::K, 0);
+                        b_desc.reg32_[0] = mma::sm90::advance_gmma_desc_lo<
+                            cute::UMMA::Major::K, BLOCK_N, BLOCK_K, kSwizzleBMode, __nv_fp8_e4m3>(
+                                b_base, half * (BLOCK_N / 2), k * HalfWGMMA::K, 0);
+                        HalfWGMMA::wgmma(a_desc, b_desc, frag, k != 0);
+                    }
+                    ptx::warpgroup_commit_batch();
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kHalfAccum; ++i)
+                        ptx::warpgroup_fence_operand(frag[i]);
+                };
+                const auto promote = [&](float (&frag)[kHalfAccum], const uint32_t& half,
+                                         const float& scale0, const float& scale1) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kHalfAccum; ++i)
+                        ptx::warpgroup_fence_operand(frag[i]);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kHalfAccum; ++i)
+                        accum[half * kHalfAccum + i] += frag[i] * (i % 4 < 2 ? scale0 : scale1);
+                };
+                float scale0, scale1;
+                const auto read_scales = [&](const uint32_t& k_block_idx) {
+                    const float sb = weight_scale(k_block_idx);
+                    scale0 = shared_storage.cached_activation_scales[stage_idx][row0] * sb;
+                    scale1 = shared_storage.cached_activation_scales[stage_idx][row0 + 8] * sb;
+                };
+                uint32_t k_block_idx = 0;
+                wait_full(k_block_idx);
+                read_scales(k_block_idx);
+                issue(half_lo, 0);
+                issue(half_hi, 1);
+                while (true) {
+                    ptx::warpgroup_wait<1>();
+                    promote(half_lo, 0, scale0, scale1);
+                    const float hi_scale0 = scale0, hi_scale1 = scale1;
+                    const uint32_t done_stage_idx = stage_idx;
+                    advance_pipeline(k_block_idx);
+                    const bool has_next = k_block_idx < num_k_blocks;
+                    if (has_next) {
+                        wait_full(k_block_idx);
+                        read_scales(k_block_idx);
+                        issue(half_lo, 0);
+                        ptx::warpgroup_wait<1>();
+                    } else {
+                        ptx::warpgroup_wait<0>();
+                    }
+                    promote(half_hi, 1, hi_scale0, hi_scale1);
+                    if (lane_idx == 0)
+                        shared_storage.empty_barriers[done_stage_idx].arrive();
+                    if (not has_next)
+                        break;
+                    issue(half_hi, 1);
+                }
+            }
+            for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks and not (kMainloopMode & 12u); advance_pipeline(k_block_idx)) {
                 const uint64_t trace_fw0 = trace_clock();
                 shared_storage.full_barriers[stage_idx].wait(phase);
                 if constexpr (kPhaseTrace) {
                     const uint64_t trace_fw = trace_clock() - trace_fw0;
                     if (k_block_idx == 0) trace_full_first = trace_fw; else trace_full_rest += trace_fw;
                 }
-                if (task_info.block_phase != sched::BlockPhase::Linear1 and
-                    task_info.block_phase != sched::BlockPhase::Linear2) {
+                if (not routed) {
                     for (uint32_t row = epilogue_wg_idx * WG_BLOCK_M + warp_idx_in_wg;
                          row < (epilogue_wg_idx + 1) * WG_BLOCK_M; row += 4) {
                     float values[4];
@@ -962,13 +1282,14 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                     }
                     }
                 }
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                ptx::sync_aligned(128, 3 + epilogue_wg_idx);
+                // Only the in-kernel quantized A (shared phases) is written by these threads.
+                if (not (kMainloopMode & 1u) or not routed) {
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    ptx::sync_aligned(128, 3 + epilogue_wg_idx);
+                }
                 const uint32_t row0 = epilogue_wg_idx * WG_BLOCK_M + warp_idx_in_wg * 16 + lane_idx / 4;
-                const float sb = weight_scales[(task_info.local_expert_idx * num_n_blocks + weight_n) * num_k_blocks + k_block_idx];
-                const float* activation_scales =
-                    (task_info.block_phase == sched::BlockPhase::Linear1 or
-                     task_info.block_phase == sched::BlockPhase::Linear2) ?
+                const float sb = weight_scale(k_block_idx);
+                const float* activation_scales = routed ?
                     shared_storage.cached_activation_scales[stage_idx] : shared_storage.activation_scales;
                 const float scale0 = activation_scales[row0] * sb;
                 const float scale1 = activation_scales[row0 + 8] * sb;
@@ -1053,7 +1374,12 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 if (not task_info.is_shared()) {
                     const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
                     const auto expected = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
-                    while (ptx::ld_acq(l2_empty_ptr) != expected) {}
+                    if constexpr (kRelaxedSpins) {
+                        while (ptx::ld_acq(l2_empty_ptr) != expected)
+                            while (ptx::ld_relaxed_gpu(l2_empty_ptr) != expected) {}
+                    } else {
+                        while (ptx::ld_acq(l2_empty_ptr) != expected) {}
+                    }
                 }
                 trace_mark[1] = trace_clock();
                 const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
@@ -1135,7 +1461,12 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                     const auto mask_ptr = workspace.get_l2_full_mask_ptr(ring_block_idx);
                     const uint64_t even_bit = 1ull << (n_block_idx - 1);
                     const uint64_t expected_even = (pool_block_idx / kNumRingBlocks) & 1u ? 0ull : even_bit;
-                    while ((ptx::ld_acq_gpu(mask_ptr) & even_bit) != expected_even) {}
+                    if constexpr (kRelaxedSpins) {
+                        while ((ptx::ld_acq_gpu(mask_ptr) & even_bit) != expected_even)
+                            while ((mono_ep_ld_relaxed_gpu_u64(mask_ptr) & even_bit) != expected_even) {}
+                    } else {
+                        while ((ptx::ld_acq_gpu(mask_ptr) & even_bit) != expected_even) {}
+                    }
                     trace_mark[3] = trace_clock();
 
                     constexpr uint32_t kScaleRowStride =
@@ -1340,7 +1671,14 @@ sm90_fp8_mono_ep_forward_impl(void* y,
         if constexpr (kPhaseTrace) {
             if (trace_leader) trace_set(4, trace_clock());
         }
+        if constexpr (kDistTrace) {
+            if (trace_leader) dist_set(8, trace_globaltimer());
+        }
 
+#if DG_MonoEP_FORWARD_ROLE_REGISTERS && defined(DG_MonoEP_FORWARD_SPLIT_COMBINE_REGISTERS)
+        // Without a region boundary here ptxas caps the whole math role near 128 registers.
+        cutlass::arch::warpgroup_reg_dealloc<DG_MonoEP_FORWARD_SPLIT_COMBINE_REGISTERS>();
+#endif
         // Combine: reduce top-k results and write back
         // NOTES: reuse shared memory from start up to the barriers
         constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
@@ -1397,6 +1735,11 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             workspace, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
+        if constexpr (kDistTrace) {
+            if (epilogue_thread_idx == 0) dist_set(9, trace_globaltimer());
+        }
+        [[maybe_unused]] uint64_t dist_first_ready_wait = 0;
+        [[maybe_unused]] bool dist_first_token = true;
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
@@ -1429,9 +1772,23 @@ sm90_fp8_mono_ep_forward_impl(void* y,
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
             const uint64_t trace_peer0 = trace_clock();
-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
-                             [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            if constexpr (kRelaxedSpins) {
+                // Poll relaxed; each routed lane then acquires its peer's flag once (set once per launch).
+                // Read-read coherence makes the acquire observe the flag the relaxed poll saw.
+                comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or mono_ep_ld_relaxed_sys_u64(peer_ready_ptr) == grid_idx); },
+                                 [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+                if (is_routed)
+                    (void) ptx::ld_acq_sys(peer_ready_ptr);
+                __syncwarp();
+            } else {
+                comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                                 [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            }
             trace_peer_wait += trace_clock() - trace_peer0;
+            if constexpr (kDistTrace) {
+                if (dist_first_token) dist_first_ready_wait = trace_clock() - trace_peer0;
+                dist_first_token = false;
+            }
 
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
 
@@ -1513,6 +1870,8 @@ sm90_fp8_mono_ep_forward_impl(void* y,
         }
         if constexpr (kPhaseTrace) {
             if (lane_idx == 0) trace_add(37, trace_peer_wait);
+            if (lane_idx == 0) dist_add(10, trace_peer_wait);
+            if (lane_idx == 0) dist_max(11, dist_first_ready_wait);
             if (trace_leader) {
                 trace_set(36, trace_clock() - trace_tail_start);
                 trace_set(5, trace_clock());

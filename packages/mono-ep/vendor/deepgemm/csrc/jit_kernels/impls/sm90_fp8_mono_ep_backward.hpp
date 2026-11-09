@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Axolotl AI
 #pragma once
 
+#include <cstdio>
 #include <cstdlib>
 #include <format>
 #include <limits>
@@ -172,8 +173,25 @@ static void fp8_mono_ep_backward_sm90(
         DG_HOST_ASSERT(mode >= 0 and mode <= max_value);
         return mode;
     };
-    const bool xdy_vector_pack =
+    // 1 = the dispatch warps pack the x/dy columns from the cached FP8 row pools (replaces the math-warp pack).
+    const bool dispatch_xdy_pack = env_mode("MONO_EP_SM90_FP8_DISPATCH_XDY_PACK",
+        transport_fp8 and cached and packed_wgrad and not compact_non_math ? 1 : 0, 1) != 0;
+    DG_HOST_ASSERT(not dispatch_xdy_pack or (transport_fp8 and cached and packed_wgrad and not compact_non_math));
+    const bool xdy_vector_pack = not dispatch_xdy_pack and
         env_mode("MONO_EP_SM90_FP8_XDY_VECTOR_PACK", transport_fp8 and cached ? 1 : 0, 1) != 0;
+    // Dispatch / non-epilogue / epilogue setmaxnreg split used with the dispatch-warp pack (default "64/40/200";
+    // "48/40/208" is the split without the pack).
+    int pack_registers[3] = {64, 40, 200};
+    if (const char* value = std::getenv("MONO_EP_SM90_FP8_DISPATCH_PACK_REGISTERS"); value != nullptr and *value != '\0') {
+        DG_HOST_ASSERT(std::sscanf(value, "%d%*[,/]%d%*[,/]%d", &pack_registers[0], &pack_registers[1], &pack_registers[2]) == 3);
+        for (const int r : pack_registers)
+            DG_HOST_ASSERT(r >= 24 and r <= 256 and r % 8 == 0);
+        DG_HOST_ASSERT(pack_registers[0] * 128 + pack_registers[1] * 128 + pack_registers[2] * 256 <= 64512);
+    }
+    const bool custom_pack_registers = dispatch_xdy_pack and
+        (pack_registers[0] != 64 or pack_registers[1] != 40 or pack_registers[2] != 200);
+    // 1 = relaxed polls plus one acquire on the A-loader, dh epilogue and combine-readiness spins.
+    const bool relaxed_spins = env_mode("MONO_EP_SM90_FP8_RELAXED_SPINS", 0, 1) != 0;
     DG_HOST_ASSERT(not xdy_vector_pack or (transport_fp8 and cached));
     // 1 = vector pack with the original fences, 2 = also drops them (packed columns are read by a later launch).
     const int vector_hdz_pack = env_mode("MONO_EP_SM90_FP8_VECTOR_HDZ_PACK", 2, 2);
@@ -191,9 +209,18 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(fp8_stages == 0 or (fp8_stages >= 2 and cached_dz));
     const bool fp8_only_stages = fp8_stages != 0;
     const int num_stages = fp8_only_stages ? fp8_stages : 2;
-    const std::string diag_suffix = std::format(", {}, {}u, {}, {}u, {}u, {}u, {}u, {}",
+    // Mainloop bits: 1 stages cached row scales in shared memory from the A loader, 2 loads a task's
+    // weight scales once per lane.
+    // Off by default: mode 2 alone saves ~0.08 ms but costs ~0.1 ms on top of the dispatch-warp x/dy pack.
+    const int mainloop_mode = env_mode("MONO_EP_SM90_FP8_BACKWARD_MAINLOOP", 0, 3);
+    const std::string diag_suffix = std::format(", {}, {}u, {}, {}u, {}u, {}u, {}u, {}, {}u, {}, {}",
         phase_trace_ptr != 0 ? "true" : "false", diag_ablate, xdy_vector_pack ? "true" : "false",
-        vector_hdz_pack, vector_dz_quant, dx_combine_mode, dispatch_spin, fp8_only_stages ? "true" : "false");
+        vector_hdz_pack, vector_dz_quant, dx_combine_mode, dispatch_spin, fp8_only_stages ? "true" : "false",
+        mainloop_mode, relaxed_spins ? "true" : "false", dispatch_xdy_pack ? "true" : "false");
+    // Diagnostic only: multi-rank extension of the phase trace (sms x 64 more entries after the CTA records).
+    const char* dist_trace_selector = std::getenv("MONO_EP_SM90_FP8_DIST_TRACE");
+    const bool dist_trace = dist_trace_selector != nullptr and std::string_view(dist_trace_selector) == "1";
+    DG_HOST_ASSERT(not dist_trace or (phase_trace_ptr != 0 and world <= 8));
     // 2 = role-scoped setmaxnreg plus a split math region before the combine (removes C7507 and the
     // epilogue spills); compact 384-thread launches keep the shared register budget.
     const int role_registers_mode = env_mode("MONO_EP_SM90_FP8_ROLE_REGISTERS", compact_non_math ? 0 : 2, 2);
@@ -216,14 +243,18 @@ static void fp8_mono_ep_backward_sm90(
             compact_non_math ? "compact384" : "baseline512",
             trap_timeouts ? "trap" : "diagnostic",
             transport_fp8 ? (fp8_combine ? "fp8transport_fp8combine" : "fp8transport_bf16combine") : "bf16transport",
-            phase_trace_ptr != 0 ? "_phasetrace" : "",
+            phase_trace_ptr != 0 ? (dist_trace ? "_phasetrace_dist" : "_phasetrace") : "",
             (diag_ablate != 0 ? std::format("_ablate{}", diag_ablate) : std::string()) +
                 (fp8_only_stages ? std::format("_fp8stages{}", num_stages) : std::string()) +
                 (xdy_vector_pack ? "_xdyvec" : "") +
                 (vector_hdz_pack ? std::format("_vechdz{}", vector_hdz_pack) : std::string()) +
                 (vector_dz_quant ? std::format("_vecdzq{}", vector_dz_quant) : std::string()) +
                 (dx_combine_mode != 0 ? std::format("_dxcombine{}", dx_combine_mode) : std::string()) +
-                (dispatch_spin != 0 ? std::format("_spin{}", dispatch_spin) : std::string()),
+                (dispatch_spin != 0 ? std::format("_spin{}", dispatch_spin) : std::string()) +
+                (mainloop_mode != 0 ? std::format("_mainloop{}", mainloop_mode) : std::string()) +
+                (relaxed_spins ? "_relaxedspins" : "") + (dispatch_xdy_pack ? "_dispatchxdy" : "") +
+                (custom_pack_registers ? std::format("_reg{}_{}_{}", pack_registers[0], pack_registers[1],
+                    pack_registers[2]) : std::string()),
             split_combine_registers ? "_rolereg_split" : role_registers ? "_rolereg" : ""),
         std::format(R"({}{}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
@@ -232,12 +263,16 @@ static void instantiate() {{
         {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, {}, {}, {}, {}, 256, {}, {}, true, {}, {}, {}, {}, {}{}>);
 }}
 )", trap_timeouts ? "#define DG_TRAP_ONLY_TIMEOUTS 1" : "",
-            split_combine_registers ? "\n#define DG_MonoEP_ROLE_SCOPED_REGISTERS 1\n#define DG_MonoEP_SPLIT_COMBINE_REGISTERS 160" :
-            role_registers ? "\n#define DG_MonoEP_ROLE_SCOPED_REGISTERS 1" : "",
+            std::string(split_combine_registers ? "\n#define DG_MonoEP_ROLE_SCOPED_REGISTERS 1\n#define DG_MonoEP_SPLIT_COMBINE_REGISTERS 160" :
+                role_registers ? "\n#define DG_MonoEP_ROLE_SCOPED_REGISTERS 1" : "") +
+                (custom_pack_registers ? std::format(
+                    "\n#define DG_MonoEP_PACK_DISPATCH_REGISTERS {}\n#define DG_MonoEP_PACK_NON_EPILOGUE_REGISTERS {}"
+                    "\n#define DG_MonoEP_PACK_EPILOGUE_REGISTERS {}", pack_registers[0], pack_registers[1],
+                    pack_registers[2]) : std::string()),
             max_tokens, hidden, inner, experts * world, topk, ring_tokens, num_stages, pull,
             dispatch_threads, non_epilogue_threads, sms, world, cached, cached_dz,
             compact_non_math ? "true" : "false", transport_fp8 ? "true" : "false",
-            fp8_combine ? "true" : "false", diag_suffix));
+            fp8_combine ? "true" : "false", diag_suffix + (dist_trace ? ", true" : "")));
     layout::MoEBackwardBuffers buffers{
         layout::SymBuffer<>(dy_ptrs, rank), layout::SymBuffer<>(ds_ptrs, rank),
         reinterpret_cast<__nv_bfloat16*>(pools[0].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[1].data_ptr()),

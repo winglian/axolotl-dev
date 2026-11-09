@@ -31,6 +31,32 @@ __device__ __forceinline__ uint32_t mono_ep_fp8x4(const float a, const float b, 
     return lo | (hi << 16);
 }
 
+#ifndef DG_MonoEP_RELAXED_SPIN_HELPERS
+#define DG_MonoEP_RELAXED_SPIN_HELPERS
+// Relaxed polls compile to LDG.STRONG without the per-iteration CCTL.IVALL of ld.acquire.
+__device__ __forceinline__ uint64_t mono_ep_ld_relaxed_gpu_u64(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
+__device__ __forceinline__ uint64_t mono_ep_ld_relaxed_sys_u64(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
+__device__ __forceinline__ bool mono_ep_mbarrier_test(const void* barrier, const uint32_t parity) {
+    uint32_t ready;
+    asm volatile(
+        "{\n\t.reg .pred p;\n\t"
+        "mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, p;\n\t}"
+        : "=r"(ready) : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(barrier))), "r"(parity) : "memory");
+    return ready != 0;
+}
+#endif
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -58,6 +84,10 @@ template <
     uint32_t kDxCombineMode = 0,
     uint32_t kDispatchSpinMode = 0,
     bool kFP8OnlyStages = false,
+    uint32_t kMainloopMode = 0,
+    bool kRelaxedSpins = false,
+    bool kDispatchXdyPack = false,
+    bool kDistTrace = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -101,6 +131,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                      "Vectorized x/dy pack reads the cached FP8 pools");
     // FP8-sized A stages are only valid when every phase loads cached FP8 A tiles.
     DG_STATIC_ASSERT(not kFP8OnlyStages or kCacheDz, "FP8-only A stages require the dZ cache");
+    DG_STATIC_ASSERT(not kDispatchXdyPack or (kTransportFP8 and kCacheActivations and not kVectorXdyPack and
+                     not kCompactNonMath), "Dispatch-warp x/dy pack reads the cached FP8 pools on 4 dispatch warps");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     constexpr uint32_t kNumLocalityDomains = 1;
 
@@ -187,6 +219,12 @@ sm90_fp8_mono_ep_backward_impl(void* y,
     // NOTES: BF16 CD output for L1 (2 TMA stages, BLOCK_N/2 post-SwiGLU), BF16 output for L2 (no TMA, a single stage)
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
 
+    constexpr uint32_t kXdyQueueDepth = 16;
+    // Per dispatch warp: 128 rows x 64 bytes (rows 64-127 shifted by 64 bytes against bank conflicts),
+    // then 129 row scales (the second half shifted by one).
+    constexpr uint32_t kXdyPackScaleOffset = 2 * 64 * 64 + 64;
+    constexpr uint32_t kXdyPackBufferBytes = math::constexpr_align(kXdyPackScaleOffset + 129 * 4, 128u);
+
     // Assign shared memory
     struct SharedStorage {
         alignas(kSharedMemoryAlignment) uint32_t expert_token_count[kNumExperts];
@@ -211,7 +249,14 @@ sm90_fp8_mono_ep_backward_impl(void* y,
         Barrier combine_barriers[kNumEpilogueWarps * 2];
         Barrier task_info_full_barriers[kNumScheduleStages];
         Barrier task_info_empty_barriers[kNumScheduleStages];
+        // M blocks handed from the math leader to the dispatch warps for the x/dy column pack; kept
+        // past the combine-reusable region because the dispatch warps drain it after the task loop.
+        Barrier xdy_queue_full[kDispatchXdyPack ? kXdyQueueDepth : 1];
+        Barrier xdy_queue_empty[kDispatchXdyPack ? kXdyQueueDepth : 1];
+        uint4 xdy_queue[kDispatchXdyPack ? kXdyQueueDepth : 1];
+        alignas(128) uint8_t xdy_pack_buffer[kDispatchXdyPack ? kNumDispatchWarps : 1][kDispatchXdyPack ? kXdyPackBufferBytes : 16];
         alignas(128) uint8_t xdy_stage[kVectorXdyPack ? 2 * BLOCK_M * 128 + 2 * BLOCK_M * sizeof(float) : 16];
+        float cached_activation_scales[(kMainloopMode & 1u) ? kNumStages * BLOCK_M : 1];
     };
     DG_STATIC_ASSERT(sizeof(SharedStorage) <= 232448, "SM90 backward exceeds Hopper shared memory capacity");
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
@@ -252,6 +297,13 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 shared_storage.task_info_full_barriers[i].init(1);
                 shared_storage.task_info_empty_barriers[i].init(kNumScheduleConsumerThreads);
             }
+            if constexpr (kDispatchXdyPack) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kXdyQueueDepth; ++ i) {
+                    shared_storage.xdy_queue_full[i].init(1);
+                    shared_storage.xdy_queue_empty[i].init(kNumDispatchWarps);
+                }
+            }
         }
         cutlass::arch::fence_barrier_init();
     }
@@ -285,6 +337,22 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             trace_set(1, trace_clock());
         }
     }
+    // Diagnostic multi-rank extension (kDistTrace only): 64 slots per CTA after all CTA records,
+    // globaltimer stamps (comparable across ranks of one node) and per-peer pull statistics.
+    DG_STATIC_ASSERT(not kDistTrace or (kPhaseTrace and kNumRanks <= 8), "Distributed trace needs the phase trace and <= 8 ranks");
+    constexpr uint32_t kDistTraceStride = 64;
+    unsigned long long* const dist_trace = kDistTrace
+        ? reinterpret_cast<unsigned long long*>(saved_z) + static_cast<uint64_t>(kNumSMs) * kTraceCTAStride +
+          static_cast<uint64_t>(sm_idx) * kDistTraceStride : nullptr;
+    const auto dist_set = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kDistTrace) dist_trace[slot] = value;
+    };
+    const auto dist_add = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kDistTrace) atomicAdd(dist_trace + slot, static_cast<unsigned long long>(value));
+    };
+    const auto dist_max = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kDistTrace) atomicMax(dist_trace + slot, static_cast<unsigned long long>(value));
+    };
 
     // Task scheduler
     auto scheduler = sched::MonoEPScheduler<
@@ -323,9 +391,18 @@ sm90_fp8_mono_ep_backward_impl(void* y,
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
-    constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
-    constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 88;
-    constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 160;
+#ifndef DG_MonoEP_PACK_DISPATCH_REGISTERS
+#define DG_MonoEP_PACK_DISPATCH_REGISTERS 64
+#define DG_MonoEP_PACK_NON_EPILOGUE_REGISTERS 40
+#define DG_MonoEP_PACK_EPILOGUE_REGISTERS 200
+#endif
+    // The dispatch-warp x/dy pack spills at 48 registers; it takes 16 per dispatch thread from the math warps.
+    constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters
+        ? (kDispatchXdyPack ? DG_MonoEP_PACK_DISPATCH_REGISTERS : 48) : 96;
+    constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters
+        ? (kDispatchXdyPack ? DG_MonoEP_PACK_NON_EPILOGUE_REGISTERS : 40) : 88;
+    constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters
+        ? (kDispatchXdyPack ? DG_MonoEP_PACK_EPILOGUE_REGISTERS : 208) : 160;
     if constexpr (kCompactNonMath) {
         DG_STATIC_ASSERT(kUseMoreEpilogueRegisters,
                          "Compact non-math WG requires at most 64 experts per rank");
@@ -409,6 +486,9 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(0, trace_globaltimer());
+        }
 
         // Write source indices (~2 us with 512 tokens)
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -424,6 +504,9 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(1, trace_globaltimer());
+        }
 
         // Write expert count
         if (sm_idx == 0) {
@@ -456,6 +539,9 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
             /* After the NVLink barrier, there is a grid sync */ true
         );
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(2, trace_globaltimer());
+        }
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -497,6 +583,144 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(3, trace_globaltimer());
+        }
+
+        // x/dy column pack on the dispatch warps (kDispatchXdyPack). The math leader queues each of its M
+        // blocks after the dh n=0 mainloop (so the rows are staged); every dispatch warp packs items
+        // warp_idx, warp_idx + 4, ... of the block's 64 (operand, 64-column half chunk) items while it waits
+        // on a ring slot, and the rest after its pulls. An item copies its 128 x 64-byte row segments into
+        // the warp's shared buffer; lanes 0-15 then own rows 0-63 and lanes 16-31 rows 64-127 of
+        // columns 4 (lane % 16) .. +3. Values, amax, scales and bytes equal the math-warp vectorized pack.
+        constexpr uint32_t kNumXdyHalfChunks = kHidden / 64;
+        constexpr uint32_t kNumXdyItems = 2 * kNumXdyHalfChunks;
+        uint32_t xdy_entry = 0, xdy_item = warp_idx;
+        [[maybe_unused]] uint64_t trace_pack = 0, trace_pack_wait = 0, trace_pack_items_ring = 0, trace_pack_items_drain = 0;
+        const auto xdy_pack_item = [&](const uint4& entry, const uint32_t& item) {
+            // entry: pool block, valid rows, expert start row, padded expert rows
+            const uint32_t pool_block = entry.x, valid_m = entry.y;
+            const uint32_t tensor = item / kNumXdyHalfChunks, col0 = (item % kNumXdyHalfChunks) * 64;
+            const uint64_t pool_row = static_cast<uint64_t>(pool_block) * BLOCK_M;
+            uint8_t* buffer_data = shared_storage.xdy_pack_buffer[warp_idx];
+            float* buffer_scales = reinterpret_cast<float*>(buffer_data + kXdyPackScaleOffset);
+    
+            // 16-byte cp.async row segments (four lanes per row): keeps the tiny copies off the TMA unit
+            // that feeds the math warps.
+            __syncwarp();
+            const uint8_t* src = (tensor == 0 ? backward.qx_pool : backward.qdy_pool) + pool_row * kHidden + col0;
+            #pragma unroll
+            for (uint32_t j = 0; j < BLOCK_M / 8; ++ j) {
+                const uint32_t row = lane_idx / 4 + 8 * j, segment = lane_idx % 4;
+                if (row < valid_m) {
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                                 :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(
+                                        buffer_data + row * 64 + (row >= 64 ? 64 : 0) + segment * 16))),
+                                    "l"(src + static_cast<uint64_t>(row) * kHidden + segment * 16)
+                                 : "memory");
+                }
+            }
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            const float* src_sf = (tensor == 0 ? backward.sx_pool : backward.sdy_pool) +
+                pool_row * (kHidden / 128) + col0 / 128;
+            #pragma unroll
+            for (uint32_t j = 0; j < BLOCK_M / 32; ++ j) {
+                const uint32_t row = lane_idx + 32 * j;
+                buffer_scales[row + (row >= 64 ? 1 : 0)] = row < valid_m ? src_sf[row * (kHidden / 128)] : 0.0f;
+            }
+            const uint64_t trace_wait0 = trace_clock();
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncwarp();
+            trace_pack_wait += trace_clock() - trace_wait0;
+
+            const uint32_t half = lane_idx / 16, word = lane_idx % 16;
+            const auto* rows = reinterpret_cast<const uint32_t*>(buffer_data + half * (64 * 64 + 64)) + word;
+            const float* row_scales = buffer_scales + half * 65;
+            const uint32_t num_rows = valid_m > half * 64 ? cute::min(valid_m - half * 64, 64u) : 0u;
+            // The math-warp pack rounds fp8 * scale to BF16; scales are powers of two at least 2^-22, so the
+            // product (at most 4 significant bits) is already exact in BF16 and the rounding is skipped.
+            const auto dequant2 = [](const uint32_t value, const uint32_t pair, const float scale) {
+                const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(
+                    static_cast<__nv_fp8x2_storage_t>(value >> (16 * pair)), __NV_E4M3);
+                const float2 f = __half22float2(__half2(raw));
+                return make_float2(f.x * scale, f.y * scale);
+            };
+            float amax[4] = {1.0e-4f, 1.0e-4f, 1.0e-4f, 1.0e-4f};
+            #pragma unroll 16
+            for (uint32_t i = 0; i < num_rows; ++ i) {
+                const uint32_t value = rows[i * 16];
+                const float scale = row_scales[i];
+                #pragma unroll
+                for (uint32_t pair = 0; pair < 2; ++ pair) {
+                    const float2 v = dequant2(value, pair, scale);
+                    amax[2 * pair] = fmaxf(amax[2 * pair], fabsf(v.x));
+                    amax[2 * pair + 1] = fmaxf(amax[2 * pair + 1], fabsf(v.y));
+                }
+            }
+            float inv[4], scale_out[4];
+            #pragma unroll
+            for (uint32_t k = 0; k < 4; ++ k) {
+                amax[k] = fmaxf(amax[k], __shfl_xor_sync(0xffffffff, amax[k], 16));
+                const uint32_t bits = __float_as_uint(amax[k] / 448.0f);
+                const uint32_t exponent = ((bits >> 23) & 255u) + ((bits & 0x7fffffu) != 0);
+                inv[k] = exponent == 255u ? 0.0f : __uint_as_float((254u - exponent) << 23);
+                scale_out[k] = __uint_as_float(exponent << 23);
+            }
+            const uint32_t col = col0 + 4 * word;
+            if (half == 0)
+                *reinterpret_cast<float4*>((tensor == 0 ? backward.sx_col : backward.sdy_col) +
+                    static_cast<uint64_t>(pool_block) * kHidden + col) =
+                    make_float4(scale_out[0], scale_out[1], scale_out[2], scale_out[3]);
+            auto* dst = (tensor == 0 ? backward.qx_col : backward.qdy_col) +
+                static_cast<uint64_t>(entry.z) * kHidden + static_cast<uint64_t>(col) * entry.w +
+                (pool_row - entry.z) + half * 64;
+            #pragma unroll 1
+            for (uint32_t group = 0; group < 4; ++ group) {
+                uint32_t out[4][4] = {};
+                #pragma unroll
+                for (uint32_t j = 0; j < 16; ++ j) {
+                    const uint32_t i = group * 16 + j;
+                    if (i < num_rows) {
+                        const uint32_t value = rows[i * 16];
+                        const float scale = row_scales[i];
+                        #pragma unroll
+                        for (uint32_t pair = 0; pair < 2; ++ pair) {
+                            const float2 v = dequant2(value, pair, scale);
+                            const uint32_t q = __nv_cvt_float2_to_fp8x2(
+                                make_float2(v.x * inv[2 * pair], v.y * inv[2 * pair + 1]), __NV_SATFINITE, __NV_E4M3);
+                            out[2 * pair][j / 4] |= (q & 0xffu) << (8 * (j % 4));
+                            out[2 * pair + 1][j / 4] |= (q >> 8) << (8 * (j % 4));
+                        }
+                    }
+                }
+                #pragma unroll
+                for (uint32_t k = 0; k < 4; ++ k)
+                    *reinterpret_cast<uint4*>(dst + k * entry.w + group * 16) =
+                        make_uint4(out[k][0], out[k][1], out[k][2], out[k][3]);
+            }
+        };
+        // Packs at most one item of the oldest queued block without blocking.
+        const auto xdy_try_pack_one = [&]() -> bool {
+            const uint32_t slot = xdy_entry % kXdyQueueDepth;
+            if (not __all_sync(0xffffffff, mono_ep_mbarrier_test(
+                    &shared_storage.xdy_queue_full[slot], (xdy_entry / kXdyQueueDepth) & 1)))
+                return false;
+            const uint4 entry = shared_storage.xdy_queue[slot];
+            if (entry.x == 0xffffffffu)
+                return false;
+            const uint64_t trace_pack0 = trace_clock();
+            xdy_pack_item(entry, xdy_item);
+            trace_pack += trace_clock() - trace_pack0;
+            xdy_item += kNumDispatchWarps;
+            if (xdy_item >= kNumXdyItems) {
+                __syncwarp();
+                if (lane_idx == 0)
+                    shared_storage.xdy_queue_empty[slot].arrive();
+                ++ xdy_entry;
+                xdy_item = warp_idx;
+            }
+            return true;
+        };
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         const uint64_t trace_pull_start = trace_clock();
@@ -603,7 +827,21 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             const uint64_t trace_ring0 = trace_clock();
             if (l1_empty_count_target > 0) {
                 const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
-                if constexpr (kDispatchSpinMode == 0) {
+                if constexpr (kDispatchXdyPack) {
+                    // Pack queued x/dy items while the ring slot is held; back off only when idle.
+                    uint32_t backoff_ns = 128;
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target) {
+                        while (ptx::ld_relaxed_gpu(empty_ptr) < l1_empty_count_target) {
+                            if (xdy_try_pack_one()) {
+                                ++ trace_pack_items_ring;
+                                backoff_ns = 128;
+                            } else {
+                                __nanosleep(backoff_ns);
+                                backoff_ns = cute::min(backoff_ns * 2, 4096u);
+                            }
+                        }
+                    }
+                } else if constexpr (kDispatchSpinMode == 0) {
                     while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
                 } else {
                     // Relaxed polls avoid the per-iteration L1 invalidation of ld.acquire; the
@@ -634,6 +872,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             const auto weight = *sym_buffer.map(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
+            [[maybe_unused]] uint64_t dist_row_wait = 0;
             for (uint32_t operand = 0; operand < 2; ++operand) {
                 const void* src = operand == 0 ? src_x : src_dy;
                 for (uint32_t i = 0; i < kNumChunks; ++i) {
@@ -648,6 +887,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     __syncwarp();
                     const uint64_t trace_load1 = trace_clock();
                     trace_load_wait += trace_load1 - trace_load0;
+                    if constexpr (kDistTrace) dist_row_wait += trace_load1 - trace_load0;
                     if constexpr (kTransportFP8) {
                         auto* q = reinterpret_cast<__nv_fp8_e4m3*>(
                             operand == 0 ? backward.qx_pool : backward.qdy_pool);
@@ -725,6 +965,15 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 __threadfence();
             }
             __syncwarp();
+            if constexpr (kDistTrace) {
+                if (lane_idx == 0) {
+                    const uint64_t arrival = trace_globaltimer();
+                    dist_add(16 + current_rank_in_expert_idx, dist_row_wait);
+                    dist_add(24 + current_rank_in_expert_idx, 1);
+                    dist_max(32 + current_rank_in_expert_idx, ~arrival);
+                    dist_max(40 + current_rank_in_expert_idx, arrival);
+                }
+            }
 
             // Store weights and metadata
             if (cute::elect_one_sync()) {
@@ -755,6 +1004,41 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 trace_set(56 + warp_idx, trace_pull_end);
                 trace_add(60, trace_rows);
                 if (warp_idx == 0) trace_set(2, trace_pull_start);
+                dist_max(4, trace_globaltimer());
+            }
+        }
+
+        if constexpr (kDispatchXdyPack) {
+            // Drain the queue until the math leader's sentinel.
+            const uint64_t trace_drain0 = trace_clock();
+            const uint64_t trace_pack_ring = trace_pack;
+            uint32_t backoff_ns = 64;
+            while (true) {
+                const uint32_t slot = xdy_entry % kXdyQueueDepth;
+                if (not __all_sync(0xffffffff, mono_ep_mbarrier_test(
+                        &shared_storage.xdy_queue_full[slot], (xdy_entry / kXdyQueueDepth) & 1))) {
+                    __nanosleep(backoff_ns);
+                    backoff_ns = cute::min(backoff_ns * 2, 1024u);
+                    continue;
+                }
+                backoff_ns = 64;
+                if (shared_storage.xdy_queue[slot].x == 0xffffffffu)
+                    break;
+                xdy_try_pack_one();
+                ++ trace_pack_items_drain;
+            }
+            if constexpr (kPhaseTrace) {
+                // Spare fields of the last per-M-block record (field 0 stays 0, so the record is ignored).
+                constexpr uint32_t kPackRecord = kTraceHeader + (kTraceMBlockSlots - 1) * kTraceMBlockFields;
+                if (lane_idx == 0) {
+                    trace_add(kPackRecord + 1, trace_pack_ring);
+                    trace_add(kPackRecord + 2, trace_pack - trace_pack_ring);
+                    trace_add(kPackRecord + 3, trace_pack_items_ring);
+                    trace_add(kPackRecord + 4, trace_pack_items_drain);
+                    trace_add(kPackRecord + 5, trace_clock() - trace_drain0);
+                    trace_add(kPackRecord + 6, xdy_entry);
+                    trace_add(kPackRecord + 7, trace_pack_wait);
+                }
             }
         }
 
@@ -830,6 +1114,9 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             }
         }
 
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(6, trace_globaltimer());
+        }
         // Wait for all ranks to finish cleaning
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
@@ -838,6 +1125,9 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(5, trace_globaltimer());
+        }
 #if DG_MonoEP_ROLE_SCOPED_REGISTERS
     } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -862,12 +1152,25 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             const uint64_t trace_spin0 = trace_clock();
             if (task_info.block_phase != sched::BlockPhase::BackwardDx) {
                 const auto expected = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
-                while (ptx::ld_acq(workspace.get_l1_full_count_ptr(ring_block_idx)) != expected);
+                const auto full_ptr = workspace.get_l1_full_count_ptr(ring_block_idx);
+                if constexpr (kRelaxedSpins) {
+                    // Relaxed polls, then one acquire re-read orders the TMA loads after the stagers' release.
+                    while (ptx::ld_acq(full_ptr) != expected)
+                        while (ptx::ld_relaxed_gpu(full_ptr) != expected);
+                } else {
+                    while (ptx::ld_acq(full_ptr) != expected);
+                }
                 trace_l1_spin += trace_clock() - trace_spin0;
             } else {
                 constexpr auto full = L2KBlockDependency::kFullMask;
                 const auto expected = (pool_block_idx / kNumRingBlocks) & 1 ? 0ull : full;
-                while (ptx::ld_acq_gpu(workspace.get_l2_full_mask_ptr(ring_block_idx)) != expected);
+                const auto mask_ptr = workspace.get_l2_full_mask_ptr(ring_block_idx);
+                if constexpr (kRelaxedSpins) {
+                    while (ptx::ld_acq_gpu(mask_ptr) != expected)
+                        while (mono_ep_ld_relaxed_gpu_u64(mask_ptr) != expected);
+                } else {
+                    while (ptx::ld_acq_gpu(mask_ptr) != expected);
+                }
                 trace_l2_spin += trace_clock() - trace_spin0;
             }
 
@@ -882,6 +1185,21 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 // Compute token offset from ring block index
                 uint32_t m_idx = pool_block_idx * BLOCK_M;
                 uint32_t k_idx = k_block_idx * BLOCK_K;
+
+                if constexpr ((kMainloopMode & 1u) != 0) {
+                    // Cached row scales are staged per stage, ordered by the full-barrier arrive below.
+                    if (kCacheActivations and (kCacheDz or task_info.block_phase != sched::BlockPhase::BackwardDx)) {
+                        const bool dh = task_info.block_phase == sched::BlockPhase::BackwardDh;
+                        const bool dx = task_info.block_phase == sched::BlockPhase::BackwardDx;
+                        const float* sf = dh ? backward.sdy_pool : dx ? backward.sdz_pool : backward.sx_pool;
+                        const uint32_t groups = (dx ? 2 * kIntermediateHidden : kHidden) / 128;
+                        #pragma unroll
+                        for (uint32_t row = lane_idx; row < BLOCK_M; row += 32)
+                            shared_storage.cached_activation_scales[stage_idx * BLOCK_M + row] =
+                                sf[(static_cast<uint64_t>(pool_block_idx) * BLOCK_M + row) * groups + k_block_idx];
+                    }
+                    __syncwarp();
+                }
 
                 // TMA copy tokens, then arrive at full barrier
                 if (cute::elect_one_sync()) {
@@ -992,10 +1310,23 @@ sm90_fp8_mono_ep_backward_impl(void* y,
         if constexpr (kPhaseTrace) {
             if (trace_leader) trace_set(3, trace_prev_end);
         }
+        [[maybe_unused]] bool dist_first_task = true;
+        [[maybe_unused]] uint32_t xdy_pushed = 0;
+        const auto xdy_push = [&](const uint4& entry) {
+            const uint32_t slot = xdy_pushed % kXdyQueueDepth;
+            shared_storage.xdy_queue_empty[slot].wait(((xdy_pushed / kXdyQueueDepth) & 1) ^ 1);
+            shared_storage.xdy_queue[slot] = entry;
+            shared_storage.xdy_queue_full[slot].arrive();
+            ++ xdy_pushed;
+        };
         while (scheduler.get_next_task(task_info)) {
             scheduler.release_task_info();
             const uint64_t trace_got = trace_clock();
             uint64_t trace_full_first = 0, trace_full_rest = 0;
+            if constexpr (kDistTrace) {
+                if (trace_leader and dist_first_task) dist_set(48, trace_globaltimer());
+                dist_first_task = false;
+            }
 
             float accum[WGMMA::kNumAccum] = {0};
             float partial[WGMMA::kNumAccum];
@@ -1015,6 +1346,11 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             const float* weight_scales = dh_task ? w2t_scales : dx_task ? w1t_scales : w1_scales;
             const uint32_t num_k_blocks = task_info.shape_k / BLOCK_K;
             const uint32_t num_n_blocks = task_info.shape_n / BLOCK_N;
+            // Weight scales of one task are contiguous over K: one load per lane, broadcast per K-block.
+            DG_STATIC_ASSERT(not (kMainloopMode & 2u) or (kHidden / BLOCK_K <= 32 and 2 * kIntermediateHidden / BLOCK_K <= 32),
+                             "Weight-scale prefetch holds one K-block per lane");
+            const float lane_weight_scale = (kMainloopMode & 2u) and lane_idx < num_k_blocks ?
+                __ldg(weight_scales + (task_info.local_expert_idx * num_n_blocks + weight_n) * num_k_blocks + lane_idx) : 0.0f;
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 const uint64_t trace_fw0 = trace_clock();
                 shared_storage.full_barriers[stage_idx].wait(phase);
@@ -1056,13 +1392,17 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 ptx::sync_aligned(128, 3 + epilogue_wg_idx);
                 }
                 const uint32_t row0 = epilogue_wg_idx * WG_BLOCK_M + warp_idx_in_wg * 16 + lane_idx / 4;
-                const float sb = weight_scales[(task_info.local_expert_idx * num_n_blocks + weight_n) * num_k_blocks + k_block_idx];
+                const float sb = (kMainloopMode & 2u) ? __shfl_sync(0xffffffff, lane_weight_scale, k_block_idx) :
+                    weight_scales[(task_info.local_expert_idx * num_n_blocks + weight_n) * num_k_blocks + k_block_idx];
                 const bool cached_a = kCacheActivations and (kCacheDz or not dx_task);
                 const float* cached_scales = dh_task ? backward.sdy_pool : dx_task ? backward.sdz_pool : backward.sx_pool;
                 const uint32_t scale_groups = (dx_task ? 2 * kIntermediateHidden : kHidden) / 128;
                 const uint64_t sf_offset = (static_cast<uint64_t>(task_info.pool_block_idx) * BLOCK_M + row0) * scale_groups + k_block_idx;
-                const float scale0 = (cached_a ? cached_scales[sf_offset] : shared_storage.activation_scales[row0]) * sb;
-                const float scale1 = (cached_a ? cached_scales[sf_offset + 8 * scale_groups] : shared_storage.activation_scales[row0 + 8]) * sb;
+                const float scale0 = (not cached_a ? shared_storage.activation_scales[row0] :
+                    (kMainloopMode & 1u) ? shared_storage.cached_activation_scales[stage_idx * BLOCK_M + row0] : cached_scales[sf_offset]) * sb;
+                const float scale1 = (not cached_a ? shared_storage.activation_scales[row0 + 8] :
+                    (kMainloopMode & 1u) ? shared_storage.cached_activation_scales[stage_idx * BLOCK_M + row0 + 8] :
+                    cached_scales[sf_offset + 8 * scale_groups]) * sb;
                 const uint32_t a_base = a_desc_lo + (cached_a ? stage_idx * sizeof(shared_storage.smem_a[0]) / 16 : 0);
                 const uint32_t b_base = b_desc_lo + stage_idx * sizeof(shared_storage.smem_b[0]) / 16;
                 #pragma unroll
@@ -1094,6 +1434,18 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             }
 
             const uint64_t trace_ml_end = trace_clock();
+            if constexpr (kDispatchXdyPack) {
+                // Queued only after the dh mainloop: the A-loader's acquire of the block's full count, the
+                // full barrier and this mbarrier hand-off order the staged rows before the dispatch reads,
+                // and the workspace counters may already be cleared when the dispatch warps drain.
+                if (epilogue_thread_idx == 0 and task_info.block_phase == sched::BlockPhase::BackwardDh and
+                    task_info.n_cluster_idx == 0) {
+                    const uint32_t pool_m = task_info.pool_block_idx * BLOCK_M;
+                    xdy_push(make_uint4(task_info.pool_block_idx, task_info.valid_m,
+                                        pool_m - task_info.m_block_idx * BLOCK_M,
+                                        shared_storage.expert_padded_counts[task_info.local_expert_idx]));
+                }
+            }
             uint64_t trace_mark[6] = {};
             constexpr uint32_t kWGMMAStoreRowsPerWarp = WGMMA::M / 4;
             #pragma unroll
@@ -1373,11 +1725,17 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             if (is_dh) {
                 if (task_info.n_cluster_idx == 0) {
                     const auto expected = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
-                    while (ptx::ld_acq(workspace.get_l2_empty_count_ptr(ring_block_idx)) != expected) {}
+                    const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
+                    if constexpr (kRelaxedSpins) {
+                        while (ptx::ld_acq(l2_empty_ptr) != expected)
+                            while (ptx::ld_relaxed_gpu(l2_empty_ptr) != expected) {}
+                    } else {
+                        while (ptx::ld_acq(l2_empty_ptr) != expected) {}
+                    }
                     trace_mark[1] = trace_clock();
                     for (uint32_t i = epilogue_thread_idx; i < 2 * BLOCK_M; i += kNumEpilogueThreads)
                         shared_storage.dscore[i / BLOCK_M][i % BLOCK_M] = 0.0f;
-                    if constexpr ((kDiagAblate & 1u) or kVectorXdyPack) {
+                    if constexpr ((kDiagAblate & 1u) or kVectorXdyPack or kDispatchXdyPack) {
                     } else if constexpr (kTransportFP8) {
                         pack_cached_columns(backward.qx_pool, backward.sx_pool,
                                             backward.qx_col, backward.sx_col);
@@ -2028,10 +2386,15 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 trace_prev_end = trace_end;
             }
         }
+        if constexpr (kDispatchXdyPack) {
+            if (epilogue_thread_idx == 0)
+                xdy_push(make_uint4(0xffffffffu, 0u, 0u, 0u));
+        }
         if constexpr (kPhaseTrace) {
             if (trace_leader) {
                 trace_set(4, trace_clock());
                 trace_add(19, trace_mblock);
+                dist_set(8, trace_globaltimer());
             }
         }
 
@@ -2094,6 +2457,11 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             workspace, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
+        if constexpr (kDistTrace) {
+            if (epilogue_thread_idx == 0) dist_set(9, trace_globaltimer());
+        }
+        [[maybe_unused]] uint64_t dist_ready_wait = 0, dist_first_ready_wait = 0;
+        [[maybe_unused]] bool dist_first_token = true;
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
@@ -2103,6 +2471,21 @@ sm90_fp8_mono_ep_backward_impl(void* y,
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         const auto grid_idx = ptx::get_grid_idx() + 1;
+        const auto wait_peers_ready = [&](const bool& is_routed, const uint64_t* peer_ready_ptr,
+                                          const uint64_t& expected, const auto& print_timeout) {
+            if constexpr (kRelaxedSpins) {
+                // Poll relaxed; each routed lane then acquires its peer's flag once (set once per launch).
+                // Read-read coherence makes the acquire observe the flag the relaxed poll saw.
+                comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or
+                    mono_ep_ld_relaxed_sys_u64(peer_ready_ptr) == expected); }, print_timeout);
+                if (is_routed)
+                    (void) ptx::ld_acq_sys(peer_ready_ptr);
+                __syncwarp();
+            } else {
+                comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or
+                    ptx::ld_acq_sys(peer_ready_ptr) == expected); }, print_timeout);
+            }
+        };
         if constexpr (kFP8Combine and (kDxCombineMode & 4u)) {
             // One warp per token; per slot, lane l reads bytes [v * 512 + l * 16, +16) for v < 4 (coalesced)
             constexpr uint32_t kNumVecs = kHidden / 512;
@@ -2116,11 +2499,16 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
                 const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                     is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-                comm::wait_until(
-                    [&]() { return __all_sync(0xffffffff, not is_routed or
-                        ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
-                    [&]() { printf("DeepGEMM FP8 combine peers timeout: rank=%u, token=%u\n",
-                                   sym_buffer.rank_idx, token_idx); });
+                [[maybe_unused]] const uint64_t dist_wait0 = trace_clock();
+                wait_peers_ready(is_routed, peer_ready_ptr, grid_idx, [&]() {
+                    printf("DeepGEMM FP8 combine peers timeout: rank=%u, token=%u\n",
+                           sym_buffer.rank_idx, token_idx); });
+                if constexpr (kDistTrace) {
+                    const uint64_t waited = trace_clock() - dist_wait0;
+                    dist_ready_wait += waited;
+                    if (dist_first_token) dist_first_ready_wait = waited;
+                    dist_first_token = false;
+                }
                 if (lane_idx < kNumTopk) {
                     const auto offset = static_cast<uint64_t>(token_idx) * kNumTopk + lane_idx;
                     const auto partials = backward.dscore_partials.get_base_ptr<float*>();
@@ -2196,11 +2584,16 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
                 const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                     is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-                comm::wait_until(
-                    [&]() { return __all_sync(0xffffffff, not is_routed or
-                        ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
-                    [&]() { printf("DeepGEMM FP8 combine peers timeout: rank=%u, token=%u\n",
-                                   sym_buffer.rank_idx, token_idx); });
+                [[maybe_unused]] const uint64_t dist_wait0 = trace_clock();
+                wait_peers_ready(is_routed, peer_ready_ptr, grid_idx, [&]() {
+                    printf("DeepGEMM FP8 combine peers timeout: rank=%u, token=%u\n",
+                           sym_buffer.rank_idx, token_idx); });
+                if constexpr (kDistTrace) {
+                    const uint64_t waited = trace_clock() - dist_wait0;
+                    dist_ready_wait += waited;
+                    if (dist_first_token) dist_first_ready_wait = waited;
+                    dist_first_token = false;
+                }
                 if (k_block_idx == 0 and lane_idx < kNumTopk) {
                     const auto offset = static_cast<uint64_t>(token_idx) * kNumTopk + lane_idx;
                     const auto partials = backward.dscore_partials.get_base_ptr<float*>();
@@ -2243,8 +2636,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
-                             [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            wait_peers_ready(is_routed, peer_ready_ptr, grid_idx, [&]() {
+                printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
 
             if (chunk_idx == 0 and lane_idx < kNumTopk) {
                 const auto offset = static_cast<uint64_t>(token_idx) * kNumTopk + lane_idx;
@@ -2331,6 +2724,12 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             }
             __syncwarp();
         }
+        }
+        if constexpr (kDistTrace) {
+            if (lane_idx == 0) {
+                dist_add(10, dist_ready_wait);
+                dist_max(11, dist_first_ready_wait);
+            }
         }
         if constexpr (kPhaseTrace) {
             if (trace_leader) {

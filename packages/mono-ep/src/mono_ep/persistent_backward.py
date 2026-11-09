@@ -212,8 +212,16 @@ class NativePersistentBackward:
             from .quantization import quantize_fp8
             from .weight_quantization import quantize_transposed_weights_128x128
 
+            if os.getenv("MONO_EP_SM90_FP8_FUSED_WEIGHT_QUANT", "1") != "0":
+                from .block_weight_quantization import quantize_weights_128x128
+
+                gate_up = quantize_weights_128x128(w1, interleave_gate_up=True)
+            else:
+                gate_up = quantize_fp8(
+                    _interleave_weights(w1), block_rows=128, block_cols=128
+                )
             prepared = [
-                quantize_fp8(_interleave_weights(w1), block_rows=128, block_cols=128),
+                gate_up,
                 quantize_transposed_weights_128x128(w2),
                 quantize_transposed_weights_128x128(w1),
             ]

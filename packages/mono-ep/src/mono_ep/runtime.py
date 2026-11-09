@@ -8,6 +8,7 @@ grouped weight gradients, or the fixed-capacity NCCL reference path.
 Native backward currently requires recomputation and a single host.
 """
 
+import os
 from itertools import count
 
 import torch
@@ -179,10 +180,13 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
         quantize_tokens_into(x, buffer.x[:tokens], buffer.x_sf[:tokens], block_cols=128)
         buffer.topk_idx[:tokens].copy_(indices)
         buffer.topk_weights[:tokens].copy_(scores)
-        prepared = [
-            quantize_paired_gate_up_weights(w1),
-            quantize_fp8(w2, block_rows=128, block_cols=128),
-        ]
+        if os.getenv("MONO_EP_SM90_FP8_FUSED_WEIGHT_QUANT", "1") != "0":
+            from .block_weight_quantization import quantize_weights_128x128
+
+            down = quantize_weights_128x128(w2)
+        else:
+            down = quantize_fp8(w2, block_rows=128, block_cols=128)
+        prepared = [quantize_paired_gate_up_weights(w1), down]
         y = torch.empty_like(x)
         deep_gemm._C.fp8_mono_ep_forward_sm90(
             y,
