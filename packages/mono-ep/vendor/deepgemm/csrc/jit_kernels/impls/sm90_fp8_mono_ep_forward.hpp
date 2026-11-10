@@ -14,6 +14,7 @@
 #include "../heuristics/sm90.hpp"
 #include "runtime_utils.hpp"
 #include "mono_ep_activation_selector.hpp"
+#include "mono_ep_dispatch_pull.hpp"
 
 namespace deep_gemm {
 
@@ -165,8 +166,14 @@ static void fp8_mono_ep_forward_sm90(
     check_ring_capacity_for_mono_ep(
         ring_tokens, 128, world, experts, max_tokens, topk, hidden, inner);
     const int sms = get_num_sms_for_mono_ep();
-    int pull = 4096;
-    while (hidden % pull != 0) pull /= 2;
+    // Dispatch pull: the largest power of two up to 4 KB dividing the FP8 row, capped at 2 KB (two pulls per
+    // row) when the 4 KB send buffers would push the layout past the SM90 capacity (hidden >= 4096 with 5
+    // stages); MONO_EP_SM90_FP8_DISPATCH_PULL_BYTES overrides. Hidden 2048 instantiations are unchanged.
+    const int default_pull = mono_ep_pull::default_pull_bytes(hidden);
+    const int pull = mono_ep_pull::select_pull_bytes(hidden, [&](const int candidate) {
+        return mono_ep_pull::forward_smem_bytes(hidden, experts * world, candidate, num_stages, fp8_only_stages,
+            dispatch_threads / 32, 256 / 32) <= SM90ArchSpec::smem_capacity;
+    });
     DG_HOST_ASSERT(hidden % pull == 0 and pull % 16 == 0);
     const auto kernel = jit->compile(
         std::format("sm90_fp8_mono_ep_forward_{}_{}_{}{}{}",
@@ -182,7 +189,7 @@ static void fp8_mono_ep_forward_sm90(
                 (mainloop_mode != 0 ? std::format("_mainloop{}", mainloop_mode) : std::string()) +
                 (scatter_mode != 0 ? std::format("_scatter{}", scatter_mode) : std::string()) +
                 (role_registers_mode == 2 ? "_rolereg_split" : role_registers_mode == 1 ? "_rolereg" : "") +
-                activation.tag()),
+                activation.tag() + (pull != default_pull ? std::format("_pull{}", pull) : std::string())),
         std::format(R"({}{}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_forward.cuh>
 static void instantiate() {{

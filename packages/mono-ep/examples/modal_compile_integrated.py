@@ -23,14 +23,19 @@ if modal.is_local():
 
 # Single-rank runtime instantiations (trap timeouts, FP8 transport + combine, cached dZ).
 BACKWARD = (
-    "17280, 2048, 768, 16, 0, 8, 128, 128, 128, 32, 44160, {stages}, 2048, "
+    "17280, {hidden}, {inner}, 16, 0, 8, 128, 128, 128, 32, {ring}, {stages}, {pull}, "
     "128, 128, 256, 132, 1, true, true, true, false, true, true{suffix}"
 )
 # EP8 per-GPU forward with the original W1 layout.
 FORWARD = (
-    "16384, 2048, 768, 16, 0, 8, 128, 128, 128, 32, 44160, {stages}, 2048, 128, 128, 256, "
+    "16384, {hidden}, {inner}, 16, 0, 8, 128, 128, 128, 32, {ring}, {stages}, {pull}, 128, 128, 256, "
     "132, 1, 0x7f7fffffu, false, false, true{suffix}"
 )
+# Layer geometries: hidden, intermediate, single-rank ring tokens, dispatch pull bytes (FP8 rows).
+GEOMETRIES = {
+    "qwen3_30b_a3b": dict(hidden=2048, inner=768, ring=44160, pull=2048),
+    "qwen3_235b_a22b": dict(hidden=4096, inner=1536, ring=40320, pull=2048),
+}
 
 
 @app.function(image=image, cpu=4, memory=16384, timeout=1800)
@@ -43,7 +48,9 @@ def compile_one(record):
     work.mkdir(parents=True, exist_ok=True)
     direction = record["direction"]
     template = BACKWARD if direction == "backward" else FORWARD
-    args = template.format(stages=record["stages"], suffix=record["suffix"])
+    args = template.format(
+        stages=record["stages"], suffix=record["suffix"], **record["geometry"]
+    )
     source = work / "probe.cu"
     source.write_text(
         "#define DG_TRAP_ONLY_TIMEOUTS 1\n"
@@ -99,10 +106,19 @@ def compile_one(record):
 
 @app.local_entrypoint()
 def main(out: str, variants: str):
-    """variants: ';'-separated name|direction|stages|DEFINE+DEFINE|template suffix."""
+    """variants: ';'-separated name|direction|stages|DEFINE+DEFINE|template suffix[|geometry].
+
+    geometry: a GEOMETRIES key (default qwen3_30b_a3b), optionally with 'key:pull=N' style overrides
+    ('qwen3_235b_a22b:pull=4096').
+    """
     records = []
     for spec in variants.split(";"):
-        name, direction, stages, defines, suffix = spec.split("|")
+        name, direction, stages, defines, suffix, *rest = spec.split("|")
+        shape, _, overrides = (rest[0] if rest else "qwen3_30b_a3b").partition(":")
+        geometry = dict(GEOMETRIES[shape])
+        for item in filter(None, overrides.split(",")):
+            key, _, value = item.partition("=")
+            geometry[key] = int(value)
         records.append(
             dict(
                 name=name,
@@ -110,6 +126,7 @@ def main(out: str, variants: str):
                 stages=int(stages),
                 defines=[d for d in defines.split("+") if d],
                 suffix=suffix,
+                geometry=geometry,
             )
         )
     results = list(compile_one.map(records))

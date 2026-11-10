@@ -16,6 +16,7 @@
 #include "../heuristics/sm90.hpp"
 #include "runtime_utils.hpp"
 #include "mono_ep_activation_selector.hpp"
+#include "mono_ep_dispatch_pull.hpp"
 
 namespace deep_gemm {
 
@@ -276,10 +277,20 @@ static void fp8_mono_ep_backward_sm90(
     check_ring_capacity_for_mono_ep(
         ring_tokens, 128, world, experts, max_tokens, topk, hidden, inner);
     const int sms = get_num_sms_for_mono_ep();
-    int pull = 4096;
+    // Dispatch pull: the largest power of two up to 4 KB dividing the transported row, capped at 2 KB (two
+    // pulls per row) when the 4 KB send buffers would push the layout past the SM90 capacity (FP8 transport at
+    // hidden >= 4096 with 3 FP8 stages and the vector x/dy pack); MONO_EP_SM90_FP8_DISPATCH_PULL_BYTES
+    // overrides. Hidden 2048 instantiations are unchanged.
     const int hidden_bytes = hidden * (transport_fp8 ? 1 : 2);
-    while (hidden_bytes % pull != 0) pull /= 2;
+    const int default_pull = mono_ep_pull::default_pull_bytes(hidden_bytes);
+    const int pull = mono_ep_pull::select_pull_bytes(hidden_bytes, [&](const int candidate) {
+        return mono_ep_pull::backward_smem_bytes(experts * world, experts, candidate, num_stages, fp8_only_stages,
+            xdy_vector_pack, dispatch_xdy_pack, mainloop_mode, dispatch_threads / 32, 256 / 32) <=
+            SM90ArchSpec::smem_capacity;
+    });
     DG_HOST_ASSERT(hidden_bytes % pull == 0 and pull % 16 == 0);
+    // The BF16-transport row cache quantizes whole 128-element groups per pull.
+    DG_HOST_ASSERT(transport_fp8 or not cached or pull % 256 == 0);
     const int smem = SM90ArchSpec::smem_capacity;
     const auto kernel = jit->compile(
         std::format("sm90_fp8_mono_ep_backward_{}_{}_{}{}{}{}",
@@ -302,7 +313,8 @@ static void fp8_mono_ep_backward_sm90(
                     (activation.is_default() ? std::string("_act0") : activation.tag()) : std::string()) +
                 (overlap_epilogue != 0 ? std::format("_overlap{:x}", overlap_epilogue) : std::string()),
             std::string(split_combine_registers ? "_rolereg_split" : role_registers ? "_rolereg" : "") +
-                (tail_mode != 0 ? std::format("_tail{}", tail_mode) : std::string())),
+                (tail_mode != 0 ? std::format("_tail{}", tail_mode) : std::string()) +
+                (pull != default_pull ? std::format("_pull{}", pull) : std::string())),
         std::format(R"({}{}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{
