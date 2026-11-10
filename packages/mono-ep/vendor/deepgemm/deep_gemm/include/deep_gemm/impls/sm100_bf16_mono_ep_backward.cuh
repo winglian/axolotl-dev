@@ -1681,6 +1681,20 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     ptx::tcgen05_before_thread_sync();
                     shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                 }
+                // The weight-gradient GEMMs reduce over each expert's padded pool rows: zero the x/dy tail of the
+                // expert's last block (stale, possibly non-finite rows from earlier launches) before its h/dz are
+                // published, so 0 * stale never reaches dW; CTA c clears column half c
+                if (task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
+                    task_info.n_cluster_idx + 1 == kIntermediateHidden / (2 * BLOCK_N) and valid_m < BLOCK_M) {
+                    constexpr uint32_t kHalfChunks = kHidden / 2 / 8;
+                    const uint32_t col_offset = is_leader_cta ? 0u : kHidden / 2;
+                    for (uint32_t i = epilogue_thread_idx; i < (BLOCK_M - valid_m) * kHalfChunks; i += kNumEpilogueThreads) {
+                        const auto offset = static_cast<uint64_t>(pool_m_idx + valid_m + i / kHalfChunks) * kHidden +
+                                            col_offset + (i % kHalfChunks) * 8;
+                        *reinterpret_cast<float4*>(backward.x_pool + offset) = make_float4(0, 0, 0, 0);
+                        *reinterpret_cast<float4*>(backward.dy_pool + offset) = make_float4(0, 0, 0, 0);
+                    }
+                }
                 __threadfence();
                 asm volatile("fence.proxy.async.global;" ::: "memory");
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
