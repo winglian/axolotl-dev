@@ -1,7 +1,9 @@
 # Composing mono-ep dispatch/combine with a local experts kernel
 
 Status: implemented on `features/mono-ep-compose` as `expert_parallel_mono_ep_mode: dispatch`
-(and the `auto` fallback). This note records the survey of the package's peer path that the
+(and the `auto` fallback); the transfer rewrite of section 5.3 / 5.4 (bandwidth-shaped
+pull/push in `peer_stream.py`, one fused combine reduction, one barrier per op, opt-in compact
+receive rows) sits on top. This note records the survey of the package's peer path that the
 design rests on, the gaps that forced a new op pair rather than a reuse of `PeerSchedule`,
 and the contract of the composable mode.
 
@@ -130,17 +132,33 @@ do not apply in dispatch mode (validation warns when set explicitly).
 
 ```python
 runtime = MonoEPDispatchRuntime(
-    group=ep_group, max_tokens_per_rank=cap, top_k=K, hidden=H
+    group=ep_group,
+    max_tokens_per_rank=cap,
+    top_k=K,
+    hidden=H,
+    compact=False,  # True: only the routed rows, one host count per dispatch
+    transfer="streamed",  # "legacy": the fused runtime's per-expert row kernels
 )
-recv_x, recv_idx, recv_w = runtime.dispatch(
+recv_x, recv_idx, recv_w, handle = runtime.dispatch(
     x_bf16, topk_idx_i64, topk_w_f32, num_local_experts
 )
-y = runtime.combine(local_out, recv_idx, topk_idx_i64, num_local_experts)
+y = runtime.combine(local_out, handle)
 runtime.destroy()
 ```
 
 - `recv_x` `[world*cap, H]` BF16, `recv_idx` `[world*cap, K]` int64 local ids / `-1`, `recv_w`
-  `[world*cap, K]` fp32 (0 on `-1`): the DeepEP layout.
+  `[world*cap, K]` fp32 (0 on `-1`): the DeepEP layout. `handle` is `(rows, topk_idx,
+  num_local_experts)` with `rows` the routed mask (fixed layout) or the int64 receive-row
+  index of every compact row; the Axolotl backend passes it through untouched.
+- Compact (`compact=True`): `recv_*` have `routed` rows (about 86k of 131072 at the EP8
+  contract), `dispatch` is the `mono_ep::peer_dispatch_publish` op (publish, barrier,
+  routing, device prefix sum of the routed mask), the `mono_ep::peer_count_to_host` op (the
+  one device-to-host copy, a stream sync per layer exactly like the torch backend's
+  `axolotl::ep_to_host`; the plugin registers both as mandatory checkpoint saves so a
+  recompute never re-syncs) and the `mono_ep::peer_dispatch_pull` op (the compact pull,
+  whose backward is the fixed layout's `peer_dispatch_backward` with the saved slots).
+  The `int()` of the count is a graph break, so compact mode is not fullgraph-compilable
+  (the torch backend has the same break); the fixed layout stays sync-free.
 - Both calls are `torch.library` custom ops (`mono_ep::peer_dispatch`, `mono_ep::peer_combine`)
   with fake implementations; their backwards (`mono_ep::peer_dispatch_backward`,
   `mono_ep::peer_combine_backward`) are the same two transfers with the payloads swapped:
@@ -157,29 +175,44 @@ Symmetric buffers per rank (allocated once): `x [cap, H]` BF16, `idx [cap, K]` i
 
 `peer_dispatch(x, idx, w)`:
 
-1. barrier (peers finished reading the previous op's buffers; stream-ordered, so it also
-   orders this rank's previous reads);
-2. local writes: `x -> x_buf[:T]`, `idx -> idx_buf` (tail `-1`), `w -> w_buf`;
-3. barrier (publish);
-4. read every peer's `idx_buf`/`w_buf` (small), remap to local ids: `recv_idx[s*cap+t, k]`,
+1. local writes: `x -> x_buf[:T]`, `idx -> idx_buf` (tail `-1`), `w -> w_buf`;
+2. barrier (publish: every peer's `idx`/`w`/`x` is visible from here on);
+3. read every peer's `idx_buf`/`w_buf` (small), remap to local ids: `recv_idx[s*cap+t, k]`,
    `recv_w` masked to 0 where not local; `routed[s*cap+t] = any_k(local)`;
-5. `pack_peer_rows([x_buf_s for s], assign = where(routed, s*cap+t, -1), topk=1)` pulls exactly
-   the routed rows over NVLink; unrouted rows are zero.
+4. `peer_stream.pull_rows` streams the routed rows of every source over NVLink
+   (section 5.3); unrouted rows are zero.
 
-`peer_combine(local_out, routed, topk_idx, num_local_experts)` (`routed = (recv_idx >= 0).any(-1)`):
+`peer_combine(local_out, rows, topk_idx, num_local_experts)`:
 
-1. barrier; 2. `return_peer_rows(local_out_bf16, assign)` pushes row `s*cap+t` to
-   `y_buf_s[r*cap + t]` (unique slot per `(producer, source token)`); 3. barrier;
-4. `y = sum_p where(routed_to[p, t], y_buf_r[p*cap + t], 0)` in fp32, cast to `local_out.dtype`.
+1. `peer_stream.push_rows` writes row `s*cap+t` to `y_buf_s[r*cap + t]` (unique slot per
+   `(producer, source token)`); 2. barrier (every producer's partial has landed in own `y`);
+3. `peer_stream.reduce_slots`: `y = sum_p where(routed_to[p, t], y_buf_r[p*cap + t], 0)` in
+   fp32, producer order, rounded once to `local_out.dtype` (one pass over `[T, H]`).
 
 Backward of dispatch = `peer_combine` of `grad_recv_x` into `x`'s dtype plus the same push of
 `grad_recv_w` through `gw`; backward of combine = the gather half of `peer_dispatch` applied to
-`grad_y`. Each op is write → barrier → read; the leading barrier of the next op protects reuse of
-the single buffer set, so no double buffering is needed and any op order is safe.
+`grad_y`. Each op is write → barrier → read.
 
-Barriers are `_SymmetricMemory.barrier` (system-scope release/acquire on the allocation's signal
-pad, 10-minute timeout so a skewed rank behaves like a slow NCCL collective, not a device
-assert).
+**Barriers.** The ops fall into two buffer families: the *x family* (dispatch, combine
+backward) writes this rank's `x`/`idx`/`w` and reads the peers'; the *y family* (combine,
+dispatch backward) writes the peers' `y`/`gw` slots and reads this rank's. A layer always
+alternates them (dispatch → combine in forward, combine backward → dispatch backward in
+backward, and a checkpoint recompute replays the forward pair before the backward pair), so
+the one barrier inside op *n* already orders every peer's reads of op *n-1*'s buffers ahead
+of op *n+1*'s writes to them: a peer's read kernels are enqueued before its arrival at the
+barrier of op *n*, and this rank's writes in op *n+1* are enqueued after it passed that
+barrier. The leading barrier the first version put in front of every op (buffer reuse) is
+therefore redundant whenever the families alternate, and `PeerDispatch._enter` inserts it
+only when two ops of the same family run back to back (e.g. two combine backwards with no
+dispatch backward between them because neither `x` nor the routing weights need a gradient;
+`extra_barriers` counts them). The one barrier per op that remains is the publish/landing
+barrier: without it a peer could pull `x` rows that are still being copied in, or the
+reduction could read slots a slow producer has not written yet. The compact
+`peer_dispatch_pull` op has no barrier of its own: it only reads, and the next op's barrier
+(always y family) orders those reads before any re-publish. Barriers are
+`_SymmetricMemory.barrier` (system-scope release/acquire on the allocation's signal pad,
+10-minute timeout so a skewed rank behaves like a slow NCCL collective, not a device assert);
+they cost 13 us on 2 x B200 and 26 us on 2 x H100 (section 5.3).
 
 ### 3.4 Axolotl seam
 
@@ -221,25 +254,40 @@ layer across the backward. The symmetric buffers themselves are `x [cap, H]`, `y
 H]` and the small `idx`/`w`/`gw` tensors, allocated once per process. Compacting the rows needs
 the host count the design avoids (follow-up below).
 
-`collect()` (combine and dispatch-backward receive) does one masked FP32 pass over the own
-`[world, T, H]` return buffer per producer rank: `world` reads of `T x H` plus the FP32 sum. At
-EP2 this is noise next to the GEMMs; at EP8 it is the first thing to fuse (one Triton pass that
-reads all producer slots of a token once and writes BF16), together with the `torch.stack` of
-the `world` routing views in `collect_routing()`.
+`collect()` (combine and dispatch-backward receive) is `peer_stream.reduce_slots`: one pass
+over the own `[world, T, H]` return buffer that sums the producer slots of each token in FP32,
+in producer order, and rounds once (bitwise what the earlier `world` masked `+=` passes
+computed, 17-19x faster at EP8, section 5.3). The `torch.stack` of the `world` routing views
+in `collect_routing()` and the `producer_mask` are small (12 MB of reads, 0.06-0.13 ms).
 
 ## 4. Follow-ups (not in this change)
 
-- Compact receive rows via an optional host count (trade one sync per layer for a smaller local
-  kernel input, like the torch backend).
-- Fuse `collect()` and `collect_routing()` into one Triton pass before EP8 timings (see 3.6).
-- Bandwidth-shaped peer pull/push for the dispatch mode: the reused `pack_peer_rows` /
-  `return_peer_rows` issue one remote load per 256-column tile from 1024 programs and are
-  NVLink latency-bound at EP8 (section 5.1); give each program a contiguous row range, 16 B
-  vector loads and several rows in flight, or stage through NCCL `all_to_all_single` for the
-  bulk rows and keep the symmetric path for routing.
-- FP8 transport for `recv_x` when the local kernel accepts it.
-- Overlap: issue the gather of layer `l+1` under layer `l`'s local kernel (needs a second buffer
-  set).
+Done since the first version: bandwidth-shaped pull/push (`peer_stream.py`), the fused
+`collect()`, one barrier per op, compact receive rows behind one host count (sections 3.2,
+3.3, 5.3, 5.4). Still open:
+
+- Overlap: issue the gather of layer `l+1` under layer `l`'s local kernel (needs a second
+  buffer set; the family rule of 3.3 would then hold per buffer set).
+- FP8 transport for `recv_x` when the local kernel accepts it (halves the bytes the pull and
+  the combine backward move; the combine push/reduce stay BF16).
+- Fuse `producer_mask` and the routing remap of `collect_routing()` into the reduce / pull
+  launches (0.1-0.3 ms per op at EP8), and the compact mode's `combine_backward` rebuilds
+  `routed`/`prefix` from the saved slots (three small launches) rather than saving them.
+- Multi-host EP groups: symmetric memory is node-local; a NCCL fallback inside the dispatch
+  mode is still out of scope.
+- `pull_rows` / `push_rows` compile one Triton specialization per `world`, `capacity` and
+  row width; a growable capacity needs a re-rendezvous of the workspace.
+- Tile size (16-64 KB) and programs per SM (2-8) are flat within 1% on both GPUs at this
+  contract (section 5.3), so the defaults are not per-arch; revisit for wider rows (H 7168)
+  or PCIe-only hosts.
+- The fixed layout hands a non-padding local kernel 1.5x the rows (grouped_mm 1.24-1.4x
+  behind torch all-to-all in 5.4); the compact rows fix it at the price of one host count per
+  layer. A fullgraph-compilable compact mode needs the count to stay on device (a
+  capacity-bounded `[world * capacity, H]` view with a device row count the kernels honor).
+- Gap to the fused kernels at EP8 (section 5.4): the streamed SonicMoE line is 1.6x behind
+  the current fused reference on both GPUs with the transfers now at the link rate; what
+  remains is local-kernel time and the serialization of transfer and compute that the
+  fused runtime overlaps.
 
 ## 5. Validation (2026-11-09)
 
@@ -329,3 +377,149 @@ two either way. Memory doubles for the same reasons. The EP2 numbers in 5 are th
 the layout is small and the latency is hidden. Before any EP8 use the pull/push need a
 bandwidth-shaped kernel (wide per-program row ranges, vectorized 16 B loads, several rows in
 flight) and the compact-rows follow-up; both are in section 4.
+
+### 5.3 Transfer microbench at the EP8 pattern on 2 GPUs (2026-11-10)
+
+`examples/peer_stream_microbench.py` (driver `modal_peer_stream_microbench.py`; 2 x H100 80GB
+Modal `ap-9le0bhpevY0xzueZCCCamD`, 2 x B200 `ap-wGHazjO0gFtAOTDSgWKaLP`, 20 s and
+0.011 GPU-h each) lays the two ranks' buffers out as if there were eight source ranks: the
+peer's `x` buffer is eight `[16384, 2048]` BF16 source slices and the pull gathers the
+`[131072, 2048]` receive layout from them (512 MB; the 5.2 copies move the same bytes), the
+push returns the rows into eight `[16384, 2048]` destination slices of the peer. Routing is
+either every row or the contract's balanced top-8 over 128 experts (66% of the rows routed,
+~341 MB). Same timing as 5.2 (CUDA events, `dist.barrier` + `synchronize` around each of 15
+samples after 3 warmups, median, max over active ranks). The streamed kernels were swept over
+tile sizes 16/32/64 KB and 2/4/8 programs per SM: every pull/push cell moves within 1% on
+both GPUs, so the defaults (32 KB tiles of 8 rows x 512 int64 lanes, 4 programs per SM,
+`world * ceil(SMs * 4 / world)` programs each streaming one peer) are kept. Every streamed
+and compact output is bitwise equal to the legacy kernels' (and the fused reduction to the
+masked 8-pass sum) on both GPUs.
+
+| transfer (both ranks active, 2 GPUs) | 2 x H100 ms / GB/s / of NVLink | 2 x B200 ms / GB/s / of NVLink |
+|---|---|---|
+| pull, all 131072 rows (512 MB): legacy `pack_peer_rows` | 1.74 / 308 / 0.68 | 2.37 / 226 / 0.25 |
+| pull, 512 MB: streamed `pull_rows` | 1.67 / 322 / 0.71 | 0.85 / 631 / 0.70 |
+| pull, 512 MB: streamed, one rank active | 1.51 / 355 / 0.79 | 0.74 / 727 / 0.81 |
+| pull, 512 MB: plain Triton row copy (5.2) | 1.64 / 327 / 0.73 | 0.84 / 641 / 0.71 |
+| pull, 512 MB: `Tensor.copy_` | 1.46 / 368 / 0.82 | 0.74 / 724 / 0.80 |
+| pull, 512 MB: NCCL `all_to_all_single` | 1.59 / 337 / 0.75 | 1.02 / 528 / 0.59 |
+| pull, contract routing (~87k rows, ~341 MB): legacy | 1.30 / 275 / 0.61 | 1.75 / 204 / 0.23 |
+| pull, contract: streamed | 1.14 / 313 / 0.70 | 0.59 / 605 / 0.67 |
+| pull, contract: streamed compact (`[routed, H]` + slots) | 1.17 / 308 / 0.68 | 0.60 / 598 / 0.66 |
+| pull, contract: plain Triton row copy | 1.11 / 322 / 0.71 | 0.57 / 627 / 0.70 |
+| pull, contract: NCCL `all_to_all_single` | 1.09 / 328 / 0.73 | 0.69 / 513 / 0.57 |
+| pull, contract: streamed, 4 of 8 sources local (crossing half counted) | 0.67 / 266 / 0.59 | 0.32 / 550 / 0.61 |
+| push, 512 MB: legacy `return_peer_rows` | 1.82 / 295 / 0.66 | 0.97 / 555 / 0.62 |
+| push, 512 MB: streamed `push_rows` | 1.54 / 348 / 0.77 | 0.81 / 665 / 0.74 |
+| push, contract: legacy | 1.22 / 293 / 0.65 | 0.73 / 492 / 0.55 |
+| push, contract: streamed | 1.06 / 337 / 0.75 | 0.56 / 643 / 0.71 |
+| push, contract: streamed compact (slots) | 1.12 / 320 / 0.71 | 0.58 / 612 / 0.68 |
+
+| local work (per rank) | 2 x H100 ms | 2 x B200 ms |
+|---|---|---|
+| combine reduction, legacy 8-pass masked `+=` (512 MB read, BF16 out) | 3.76 | 2.39 |
+| combine reduction, fused `reduce_slots` (BF16 out) | 0.236 | 0.124 |
+| fused `reduce_slots` (FP32 out, the `gw` path's shape class) | 0.251 | 0.153 |
+| `producer_mask` (torch) | 0.128 | 0.061 |
+| symmetric-memory barrier | 26 us | 13 us |
+| NCCL `dist.barrier` | 112 us | 43 us |
+
+Reading. On B200 the legacy pull was the problem the 5.2 copy predicted: 25% of the link
+against 70-71% for the streamed pull and the plain row copy (80% for `Tensor.copy_`), so the
+dispatch's pull drops 2.8x at this pattern and the push 1.2-1.3x. On H100 the legacy pull was
+already at 68% and the streamed one gains 4%: the EP8 loss on H100 is not per-row latency but
+the combine reduction (3.7 ms per combine, 17x more than the fused pass; at EP8 the dispatch
+mode runs it three times per checkpointed layer, 11 ms of the 43.5) plus the masked
+`torch.where` / `masked_fill` passes around it. NCCL `all_to_all_single` of the same bytes
+sits at 73-75% (H100) / 57-59% (B200) of the link, so the streamed pull is at NCCL's rate on
+H100 and 1.2x faster on B200; the compact variants pay 2-5% for the prefix-sum stores and the
+slot indirection. The streamed kernels address every peer buffer as `first buffer + delta`
+with a `multiple_of(16)` hint; casting a loaded address to a pointer (the pointer-array
+idiom) loses the alignment to Triton and halves every load to 8-byte scalars (an earlier
+H100 run with that form: pull 1.67 ms, i.e. the same on H100, where the link latency rather
+than the instruction count bounds it).
+
+### 5.4 EP8 contract rerun with the streamed transfers (2026-11-10)
+
+Same script, same contract, same profiles and timing as 5.1, nine variants interleaved in one
+allocation: the 5.1 four (the legacy transfers are kept as `transfer="legacy"`), the streamed
+transfers (`peer_stream.py`, default) and the compact rows (`compact=True`), each with
+SonicMoE and grouped_mm, plus the fused mono_ep runtime (`mode=fused`) re-measured in the same
+allocation instead of quoted from another one. The three dispatch runtimes and the fused
+runtime are resident for the whole run, so the peak memory column of every variant includes
+all their symmetric workspaces (as 5.1's included one). Extra same-family barriers inserted by `_enter`: 0 for every runtime on both GPUs.
+
+8 x H100 80GB (Modal `ap-VUsL20asL4xebM9ByaCUSX`, 0.56 GPU-h, 253 s), median max-rank ms:
+
+| variant | F bal | B bal | 2F+B bal | F skew | B skew | 2F+B skew | peak GiB |
+|---|---|---|---|---|---|---|---|
+| torch all-to-all + SonicMoE (control) | 7.36 | 8.38 | 22.55 | 7.63 | 9.71 | 24.54 | 13.0 |
+| dispatch, legacy transfers + SonicMoE (5.1 line) | 12.88 | 15.05 | 40.37 | 12.33 | 15.00 | 38.91 | 22.8 |
+| dispatch, streamed + SonicMoE | 6.53 | 8.71 | 21.07 | 7.16 | 9.97 | 23.73 | 22.8 |
+| dispatch, streamed compact + SonicMoE | 6.43 | 8.07 | 20.68 | 6.79 | 9.43 | 22.90 | 13.0 |
+| torch all-to-all + grouped_mm | 35.90 | 59.04 | 129.78 | 41.19 | 68.00 | 149.48 | 35.1 |
+| dispatch, legacy transfers + grouped_mm | 55.76 | 90.75 | 201.54 | 55.30 | 90.32 | 200.05 | 44.7 |
+| dispatch, streamed + grouped_mm | 49.49 | 83.98 | 182.32 | 50.38 | 85.22 | 185.26 | 44.7 |
+| dispatch, streamed compact + grouped_mm | 35.11 | 58.81 | 128.35 | 40.54 | 67.81 | 148.30 | 35.1 |
+| fused mono_ep, this branch's base build (mode=fused, same allocation) (b) | 4.77 | 9.78 | 18.57 | 5.73 | 12.06 | 22.52 | 19.8 (a) |
+
+8 x B200 (Modal `ap-kqdcZKzZU8tgEHqRPGUIHb`, 0.49 GPU-h, 220 s), median max-rank ms:
+
+| variant | F bal | B bal | 2F+B bal | F skew | B skew | 2F+B skew | peak GiB |
+|---|---|---|---|---|---|---|---|
+| torch all-to-all + SonicMoE (control) | 4.79 | 4.93 | 14.16 | 4.95 | 5.66 | 15.20 | 13.0 |
+| dispatch, legacy transfers + SonicMoE (5.1 line) | 8.42 | 9.42 | 25.65 | 8.27 | 9.63 | 25.60 | 22.8 |
+| dispatch, streamed + SonicMoE | 4.47 | 4.83 | 12.57 | 4.55 | 5.47 | 13.82 | 22.8 |
+| dispatch, streamed compact + SonicMoE | 4.19 | 4.30 | 12.32 | 4.25 | 5.05 | 13.36 | 13.0 |
+| torch all-to-all + grouped_mm | 24.79 | 41.64 | 90.68 | 28.13 | 47.37 | 103.06 | 35.2 |
+| dispatch, legacy transfers + grouped_mm | 38.76 | 63.44 | 140.51 | 38.63 | 63.46 | 140.22 | 44.7 |
+| dispatch, streamed + grouped_mm | 34.33 | 58.99 | 127.06 | 34.50 | 59.15 | 127.61 | 44.7 |
+| dispatch, streamed compact + grouped_mm | 24.25 | 41.01 | 89.05 | 27.64 | 46.78 | 101.59 | 35.2 |
+| fused mono_ep, this branch's base build (mode=fused, same allocation) (b) | 2.40 | 6.57 | 10.98 | 2.85 | 8.21 | 13.53 | 16.7 (a) |
+
+(a) The peak GiB column comes from the same code run without the fused runtime resident
+(H100 `ap-xJHCsDBnHQDkzZTIlyX4kY`, B200 `ap-iSuWi5SykSIvjdiNuUVvGO`, 0.98 GPU-h together, dispatch
+timings within 0.1 ms of the tables above); in the runs with the fused runtime resident every
+variant's peak rises by its workspace (torch + SonicMoE reads 26.5 GiB on B200), and the fused row's own
+figure is the one with the three dispatch workspaces resident. Mean-rank medians sit within
+0.07 ms of the max-rank ones in every dispatch and torch cell (the streamed kernels keep the
+fixed layout's property that every rank does the same work; the compact rows differ per rank
+by the routing only); the fused row's max rank runs up to 0.42 ms ahead of the mean on skewed routing. Parity, both GPUs, both routings:
+`dgate_up`, `ddown`, `dscore` bitwise against the torch backend with the same local kernel
+for all six dispatch variants; `y` / `dx` rel-L2 at most 3.39e-03 (H100) /
+3.39e-03 (B200), the FP32-combine-vs-BF16-`index_add_` difference of 5.1; the streamed
+and compact SonicMoE variants are **bitwise equal to the legacy transfers** on `y`, `dx`,
+`dscore`, `dgate_up` and `ddown`, as the 2-GPU test (`tests/test_peer_dispatch_gpu.py`)
+requires. Quack candidates failed: 0 on both GPUs.
+
+(b) Provenance of the fused row: it is the production `MonoEPRuntime` of this branch's base,
+`features/mono-ep` @ 9ae994be97, whose SM90/SM100 persistent kernels predate B200 rounds 1-3
+(no two-row dispatch pulls, no forward lookahead, no weight-layout cache, none of the
+`MONO_EP_SM100_*` selectors), run eager on the BF16 parameters (the reference runs keep FP32
+masters) with 16 reserved SMs. It is a same-allocation sanity point for the dispatch numbers,
+not the fused-vs-dispatch gap: the current fused reference for this contract is
+the B200 round-3 build (f73dad341d) at **7.66 ms** checkpointed 2F+B on 8 x B200 and
+**13.48 ms** (FP8) on 8 x H100, which is being ported into the integrated branch. The JSON
+artifacts carry the same note under `fused_runtime.provenance`. On H100 the fused row ran at precision `fp8` with the `native` backward; against torch all-to-all + SonicMoE it is rel-L2 6.6e-02 on `y`, 7.3e-02 on `dx`, 6.8e-02 on the weight gradients. On B200 the fused row ran at precision `bf16` with the `native` backward; against torch all-to-all + SonicMoE it is rel-L2 5.9e-03 on `y`, 5.5e-03 on `dx`, 4.0e-03 on the weight gradients.
+
+Reading, 2F+B balanced / skewed against torch all-to-all with the same local kernel:
+
+| | H100 streamed | H100 compact | B200 streamed | B200 compact |
+|---|---|---|---|---|
+| SonicMoE, vs torch | 0.93x / 0.97x | 0.92x / 0.93x | 0.89x / 0.91x | 0.87x / 0.88x |
+| grouped_mm, vs torch | 1.40x / 1.24x | 0.99x / 0.99x | 1.40x / 1.24x | 0.98x / 0.99x |
+| SonicMoE, vs the base build's fused row (b) | 1.13x / 1.05x | 1.11x / 1.02x | 1.14x / 1.02x | 1.12x / 0.99x |
+| SonicMoE, vs legacy transfers | 0.52x | 0.51x | 0.49x | 0.48x |
+
+Reading. The target of this change holds on both GPUs: with the same local kernel the
+streamed dispatch mode is now 3-11% faster than torch all-to-all on SonicMoE (it was 1.8-2x
+slower in 5.1), the compact rows add another 1-3% and bring the memory back to the torch
+backend's, and both are bitwise equal to the legacy path. With grouped_mm the fixed layout
+still costs 1.24-1.4x against torch (the kernel runs over 131072 rows instead of ~86k routed
+ones), which the compact rows remove (0.98-0.99x); so `expert_parallel_mono_ep_compact: true`
+is the setting for a local kernel that does not pad to the receive count, and the fixed
+layout is for SonicMoE and for fullgraph compilation. Against the current fused reference
+(7.66 ms B200 / 13.48 ms H100) the streamed SonicMoE line is 1.6x behind on both GPUs: that
+gap is the local kernel's forward and the two backward GEMMs plus the three serialized
+transfers, no longer the transfer kernels, and section 4 lists what is left on the transfer
+side (overlap of the next layer's gather, FP8 transport, fusing the routing remaps).

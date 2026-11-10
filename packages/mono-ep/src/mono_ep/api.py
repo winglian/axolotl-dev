@@ -28,6 +28,9 @@ DISPATCH_OP = "mono_ep::peer_dispatch"
 COMBINE_OP = "mono_ep::peer_combine"
 DISPATCH_BACKWARD_OP = "mono_ep::peer_dispatch_backward"
 COMBINE_BACKWARD_OP = "mono_ep::peer_combine_backward"
+DISPATCH_PUBLISH_OP = "mono_ep::peer_dispatch_publish"
+DISPATCH_PULL_OP = "mono_ep::peer_dispatch_pull"
+COUNT_TO_HOST_OP = "mono_ep::peer_count_to_host"
 HIDDEN_MULTIPLE = 256
 INTERMEDIATE_MULTIPLE = 128
 
@@ -166,14 +169,32 @@ class MonoEPDispatchRuntime:
     DeepEP row layout (``world * max_tokens_per_rank`` rows, local expert ids with
     ``-1`` for remote slots, zero weights there). Build one per process and share it
     across layers; no DeepGEMM, SM reservation or ``NCCL_MAX_CTAS`` is involved.
+
+    ``compact=True`` returns only the routed rows (``[routed, hidden]``) at the price of
+    one device-to-host count per dispatch (``mono_ep::peer_count_to_host``, a stream
+    sync, like the torch backend's ``axolotl::ep_to_host``); the dispatch is then the
+    ``peer_dispatch_publish`` + ``peer_dispatch_pull`` op pair. ``transfer`` selects
+    the bandwidth-shaped streams (default) or the fused runtime's legacy row kernels.
     """
 
     dispatch_op = DISPATCH_OP
     combine_op = COMBINE_OP
     dispatch_backward_op = DISPATCH_BACKWARD_OP
     combine_backward_op = COMBINE_BACKWARD_OP
+    dispatch_publish_op = DISPATCH_PUBLISH_OP
+    dispatch_pull_op = DISPATCH_PULL_OP
+    count_to_host_op = COUNT_TO_HOST_OP
 
-    def __init__(self, *, group, max_tokens_per_rank: int, top_k: int, hidden: int):
+    def __init__(
+        self,
+        *,
+        group,
+        max_tokens_per_rank: int,
+        top_k: int,
+        hidden: int,
+        compact: bool = False,
+        transfer: str = "streamed",
+    ):
         from .peer_dispatch import PeerDispatch
 
         reason = dispatch_unsupported_reason(
@@ -183,11 +204,26 @@ class MonoEPDispatchRuntime:
         if reason is not None:
             raise ValueError(f"mono_ep: {reason}")
         self._dispatch: PeerDispatch | None = PeerDispatch(
-            capacity=max_tokens_per_rank, top_k=top_k, hidden=hidden, group=group
+            capacity=max_tokens_per_rank,
+            top_k=top_k,
+            hidden=hidden,
+            group=group,
+            compact=compact,
+            transfer=transfer,
         )
         self.max_tokens_per_rank = max_tokens_per_rank
+        self.compact = compact
+        self.transfer = transfer
         self.world_size = self._dispatch.world
         self.receive_rows = self._dispatch.rows
+
+    @property
+    def save_ops(self) -> frozenset[str]:
+        """Ops whose outputs a checkpointing policy saves to skip the peer transfers."""
+        ops = {self.dispatch_op, self.combine_op}
+        if self.compact:
+            ops.add(self.dispatch_pull_op)
+        return frozenset(ops)
 
     def _live(self):
         if self._dispatch is None:
@@ -200,38 +236,36 @@ class MonoEPDispatchRuntime:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_local_experts: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
         """``x`` BF16 ``[T, H]``, ``topk_idx`` int64 global ids ``[T, K]`` (``-1`` =
-        dropped), ``topk_weights`` FP32 ``[T, K]`` -> ``(recv_x, recv_idx, recv_w)`` over
-        ``world * max_tokens_per_rank`` rows."""
-        from .peer_dispatch import peer_dispatch
+        dropped), ``topk_weights`` FP32 ``[T, K]`` -> ``(recv_x, recv_idx, recv_w,
+        handle)`` over ``world * max_tokens_per_rank`` rows (or the routed rows when
+        compact); ``handle`` goes to :meth:`combine`."""
+        from .peer_dispatch import dispatch_compact, peer_dispatch
 
-        return peer_dispatch(
-            x.contiguous(),
-            topk_idx.contiguous(),
-            topk_weights.contiguous(),
-            num_local_experts,
-            self._live().key,
-        )
+        x, topk_idx = x.contiguous(), topk_idx.contiguous()
+        topk_weights = topk_weights.contiguous()
+        key = self._live().key
+        if self.compact:
+            recv_x, recv_idx, recv_w, slots = dispatch_compact(
+                x, topk_idx, topk_weights, num_local_experts, key
+            )
+            rows = slots
+        else:
+            recv_x, recv_idx, recv_w = peer_dispatch(
+                x, topk_idx, topk_weights, num_local_experts, key
+            )
+            rows = (recv_idx >= 0).any(dim=-1)
+        return recv_x, recv_idx, recv_w, (rows, topk_idx, num_local_experts)
 
-    def combine(
-        self,
-        local_out: torch.Tensor,
-        recv_idx: torch.Tensor,
-        topk_idx: torch.Tensor,
-        num_local_experts: int,
-    ) -> torch.Tensor:
+    def combine(self, local_out: torch.Tensor, handle: tuple) -> torch.Tensor:
         """Sum the per-rank partial rows ``local_out`` (the local kernel's output for
-        ``dispatch``'s rows) onto this rank's ``topk_idx.shape[0]`` source tokens."""
+        ``dispatch``'s rows) onto this rank's source tokens."""
         from .peer_dispatch import peer_combine
 
-        routed = (recv_idx >= 0).any(dim=-1)
+        rows, topk_idx, num_local_experts = handle
         return peer_combine(
-            local_out.contiguous(),
-            routed,
-            topk_idx.contiguous(),
-            num_local_experts,
-            self._live().key,
+            local_out.contiguous(), rows, topk_idx, num_local_experts, self._live().key
         )
 
     def destroy(self) -> None:

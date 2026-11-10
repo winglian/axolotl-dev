@@ -23,15 +23,52 @@ from torch.utils.checkpoint import checkpoint
 TOKENS, HIDDEN, INNER, EXPERTS, TOPK = 16384, 2048, 768, 128, 8
 WARMUP, MEASURED = 5, 15
 SCOPES = ("forward", "backward", "checkpointed_layer")
+# (label, backend, local kernel, mono_ep runtime): the original four variants, the legacy
+# per-expert row kernels now named as such, plus the streamed transfers (the dispatch
+# mode's default), the compact receive rows, and the fused mono_ep runtime (mode=fused,
+# no local kernel) re-measured in the same allocation
 VARIANTS = (
-    ("torch+sonicmoe", "torch", "sonicmoe"),
-    ("mono_ep+sonicmoe", "mono_ep", "sonicmoe"),
-    ("mono_ep+grouped_mm", "mono_ep", "grouped_mm"),
-    ("torch+grouped_mm", "torch", "grouped_mm"),
+    ("torch+sonicmoe", "torch", "sonicmoe", None),
+    ("mono_ep_legacy+sonicmoe", "mono_ep", "sonicmoe", "legacy"),
+    ("mono_ep_legacy+grouped_mm", "mono_ep", "grouped_mm", "legacy"),
+    ("torch+grouped_mm", "torch", "grouped_mm", None),
+    ("mono_ep+sonicmoe", "mono_ep", "sonicmoe", "streamed"),
+    ("mono_ep+grouped_mm", "mono_ep", "grouped_mm", "streamed"),
+    ("mono_ep_compact+sonicmoe", "mono_ep", "sonicmoe", "compact"),
+    ("mono_ep_compact+grouped_mm", "mono_ep", "grouped_mm", "compact"),
+    ("mono_ep_fused", "mono_ep", None, "fused"),
+)
+RUNTIMES = {
+    "legacy": {"transfer": "legacy", "compact": False},
+    "streamed": {"transfer": "streamed", "compact": False},
+    "compact": {"transfer": "streamed", "compact": True},
+}
+# the fused reference lines: FP8 (blockwise) on H100 with FP8 transport + combine, BF16 on B200
+FUSED_PRECISION = {"H100": "fp8", "B200": "bf16"}
+FUSED_PROVENANCE = (
+    "fused kernels of the mono-ep base (features/mono-ep @ 9ae994be97: SM90/SM100 persistent "
+    "kernels from before B200 rounds 1-3, no two-row dispatch pulls, forward lookahead or "
+    "weight-layout cache, no MONO_EP_SM100_* selectors); the current fused reference for this "
+    "contract is the B200 round-3 build (f73dad341d): 7.66 ms checkpointed 2F+B on 8xB200, "
+    "13.48 ms on 8xH100 (FP8); this row is a same-allocation sanity point, not the fused-vs-dispatch gap"
+)
+FUSED_ENV = (
+    "MONO_EP_SM90_FP8_TRANSPORT",
+    "MONO_EP_SM90_FP8_COMBINE",
+    "MONO_EP_SM90_FP8_TRAP_TIMEOUTS",
+    "NCCL_MAX_CTAS",
+    "DG_JIT_CACHE_DIR",
 )
 PARITY_PAIRS = (
+    ("mono_ep_fused", "torch+sonicmoe"),
+    ("mono_ep_legacy+sonicmoe", "torch+sonicmoe"),
+    ("mono_ep_legacy+grouped_mm", "torch+grouped_mm"),
     ("mono_ep+sonicmoe", "torch+sonicmoe"),
     ("mono_ep+grouped_mm", "torch+grouped_mm"),
+    ("mono_ep_compact+sonicmoe", "torch+sonicmoe"),
+    ("mono_ep_compact+grouped_mm", "torch+grouped_mm"),
+    ("mono_ep+sonicmoe", "mono_ep_legacy+sonicmoe"),
+    ("mono_ep_compact+sonicmoe", "mono_ep_legacy+sonicmoe"),
 )
 
 
@@ -185,6 +222,42 @@ def _build_experts(group):
     return experts
 
 
+def _build_fused_runtime(group, profile_set):
+    """The production fused runtime (``MonoEPRuntime``) on this allocation, or ``None`` with
+    the reason when the image has no vendored DeepGEMM build."""
+    import deep_gemm
+    from mono_ep import MonoEPRuntime
+
+    # the symmetric buffer rounds the capacity up to DeepGEMM's token alignment, as the
+    # plugin does (1920 on the current vendored build: 16384 tokens -> 17280 slots)
+    alignment = MonoEPRuntime.token_alignment()
+    capacity = -(-TOKENS // alignment) * alignment
+    runtime = MonoEPRuntime(
+        group=group,
+        num_experts=EXPERTS,
+        max_tokens_per_rank=capacity,
+        top_k=TOPK,
+        hidden=HIDDEN,
+        intermediate=INNER,
+        precision=FUSED_PRECISION[profile_set],
+    )
+    assert runtime.max_tokens_per_rank >= TOKENS
+    return runtime, {
+        "mode": "fused",
+        "max_tokens_per_rank": runtime.max_tokens_per_rank,
+        "token_alignment": alignment,
+        "class": "mono_ep.MonoEPRuntime",
+        "precision": runtime.precision,
+        "backward_backend": runtime.backward_backend,
+        "reserved_sms": runtime.reserved_sms,
+        "deep_gemm_num_sms": deep_gemm.get_num_sms(),
+        "masters": "bfloat16 parameters quantized per call (the r3 reference runs kept FP32 masters)",
+        "compiled": False,
+        "provenance": FUSED_PROVENANCE,
+        "env": {name: os.environ.get(name) for name in FUSED_ENV},
+    }
+
+
 def run(profile_set):
     from mono_ep import MonoEPDispatchRuntime
 
@@ -200,19 +273,41 @@ def run(profile_set):
     experts_fn.register_all()
     quack_setup = _prepare_sonicmoe(profile_set)
     experts = _build_experts(group)
-    runtime = MonoEPDispatchRuntime(
-        group=group, max_tokens_per_rank=TOKENS, top_k=TOPK, hidden=HIDDEN
+    runtimes = {
+        name: MonoEPDispatchRuntime(
+            group=group, max_tokens_per_rank=TOKENS, top_k=TOPK, hidden=HIDDEN, **kw
+        )
+        for name, kw in RUNTIMES.items()
+    }
+    try:
+        fused, fused_info = _build_fused_runtime(group, profile_set)
+    except Exception as error:  # the stock images carry no vendored DeepGEMM build
+        fused, fused_info = None, {"mode": "fused", "unavailable": repr(error)}
+    # every rank must run the same variant list (the ops are collective)
+    fused_everywhere = torch.tensor(float(fused is not None), device="cuda")
+    dist.all_reduce(fused_everywhere, op=dist.ReduceOp.MIN)
+    if fused is not None and fused_everywhere.item() == 0.0:
+        fused.destroy()
+        fused, fused_info = (
+            None,
+            {"mode": "fused", "unavailable": "failed on another rank"},
+        )
+    variants = tuple(v for v in VARIANTS if v[3] != "fused" or fused is not None)
+    labels_present = {label for label, _, _, _ in variants}
+    parity_pairs = tuple(
+        pair
+        for pair in PARITY_PAIRS
+        if pair[0] in labels_present and pair[1] in labels_present
     )
-    experts_fn.set_mono_ep_runtime(runtime)
-    experts_fn.set_mono_ep_mode("dispatch")
-    workspace = runtime._dispatch.workspace
+    workspace = runtimes["streamed"]._dispatch.workspace
     receive_buffers = {
-        "receive_rows": runtime.receive_rows,
-        "recv_x_bf16_bytes": runtime.receive_rows * HIDDEN * 2,
-        "symmetric_local_bytes": {
+        "receive_rows": runtimes["streamed"].receive_rows,
+        "recv_x_bf16_bytes": runtimes["streamed"].receive_rows * HIDDEN * 2,
+        "symmetric_local_bytes_per_runtime": {
             name: views[workspace.rank].nbytes
             for name, views in workspace.views.items()
         },
+        "runtimes_resident": list(RUNTIMES),
     }
 
     torch.manual_seed(812 + rank)
@@ -227,9 +322,16 @@ def run(profile_set):
     def operation(x, ids, scores):
         return experts(x, ids, scores)
 
-    def configure(backend, local):
+    def configure(backend, local, runtime):
         experts_fn.set_backend(backend)
+        if runtime == "fused":
+            experts_fn.set_mono_ep_mode("fused")
+            experts_fn.set_mono_ep_runtime(fused)
+            return
+        experts_fn.set_mono_ep_mode("dispatch")
         experts_fn.set_local_implementation(local)
+        if runtime is not None:
+            experts_fn.set_mono_ep_runtime(runtimes[runtime])
 
     rank_elapsed = torch.empty(world, device="cuda", dtype=torch.float32)
     results = {}
@@ -238,8 +340,8 @@ def run(profile_set):
         ids = _routing(routing, rank)
         # warm SonicMoE's quack sweeps (serial in-process compile) outside the timed loop
         started = time.perf_counter()
-        for _label, backend, local in VARIANTS:
-            configure(backend, local)
+        for _label, backend, local, runtime_name in variants:
+            configure(backend, local, runtime_name)
             for tensor in grads_of:
                 tensor.grad = None
             operation(x, ids, scores).backward(dy)
@@ -248,11 +350,11 @@ def run(profile_set):
         autotune_warm_seconds[routing] = time.perf_counter() - started
 
         cases = [
-            (scope, label, backend, local)
+            (scope, label, backend, local, runtime_name)
             for scope in SCOPES
-            for label, backend, local in VARIANTS
+            for label, backend, local, runtime_name in variants
         ]
-        labels = [f"{scope}/{label}" for scope, label, _, _ in cases]
+        labels = [f"{scope}/{label}" for scope, label, _, _, _ in cases]
         times = {label: [] for label in labels}
         mean_rank_times = {label: [] for label in labels}
         rank_times = {label: [] for label in labels}
@@ -260,9 +362,9 @@ def run(profile_set):
         captured = {}
         for iteration in range(WARMUP + MEASURED):
             ordered = cases if iteration % 2 == 0 else cases[::-1]
-            for scope, variant, backend, local in ordered:
+            for scope, variant, backend, local, runtime_name in ordered:
                 label = f"{scope}/{variant}"
-                configure(backend, local)
+                configure(backend, local, runtime_name)
                 for tensor in grads_of:
                     tensor.grad = None
                 y = operation(x, ids, scores) if scope == "backward" else None
@@ -319,7 +421,7 @@ def run(profile_set):
                         )
                 del y
         parity = {}
-        for candidate, reference in PARITY_PAIRS:
+        for candidate, reference in parity_pairs:
             for scope in ("forward", "backward"):
                 entry = {}
                 for key, a in captured[f"{scope}/{candidate}"].items():
@@ -378,7 +480,13 @@ def run(profile_set):
         for outcome in outcomes
         for key in outcome["keys"]
     ]
-    runtime.destroy()
+    barriers = {
+        name: runtime._dispatch.extra_barriers for name, runtime in runtimes.items()
+    }
+    for runtime in runtimes.values():
+        runtime.destroy()
+    if fused is not None:
+        fused.destroy()
     if rank == 0:
         print(
             "RESULT "
@@ -396,15 +504,24 @@ def run(profile_set):
                     "topk": TOPK,
                     "local_experts_per_rank": EXPERTS // world,
                     "expert_weight_dtype": "bfloat16",
-                    "master_dtype": "bfloat16 (SonicMoE's native dtype; the fused mono-ep line uses FP32 masters quantized per call)",
+                    "master_dtype": "bfloat16 (SonicMoE's native dtype; the fused variant here quantizes the same BF16 parameters per call, the r3 reference runs kept FP32 masters)",
                     "transport_dtype": {
                         "mono_ep": "bf16 rows, fp32 combine accumulation",
                         "torch": "bf16 all_to_all_single",
                     },
+                    "mono_ep_barriers": "one symmetric-memory barrier per op (dispatch, combine, each backward), plus extra_barriers when two same-family ops ran back to back",
                     "variants": {
-                        label: {"backend": backend, "local_kernel": local}
-                        for label, backend, local in VARIANTS
+                        label: {
+                            "backend": backend,
+                            "local_kernel": local,
+                            "mono_ep_runtime": None
+                            if runtime_name is None
+                            else RUNTIMES.get(runtime_name, fused_info),
+                        }
+                        for label, backend, local, runtime_name in variants
                     },
+                    "fused_runtime": fused_info,
+                    "mono_ep_extra_barriers_per_runtime": barriers,
                     "scopes": SCOPES,
                     "checkpoint_scope": "torch_nonreentrant_2F_plus_B",
                     "router_in_timing": False,
@@ -412,7 +529,7 @@ def run(profile_set):
                     "warmup_iterations": WARMUP,
                     "measured_iterations": MEASURED,
                     "timing": "host_wall_synchronized; max and arithmetic mean across ranks per iteration, median across measured iterations",
-                    "memory_scope": "max across measured iterations and ranks; all variants share one process, the peer runtime is resident throughout",
+                    "memory_scope": "max across measured iterations and ranks; all variants share one process, the three dispatch runtimes and the fused runtime are resident throughout",
                     "receive_buffers": receive_buffers,
                     "quack_profiles": quack_setup,
                     "quack_autotune_per_kernel_rank0": local_outcome["per_kernel"],

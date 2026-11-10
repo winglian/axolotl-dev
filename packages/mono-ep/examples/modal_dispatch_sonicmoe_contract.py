@@ -16,6 +16,33 @@ ROOT = Path(__file__).resolve().parents[1]
 app = modal.App("axolotl-mono-ep-dispatch-sonicmoe-contract")
 
 
+def _with_deepgemm(image):
+    """The vendored DeepGEMM build the fused runtime needs (the same steps, in the same
+    order, as ``modal_validate.base_image``, so the layers are shared)."""
+    return (
+        image.run_commands(
+            'uv pip install --python "$(command -v python)" setuptools wheel packaging ninja',
+            "apt-get update && apt-get install -y libdw-dev libelf-dev software-properties-common",
+            "add-apt-repository -y ppa:ubuntu-toolchain-r/test && apt-get update && apt-get install -y g++-13",
+        )
+        .add_local_dir(
+            Path(os.environ.get("MONO_EP_VENDOR_DIR", ROOT / "vendor")),
+            "/opt/mono-ep/vendor",
+            copy=True,
+        )
+        .add_local_file(
+            ROOT / "tools/fetch_build_dependencies.py",
+            "/opt/mono-ep/tools/fetch_build_dependencies.py",
+            copy=True,
+        )
+        .run_commands(
+            "python /opt/mono-ep/tools/fetch_build_dependencies.py",
+            "cd /opt/mono-ep/vendor/deepgemm && DG_USE_LOCAL_VERSION=0 DG_FORCE_BUILD=1 "
+            'CC=gcc-13 CXX=g++-13 MAX_JOBS=4 uv pip install --python "$(command -v python)" --no-build-isolation --no-deps .',
+        )
+    )
+
+
 def _with_sources(image):
     return (
         image.add_local_dir(ROOT / "src", "/probe/mono_ep_src")
@@ -30,9 +57,12 @@ def _with_sources(image):
     )
 
 
-# H100: stock image plus the SonicMoE hub kernel's CuteDSL build deps.
+# H100: stock image plus the vendored DeepGEMM build and the SonicMoE hub kernel's CuteDSL
+# build deps.
 hopper_image = _with_sources(
-    modal.Image.from_registry("axolotlai/axolotl-uv:main-latest").run_commands(
+    _with_deepgemm(
+        modal.Image.from_registry("axolotlai/axolotl-uv:main-latest")
+    ).run_commands(
         'uv pip install --python "$(command -v python)" '
         '"nvidia-cutlass-dsl==4.8.0" "apache-tvm-ffi>=0.1.10"'
     )
@@ -41,8 +71,10 @@ hopper_image = _with_sources(
 # CuteDSL 4.8.1). The hub-vendored quack 0.6.1 still uses the pre-4.8 `nvvm.mbarrier_arrive`
 # call form on its SM100 2-CTA path; the worker applies the kernels plugin's shim for it.
 blackwell_image = _with_sources(
-    modal.Image.from_registry(
-        "axolotlai/axolotl-cloud-uv:main-py3.14-cu130-2.14.1-blackwell"
+    _with_deepgemm(
+        modal.Image.from_registry(
+            "axolotlai/axolotl-cloud-uv:main-py3.14-cu130-2.14.1-blackwell"
+        )
     )
 )
 
@@ -73,6 +105,10 @@ def _run_worker(expected_gpu):
             **os.environ,
             "PYTHONPATH": "/probe/framework:/probe/mono_ep_src",
             "OMP_NUM_THREADS": "1",
+            # the fused H100 reference line's settings; read only by the SM90 blockwise
+            # backward, inert on B200 / BF16
+            "MONO_EP_SM90_FP8_TRANSPORT": "1",
+            "MONO_EP_SM90_FP8_COMBINE": "1",
         },
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
