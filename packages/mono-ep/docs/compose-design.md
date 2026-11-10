@@ -274,27 +274,53 @@ balanced and skewed routing from the same generators, forward / backward / check
 5 warmups + 15 samples, medians of the max rank, all variants interleaved in one allocation.
 Expert weights are **BF16** (SonicMoE's native dtype); the fused numbers quoted for comparison
 come from different allocations with FP32 masters quantized per call (FP8 compute on H100,
-BF16 on B200). SonicMoE runs with the kernels plugin's quack policy (`install_quack_key_policy`,
-pow2 buckets, in-process compile): 8 autotuners covered, 0 failed candidates on every rank.
+BF16 on B200). SonicMoE runs the way production does: the kernels plugin's device setup
+(`_check_sonicmoe_gpu_compat`, which on cutlass-dsl 4.8 shims the pre-4.8 `nvvm.mbarrier_arrive`
+call form the hub-vendored quack 0.6.1 still uses on its SM100 2-CTA path), the measured
+no-sweep profiles seeded with `apply_autotune_profiles` (`examples/sonicmoe_contract_profiles.py`:
+B200 entries from main `b0f55d39e3`, #4273; H100 entries from `7d4225c71f` on
+`features/sonicmoe-quack-h100`), then `install_quack_key_policy` (pow2 buckets, in-process
+compile). Per rank the 12 grouped quack keys got 1-4 candidates each (gated forward 1, not
+benchmarked; `gemm_tuned` 3-4; `gemm_dgated_tuned` 3 on B200, 1 on H100), all compiled, 0 failed,
+every winner `source: profile`; the first-step warm took 72 s (B200) / 82 s (H100) instead of
+200 s with full sweeps. Each artifact records every key's call shapes, candidates offered /
+compiled / failed, the winner and its timing table. (`token_gather_sum_kernel` is the bundled
+Triton kernel with its own 60-config autotuner, untouched by the quack profiles.)
 
-8 x H100 (Modal `ap-gonVugQZPGReBJVajH1kkx`, 0.65 GPU-h), median max-rank ms:
+8 x H100 80GB (Modal `ap-DPDFL3sbYfPqkGAh5dNWqe`, 0.46 GPU-h), median max-rank ms:
 
 | variant | F bal | B bal | 2F+B bal | F skew | B skew | 2F+B skew | peak GiB |
 |---|---|---|---|---|---|---|---|
-| torch all-to-all + SonicMoE (control) | 6.76 | 8.23 | 21.24 | 7.41 | 9.61 | 23.63 | 11.6 |
-| mono_ep dispatch + SonicMoE | 13.82 | 16.20 | 43.54 | 13.88 | 16.42 | 43.57 | 21.5 |
-| mono_ep dispatch + grouped_mm | 56.68 | 91.23 | 204.26 | 56.67 | 91.38 | 204.09 | 43.4 |
-| torch all-to-all + grouped_mm | 35.68 | 58.60 | 128.91 | 41.03 | 67.71 | 148.83 | 29.6 |
+| torch all-to-all + SonicMoE (control) | 7.31 | 8.37 | 22.68 | 7.87 | 9.77 | 24.75 | 11.9 |
+| mono_ep dispatch + SonicMoE | 13.77 | 16.24 | 43.54 | 13.77 | 16.53 | 43.34 | 21.7 |
+| mono_ep dispatch + grouped_mm | 56.83 | 91.90 | 204.99 | 56.77 | 91.96 | 204.80 | 43.6 |
+| torch all-to-all + grouped_mm | 35.80 | 58.97 | 129.52 | 41.21 | 68.22 | 149.58 | 34.1 |
 | fused mono_ep r3 (FP8, other allocation) | 3.26 | 7.53 | 13.48 | | | 16.60 | |
 
-Parity on H100 (first measured iteration, max over ranks): `dgate_up` and `ddown` bitwise for
-both pairs; `y` and `dx` differ by rel-L2 3.4e-3 (the torch backend sums up to eight partial
-rows per token with a BF16 `index_add_`, the peer combine sums them in FP32 and rounds once);
-`dscore` bitwise for grouped_mm, rel 1.3e-5 for SonicMoE. Receive side per rank: 131072 rows,
-`recv_x` 512 MB BF16, symmetric buffers 64 MB `x` + 512 MB `y` + 6 MB routing.
+8 x B200 (Modal `ap-R8iuf9H6IVXAWgpMWmfv9P`, 0.40 GPU-h), median max-rank ms:
 
-Reading: at EP8 the dispatch mode is about 2x slower than torch all-to-all with the same local
-kernel and far from the fused kernels. The transfer kernels it reuses (`pack_peer_rows` pull,
+| variant | F bal | B bal | 2F+B bal | F skew | B skew | 2F+B skew | peak GiB |
+|---|---|---|---|---|---|---|---|
+| torch all-to-all + SonicMoE (control) | 4.75 | 4.94 | 14.01 | 4.67 | 5.69 | 14.88 | 11.9 |
+| mono_ep dispatch + SonicMoE | 8.68 | 9.81 | 26.68 | 8.83 | 10.20 | 27.22 | 21.7 |
+| mono_ep dispatch + grouped_mm | 38.72 | 63.27 | 140.24 | 38.98 | 63.73 | 141.02 | 43.6 |
+| torch all-to-all + grouped_mm | 24.50 | 41.11 | 89.64 | 28.11 | 47.40 | 103.23 | 34.1 |
+| fused mono_ep r3 (BF16, other allocation) | 2.11 | 4.14 | 7.66 | | | | |
+
+An earlier H100 run with full quack sweeps (`ap-gonVugQZPGReBJVajH1kkx`, 0.65 GPU-h, 124
+`gemm_tuned` candidates over 8 keys) gave the same dispatch numbers (13.82 / 16.20 / 43.54) and
+a control within 1-8% (6.76 / 8.23 / 21.24), so the bounded profiles cost the control a little
+on this shape and the dispatch mode nothing. Mean-rank medians sit within 0.03 ms of the
+max-rank ones on both GPUs: the fixed layout makes every rank do the same work.
+
+Parity (first measured iteration, max over ranks, identical on both GPUs): `dgate_up`, `ddown`
+and `dscore` bitwise for both pairs; `y` and `dx` differ by rel-L2 3.4e-3 (the torch backend
+sums up to eight partial rows per token with a BF16 `index_add_`, the peer combine sums them in
+FP32 and rounds once). Receive side per rank: 131072 rows, `recv_x` 512 MB BF16, symmetric
+buffers 64 MB `x` + 512 MB `y` + 6 MB routing.
+
+Reading: at EP8 the dispatch mode is 1.8-2x slower than torch all-to-all with the same local
+kernel on both GPUs and 3.2x (H100) / 3.5x (B200) behind the fused kernels on 2F+B. The transfer kernels it reuses (`pack_peer_rows` pull,
 `return_peer_rows` push) were sized for the fused runtime's per-expert row pulls: 1024 programs
 walk 131072 rows x 8 column tiles with one remote load per tile, so each direction is NVLink
 latency-bound (~6-7 ms for 512 MB that NCCL moves in ~1-2 ms), and the fixed layout makes

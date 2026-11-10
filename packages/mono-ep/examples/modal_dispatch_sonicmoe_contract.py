@@ -23,6 +23,10 @@ def _with_sources(image):
         .add_local_file(
             ROOT / "examples/dispatch_sonicmoe_contract.py", "/probe/contract.py"
         )
+        .add_local_file(
+            ROOT / "examples/sonicmoe_contract_profiles.py",
+            "/probe/sonicmoe_contract_profiles.py",
+        )
     )
 
 
@@ -33,14 +37,12 @@ hopper_image = _with_sources(
         '"nvidia-cutlass-dsl==4.8.0" "apache-tvm-ffi>=0.1.10"'
     )
 )
-# B200: the kernel lane's image, which carries axolotl's `blackwell` extra (quack, flash-attn-4).
-# Its unpinned CuteDSL (4.8.1) changed `mbarrier_arrive`, which breaks the hub-vendored quack
-# SM100 GEMM; the lane itself ends up on 4.8.0 through mono-ep's `sonic` extra, so pin that.
+# B200: the kernel lane's image, which carries axolotl's `blackwell` extra (quack, flash-attn-4,
+# CuteDSL 4.8.1). The hub-vendored quack 0.6.1 still uses the pre-4.8 `nvvm.mbarrier_arrive`
+# call form on its SM100 2-CTA path; the worker applies the kernels plugin's shim for it.
 blackwell_image = _with_sources(
     modal.Image.from_registry(
         "axolotlai/axolotl-cloud-uv:main-py3.14-cu130-2.14.1-blackwell"
-    ).run_commands(
-        'uv pip install --python "$(command -v python)" "nvidia-cutlass-dsl==4.8.0"'
     )
 )
 
@@ -51,6 +53,7 @@ def _run_worker(expected_gpu):
     actual = torch.cuda.get_device_name()
     if expected_gpu not in actual:
         raise RuntimeError(f"expected {expected_gpu}, allocated {actual}")
+    print(f"allocated {actual}", flush=True)
     started = time.time()
     command = [
         "python",
@@ -60,6 +63,8 @@ def _run_worker(expected_gpu):
         "--nproc-per-node=8",
         "/probe/contract.py",
         "--worker",
+        "--profiles",
+        expected_gpu,
     ]
     lines = []
     with subprocess.Popen(  # nosec B603

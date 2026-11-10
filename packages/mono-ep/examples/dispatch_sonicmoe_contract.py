@@ -53,49 +53,102 @@ def _routing(routing, rank):
     return torch.rand(TOKENS, EXPERTS, device="cuda").argsort(-1)[:, :TOPK].contiguous()
 
 
-def _prepare_sonicmoe():
-    """Register axolotl's SonicMoE forward and apply the kernels plugin's quack policy
-    (config defaults: pow2 key buckets, sweep on) so the hub-vendored quack compiles its
-    candidates in-process instead of in a forkserver pool that cannot import it."""
+def _prepare_sonicmoe(profile_set):
+    """Register axolotl's SonicMoE forward, seed the measured quack profiles for
+    ``profile_set`` and apply the kernels plugin's quack policy (config defaults: pow2 key
+    buckets, sweep on), in the plugin's order. The profiles bound every grouped key to its
+    measured shortlist; the policy compiles in-process (the hub-vendored quack's forkserver
+    pool cannot import it) and buckets keys."""
+    import copy
+
+    from sonicmoe_contract_profiles import PROFILE_SETS, PROFILE_SOURCES
     from transformers.integrations.sonicmoe import load_sonicmoe_kernel
 
+    from axolotl.integrations.kernels.autotune_profiles import apply_autotune_profiles
     from axolotl.integrations.kernels.libs.sonicmoe.experts import (
         register_sonicmoe_experts,
     )
+    from axolotl.integrations.kernels.plugin import _check_sonicmoe_gpu_compat
     from axolotl.integrations.kernels.quack_autotune_policy import (
         install_quack_key_policy,
     )
 
+    # Same device setup the kernels plugin runs before loading a model: USE_QUACK_GEMM on
+    # Blackwell and the cutlass-dsl 4.8 `nvvm.mbarrier_arrive` shim the hub-vendored quack
+    # 0.6.1 needs on its SM100 2-CTA release path.
+    _check_sonicmoe_gpu_compat()
     register_sonicmoe_experts()
     load_sonicmoe_kernel()
+    profiles = copy.deepcopy(PROFILE_SETS[profile_set])
+    gpu_name = torch.cuda.get_device_name()
+    # the H100 entries also serve an H200 allocation: drop the gpu filter, record the device
+    gpu_filter_dropped = any(p["gpu"].lower() not in gpu_name.lower() for p in profiles)
+    if gpu_filter_dropped:
+        for profile in profiles:
+            profile.pop("gpu")
+    seeded = apply_autotune_profiles(profiles)
+    assert seeded > 0, "apply_autotune_profiles attached to no quack autotuners"
     covered = install_quack_key_policy()
     assert covered > 0, "install_quack_key_policy covered no quack autotuners"
-    return covered
+    return {
+        "profile_set": profile_set,
+        "source": PROFILE_SOURCES[profile_set],
+        "profiles": len(profiles),
+        "configs": sum(len(p["configs"]) for p in profiles),
+        "gpu_name": gpu_name,
+        "gpu_filter_dropped": gpu_filter_dropped,
+        "autotuners_seeded": seeded,
+        "policy_autotuners_covered": covered,
+    }
 
 
 def _autotune_outcome():
-    """Per quack GEMM: keys swept, candidates benchmarked and failed, on this rank."""
+    """Per quack GEMM key on this rank: candidates offered (after the profiles), compiled,
+    failed, the winner and how it was chosen; plus per-kernel totals."""
     from axolotl.integrations.kernels.sonicmoe_autotune import (
         collect_sonicmoe_autotune_configs,
     )
 
+    keys = []
     per_kernel = {}
     for record in collect_sonicmoe_autotune_configs(with_timings=True):
+        benchmarked = record.get("configs_benchmarked")
+        failed = record.get("failed_configs", 0)
+        keys.append(
+            {
+                "kernel": record["kernel"],
+                "key": record.get("key"),
+                "call_args": record.get("call_args"),
+                "candidates_offered": record.get("candidate_config_count"),
+                "candidates_compiled": (
+                    None if benchmarked is None else benchmarked - failed
+                ),
+                "candidates_failed": failed,
+                "winner": record.get("config"),
+                "source": record.get("source", "unknown"),
+                "sweep_seconds": record.get("sweep_seconds"),
+                "timings_ms": record.get("timings_ms"),
+            }
+        )
         entry = per_kernel.setdefault(
             record["kernel"],
             {
                 "keys": 0,
+                "candidates_offered_max": 0,
                 "candidates_benchmarked": 0,
                 "candidates_failed": 0,
                 "sources": {},
             },
         )
         entry["keys"] += 1
-        entry["candidates_benchmarked"] += record.get("configs_benchmarked", 0)
-        entry["candidates_failed"] += record.get("failed_configs", 0)
+        entry["candidates_offered_max"] = max(
+            entry["candidates_offered_max"], record.get("candidate_config_count") or 0
+        )
+        entry["candidates_benchmarked"] += benchmarked or 0
+        entry["candidates_failed"] += failed
         source = record.get("source", "unknown")
         entry["sources"][source] = entry["sources"].get(source, 0) + 1
-    return per_kernel
+    return {"per_kernel": per_kernel, "keys": keys}
 
 
 def _build_experts(group):
@@ -132,7 +185,7 @@ def _build_experts(group):
     return experts
 
 
-def run():
+def run(profile_set):
     from mono_ep import MonoEPDispatchRuntime
 
     from axolotl.integrations.expert_parallel import experts_fn, torch_dispatch
@@ -145,7 +198,7 @@ def run():
     group = dist.group.WORLD
     torch_dispatch.set_ep_group(group)
     experts_fn.register_all()
-    policy_covered = _prepare_sonicmoe()
+    quack_setup = _prepare_sonicmoe(profile_set)
     experts = _build_experts(group)
     runtime = MonoEPDispatchRuntime(
         group=group, max_tokens_per_rank=TOKENS, top_k=TOPK, hidden=HIDDEN
@@ -316,8 +369,15 @@ def run():
     outcomes = [None] * world
     dist.all_gather_object(outcomes, local_outcome)
     failed = sum(
-        entry["candidates_failed"] for outcome in outcomes for entry in outcome.values()
+        entry["candidates_failed"]
+        for outcome in outcomes
+        for entry in outcome["per_kernel"].values()
     )
+    offered = [
+        key["candidates_offered"] or 0
+        for outcome in outcomes
+        for key in outcome["keys"]
+    ]
     runtime.destroy()
     if rank == 0:
         print(
@@ -354,9 +414,15 @@ def run():
                     "timing": "host_wall_synchronized; max and arithmetic mean across ranks per iteration, median across measured iterations",
                     "memory_scope": "max across measured iterations and ranks; all variants share one process, the peer runtime is resident throughout",
                     "receive_buffers": receive_buffers,
-                    "quack_policy_autotuners_covered": policy_covered,
-                    "quack_autotune_outcome_rank0": local_outcome,
+                    "quack_profiles": quack_setup,
+                    "quack_autotune_per_kernel_rank0": local_outcome["per_kernel"],
+                    "quack_autotune_keys_rank0": local_outcome["keys"],
                     "quack_candidates_failed_all_ranks": failed,
+                    "quack_candidates_offered_all_ranks": {
+                        "keys": len(offered),
+                        "min": min(offered, default=None),
+                        "max": max(offered, default=None),
+                    },
                     "routings": results,
                 }
             ),
@@ -370,7 +436,8 @@ def run():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--profiles", choices=("H100", "B200"), required=True)
     args = parser.parse_args()
     if not args.worker:
         parser.error("run under torch.distributed.run with --worker")
-    run()
+    run(args.profiles)
