@@ -60,11 +60,9 @@ RUNTIMES = {
 # the fused reference lines: FP8 (blockwise) on H100 with FP8 transport + combine, BF16 on B200
 FUSED_PRECISION = {"H100": "fp8", "B200": "bf16"}
 FUSED_PROVENANCE = (
-    "fused kernels of the mono-ep base (features/mono-ep @ 9ae994be97: SM90/SM100 persistent "
-    "kernels from before B200 rounds 1-3, no two-row dispatch pulls, forward lookahead or "
-    "weight-layout cache, no MONO_EP_SM100_* selectors); the current fused reference for this "
-    "contract is the B200 round-3 build (f73dad341d): 7.66 ms checkpointed 2F+B on 8xB200, "
-    "13.48 ms on 8xH100 (FP8); this row is a same-allocation sanity point, not the fused-vs-dispatch gap"
+    "the fused persistent kernels of this tree at their defaults, run uncompiled inside the "
+    "contract job with BF16 parameters quantized per call; a same-allocation reference point, "
+    "not the fused harness timing (benchmark_persistent_training.py, compiled, FP32 masters)"
 )
 FUSED_ENV = (
     "MONO_EP_SM90_FP8_TRANSPORT",

@@ -279,6 +279,7 @@ def run(
     geometry=(16384, 2048, 768, 128, 8),
     shape_name="qwen3_30b_a3b",
     time_weight_build=False,
+    paths="",
 ):
     variant_envs = _parse_variants(variants)
     four_layer_envs = _parse_variants(four_layer_variants)
@@ -308,6 +309,13 @@ def run(
             "Hopper FP8 timing requires compiled native/NCCL recomputation only"
         )
     compare_nccl = compare_nccl or compare_native
+    # A subset of the paired backends keeps the larger shapes inside 80 GB: unselected
+    # backends are never built or run, so their buffers and transients are not resident.
+    selected_paths = set(paths.split(",")) if paths else None
+    if selected_paths is not None and (
+        not compare_nccl or not selected_paths <= {"native", "peer", "nccl"}
+    ):
+        raise ValueError("--paths selects among native, peer and nccl paired timing")
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", rank))
@@ -358,7 +366,7 @@ def run(
         )
     peer_backend = runtime._peer_backward
     native_backend = None
-    if compare_native:
+    if compare_native and (selected_paths is None or "native" in selected_paths):
         from mono_ep.persistent_backward import NativePersistentBackward
 
         native_backend = NativePersistentBackward(runtime)
@@ -440,6 +448,11 @@ def run(
         for native in ((False, True) if compare_native and use_peer else (False,))
         for forward_layout, backward_layout in kernel_layouts
         if not (compute_dtype == "blockwise" and use_peer and not native)
+        and (
+            selected_paths is None
+            or ("native" if native else "peer" if use_peer else "nccl")
+            in selected_paths
+        )
     ]
     # Variant lists: every native case runs once per variant (env set before each step); the NCCL
     # control keeps the default environment.
@@ -739,6 +752,7 @@ def run(
                     compare_owned=compare_owned,
                     compare_nccl=compare_nccl,
                     compare_native=compare_native,
+                    paths=sorted(selected_paths) if selected_paths else None,
                     compare_forward_layouts=compare_forward_layouts,
                     compare_kernel_layouts=compare_kernel_layouts,
                     kernel_layout_scope=(
@@ -936,6 +950,11 @@ if __name__ == "__main__":
     parser.add_argument("--shape-name", default="qwen3_30b_a3b")
     parser.add_argument("--time-weight-build", action="store_true")
     parser.add_argument(
+        "--paths",
+        default="",
+        help="comma subset of the paired backends to build and time (native,peer,nccl)",
+    )
+    parser.add_argument(
         "--four-layer-variants",
         default="",
         help="native env variants for the four-layer stack 'name:ENV=V+...,...'",
@@ -1017,4 +1036,5 @@ if __name__ == "__main__":
         (args.tokens, args.hidden, args.intermediate, args.experts, args.topk),
         args.shape_name,
         args.time_weight_build,
+        args.paths,
     )

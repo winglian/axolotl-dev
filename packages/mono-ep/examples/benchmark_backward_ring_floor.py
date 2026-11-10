@@ -68,7 +68,12 @@ def main():
     os.environ.pop("MONO_EP_BACKWARD_RING_WAVES", None)
     os.environ.update(dtype_env)
     runtimes = {}
+    # RING_BENCH_VARIANTS=ring0 or =default builds one runtime only (no bitwise check), which
+    # keeps the larger shapes inside 80 GB.
+    selected = os.environ.get("RING_BENCH_VARIANTS", "ring0,default").split(",")
     for name, waves in (("ring0", "0"), ("default", None)):
+        if name not in selected:
+            continue
         if waves is not None:
             os.environ["MONO_EP_BACKWARD_RING_WAVES"] = waves
         runtimes[name] = PersistentMoE(
@@ -119,17 +124,18 @@ def main():
                 t.grad = None
             fn(x, ids, scores).backward(dy)
             grads[name] = [t.grad.clone() for t in (x, scores, w1, w2)]
-        same = torch.tensor(
-            [
-                int(torch.equal(a, b))
-                for a, b in zip(grads["ring0"], grads["default"], strict=True)
-            ],
-            device=device,
-        )
-        dist.all_reduce(same, op=dist.ReduceOp.MIN)
-        grads_match[route] = dict(
-            zip(("dx", "ds", "dw1", "dw2"), map(bool, same.tolist()), strict=True)
-        )
+        if len(grads) == 2:
+            same = torch.tensor(
+                [
+                    int(torch.equal(a, b))
+                    for a, b in zip(grads["ring0"], grads["default"], strict=True)
+                ],
+                device=device,
+            )
+            dist.all_reduce(same, op=dist.ReduceOp.MIN)
+            grads_match[route] = dict(
+                zip(("dx", "ds", "dw1", "dw2"), map(bool, same.tolist()), strict=True)
+            )
         del grads
         combos = [(v, s) for v in variants for s in scopes]
         samples = {c: [] for c in combos}
@@ -162,14 +168,14 @@ def main():
         geometry=dict(world=world, local_experts=local, **case),
         device=torch.cuda.get_device_name(),
         torch_version=torch.__version__,
-        active_sms=runtimes["default"].num_sms,
+        active_sms=next(iter(runtimes.values())).num_sms,
         warmup=WARMUP,
         samples=SAMPLES,
         env={k: v for k, v in os.environ.items() if k.startswith("MONO_EP_")},
         backward_ring_tokens={
             k: rt._peer_backward.buffer.l1_acts.shape[0] for k, rt in runtimes.items()
         },
-        grads_bitwise_ring0_vs_default=grads_match,
+        grads_bitwise_ring0_vs_default=grads_match or None,
         peak_memory_gib={
             v: m / 2**30 for v, m in zip(variants, mem.tolist(), strict=True)
         },
