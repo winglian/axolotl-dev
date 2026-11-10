@@ -95,6 +95,12 @@ model = AutoModelForCausalLM.from_pretrained(model_id, experts_implementation="m
 script (expert slicing, DDP exclusion, runtime lifetime); the API and what the Axolotl seam
 adds are in [docs/trl-integration.md](docs/trl-integration.md).
 
+### NVFP4 LoRA (SM100)
+
+LoRA on frozen packed NVFP4 experts runs through the package API
+(`MonoEPRuntime(precision="nvfp4_lora").forward_lora(...)`), not yet from an Axolotl config:
+[docs/trl-integration.md](docs/trl-integration.md#nvfp4-lora).
+
 ## Benchmarks
 
 One MoE layer at expert parallel 8 (16,384 tokens per GPU, top-8), checkpointed layer step
