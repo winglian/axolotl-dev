@@ -30,6 +30,7 @@ DISPATCH_BACKWARD_OP = "mono_ep::peer_dispatch_backward"
 COMBINE_BACKWARD_OP = "mono_ep::peer_combine_backward"
 DISPATCH_PUBLISH_OP = "mono_ep::peer_dispatch_publish"
 DISPATCH_PULL_OP = "mono_ep::peer_dispatch_pull"
+DISPATCH_PULL_BOUNDED_OP = "mono_ep::peer_dispatch_pull_bounded"
 COUNT_TO_HOST_OP = "mono_ep::peer_count_to_host"
 HIDDEN_MULTIPLE = 256
 INTERMEDIATE_MULTIPLE = 128
@@ -173,7 +174,10 @@ class MonoEPDispatchRuntime:
     ``compact=True`` returns only the routed rows (``[routed, hidden]``) at the price of
     one device-to-host count per dispatch (``mono_ep::peer_count_to_host``, a stream
     sync, like the torch backend's ``axolotl::ep_to_host``); the dispatch is then the
-    ``peer_dispatch_publish`` + ``peer_dispatch_pull`` op pair. ``transfer`` selects
+    ``peer_dispatch_publish`` + ``peer_dispatch_pull`` op pair. ``bounded=True`` (compact)
+    makes :meth:`forward_bounded` available: the receive is sized
+    from the layer's high-water routed count and the count is read only after the local
+    kernel was issued, so the dispatch never drains the stream. ``transfer`` selects
     the bandwidth-shaped streams (default) or the fused runtime's legacy row kernels.
     """
 
@@ -183,6 +187,7 @@ class MonoEPDispatchRuntime:
     combine_backward_op = COMBINE_BACKWARD_OP
     dispatch_publish_op = DISPATCH_PUBLISH_OP
     dispatch_pull_op = DISPATCH_PULL_OP
+    dispatch_pull_bounded_op = DISPATCH_PULL_BOUNDED_OP
     count_to_host_op = COUNT_TO_HOST_OP
 
     def __init__(
@@ -193,9 +198,13 @@ class MonoEPDispatchRuntime:
         top_k: int,
         hidden: int,
         compact: bool = False,
+        bounded: bool = False,
         transfer: str = "streamed",
     ):
         from .peer_dispatch import PeerDispatch
+
+        if bounded and not compact:
+            raise ValueError("bounded needs compact=True")
 
         reason = dispatch_unsupported_reason(
             capability=torch.cuda.get_device_capability(),
@@ -213,6 +222,7 @@ class MonoEPDispatchRuntime:
         )
         self.max_tokens_per_rank = max_tokens_per_rank
         self.compact = compact
+        self.bounded = bounded
         self.transfer = transfer
         self.world_size = self._dispatch.world
         self.receive_rows = self._dispatch.rows
@@ -223,6 +233,8 @@ class MonoEPDispatchRuntime:
         ops = {self.dispatch_op, self.combine_op}
         if self.compact:
             ops.add(self.dispatch_pull_op)
+        if self.bounded:
+            ops.add(self.dispatch_pull_bounded_op)
         return frozenset(ops)
 
     def _live(self):
@@ -267,6 +279,46 @@ class MonoEPDispatchRuntime:
         return peer_combine(
             local_out.contiguous(), rows, topk_idx, num_local_experts, self._live().key
         )
+
+    def forward_bounded(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_local_experts: int,
+        local_fn,
+        key,
+        row_bound=None,
+    ) -> torch.Tensor:
+        """``combine(local_fn(*dispatch(...)[:3]))`` in compact mode without the stream
+        stall (``bounded=True``). ``key`` names the MoE layer (one call per key per
+        forward); ``row_bound(mark) >= mark`` may widen the receive to the local kernel's
+        own row padding. Outputs and gradients are compact mode's."""
+        from .peer_dispatch import dispatch_bounded_moe
+
+        if not self.bounded:
+            raise RuntimeError(
+                "forward_bounded needs a runtime built with bounded=True"
+            )
+        return dispatch_bounded_moe(
+            x.contiguous(),
+            topk_idx.contiguous(),
+            topk_weights.contiguous(),
+            num_local_experts,
+            local_fn,
+            self._live().key,
+            key,
+            row_bound,
+        )
+
+    def clear_receive_marks(self) -> None:
+        """Forget every layer's high-water count (the next call per layer is exact)."""
+        self._live().clear_marks()
+
+    @property
+    def bound_overflows(self) -> int:
+        """Bounded calls whose routed count exceeded the bound and were re-run exactly."""
+        return self._live().bound_overflows
 
     def destroy(self) -> None:
         """Release the symmetric buffers; call only after every graph using them has finished."""

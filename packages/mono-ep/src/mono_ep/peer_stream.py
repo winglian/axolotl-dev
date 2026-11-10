@@ -87,7 +87,7 @@ def _check_rows(rows, name, dtype, numel):
         raise ValueError(f"expected a contiguous {dtype} [{numel}] {name}")
 
 
-@triton.jit(do_not_specialize=["rank", "programs_per_source"])
+@triton.jit(do_not_specialize=["rank", "programs_per_source", "limit"])
 def _pull_rows(
     BASE,
     DELTAS,
@@ -97,6 +97,7 @@ def _pull_rows(
     SLOTS,
     rank,
     programs_per_source,
+    limit,
     CAPACITY: tl.constexpr,
     WORLD: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -132,6 +133,8 @@ def _pull_rows(
         if COMPACT:
             prefix = prefix_next
             prefix_next = tl.load(PREFIX + first + t_next, mask=valid_next, other=0)
+            # a bounded receive smaller than the routed count drops the rows past it
+            routed = routed & (prefix - 1 < limit)
             dst_rows = (prefix - 1) * WIDTH
             tl.store(SLOTS + prefix - 1, first + t, mask=routed)
         else:
@@ -152,7 +155,15 @@ def _pull_rows(
 
 
 def pull_rows(
-    sources, routed, rank, *, out=None, prefix=None, count=None, programs_per_sm=4
+    sources,
+    routed,
+    rank,
+    *,
+    out=None,
+    prefix=None,
+    count=None,
+    programs_per_sm=4,
+    slots=None,
 ):
     """Receive rows from the peers' ``[capacity, width]`` ``sources`` (process-group rank
     order), this rank's own copy included.
@@ -161,7 +172,9 @@ def pull_rows(
     ``s * capacity + t`` = ``sources[s][t]`` where ``routed`` is set and a zero row
     elsewhere. Compact (``prefix`` = inclusive cumsum of ``routed``, ``count`` = its last
     value as a host int): returns ``([count, width], slots [count] int64)``, the routed rows
-    in receive-row order and the receive row each one came from.
+    in receive-row order and the receive row each one came from. A ``count`` below the
+    routed count drops the rows past it; above it, the rows past the routed count stay
+    unwritten (``zero_tail``).
     """
     first = sources[0]
     world, capacity, width = len(sources), first.shape[0], first.shape[1]
@@ -177,7 +190,8 @@ def pull_rows(
         if count is None:
             raise ValueError("compact pulls need the routed count on the host")
         out = first.new_empty((count, width)) if out is None else out
-        slots = torch.empty(count, dtype=torch.int64, device=first.device)
+        if slots is None:
+            slots = torch.empty(count, dtype=torch.int64, device=first.device)
     else:
         out = first.new_empty((world * capacity, width)) if out is None else out
         slots = routed  # unused placeholder pointer
@@ -199,6 +213,7 @@ def pull_rows(
         slots,
         rank,
         programs_per_source,
+        out.shape[0],
         capacity,
         world,
         wide.shape[1],
@@ -210,6 +225,47 @@ def pull_rows(
         num_warps=8,
     )
     return (out, slots) if compact else out
+
+
+@triton.jit(do_not_specialize=["limit"])
+def _zero_tail(
+    OUT,
+    PREFIX,
+    limit,
+    TOTAL: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    count = tl.load(PREFIX + TOTAL - 1)
+    rows = tl.program_id(0).to(tl.int64) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    tail = (rows >= count) & (rows < limit)
+    if tl.max(tail.to(tl.int32), 0) != 0:
+        for c in tl.static_range(tl.cdiv(WIDTH, BLOCK_COLS)):
+            cols = c * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+            mask = tail[:, None] & (cols < WIDTH)[None, :]
+            zeros = tl.zeros((BLOCK_ROWS, BLOCK_COLS), dtype=OUT.dtype.element_ty)
+            tl.store(OUT + rows[:, None] * WIDTH + cols[None, :], zeros, mask=mask)
+
+
+def zero_tail(out, prefix):
+    """Zero the rows of a compact ``out`` at or past the routed count ``prefix[-1]`` (read
+    on device), so a receive bounded above the count needs no host count."""
+    if out.shape[0] == 0:
+        return out
+    wide = _wide_view(out)
+    _, block_rows, block_cols = _tile(wide.shape[1], wide.element_size())
+    _zero_tail[(triton.cdiv(out.shape[0], block_rows),)](
+        wide,
+        prefix,
+        out.shape[0],
+        prefix.numel(),
+        wide.shape[1],
+        block_rows,
+        block_cols,
+        num_warps=8,
+    )
+    return out
 
 
 @triton.jit(do_not_specialize=["rank", "programs_per_source"])

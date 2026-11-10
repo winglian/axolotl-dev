@@ -8,7 +8,9 @@ between. Every rank receives a fixed ``world * capacity`` rows: row ``s * capaci
 token ``t`` of source rank ``s`` when one of its top-k experts is local, otherwise a zero
 row with all ``-1`` ids. The layout is a pure function of the published routing, so there
 is no host count and no sort; the opt-in compact mode trades one host count per dispatch
-for a ``[routed, hidden]`` receive side.
+for a ``[routed, hidden]`` receive side, and its bounded form (``dispatch_bounded_moe``)
+receives into a host-known bound instead and reads the count only after the local kernel
+was issued.
 
 Transfers are the bandwidth-shaped streams of ``peer_stream.py`` (``transfer="streamed"``);
 ``transfer="legacy"`` keeps the fused runtime's per-expert ``pack_peer_rows`` /
@@ -31,6 +33,7 @@ COMBINE_BACKWARD_OP = "mono_ep::peer_combine_backward"
 DISPATCH_PUBLISH_OP = "mono_ep::peer_dispatch_publish"
 COUNT_TO_HOST_OP = "mono_ep::peer_count_to_host"
 DISPATCH_PULL_OP = "mono_ep::peer_dispatch_pull"
+DISPATCH_PULL_BOUNDED_OP = "mono_ep::peer_dispatch_pull_bounded"
 
 # Buffer families: ops that write this rank's ``x``/``idx``/``w`` and read the peers'
 # (dispatch, combine backward) and ops that write the peers' ``y``/``gw`` and read this
@@ -205,6 +208,9 @@ class PeerDispatch:
         self.zero_scores = torch.zeros(self.rows, device=device, dtype=torch.float32)
         self._last_family = None
         self.extra_barriers = 0
+        # bounded compact receive: per-key [frozen, pending] high-water routed counts
+        self._marks: dict = {}
+        self.bound_overflows = 0
         self._key = next(_RUNTIME_KEYS)
         _RUNTIMES[self._key] = self
 
@@ -360,6 +366,55 @@ class PeerDispatch:
             weights.index_select(0, slots),
             slots,
         )
+
+    def dispatch_pull_bounded(self, local, weights, routed, prefix, bound):
+        """Compact mode without the host count: ``bound`` rows, the routed rows first in
+        receive-row order, then zero rows with ``-1`` ids, zero weights and slot 0 (a bound
+        below the routed count drops the rows past it). Same reads and ordering as
+        ``dispatch_pull``."""
+        count = prefix[-1:]
+        if self.streamed:
+            from .peer_stream import pull_rows, zero_tail
+
+            recv_x, slots = pull_rows(
+                self.workspace.views["x"],
+                routed,
+                self.rank,
+                prefix=prefix,
+                count=bound,
+                slots=torch.zeros(bound, dtype=torch.int64, device=self.device),
+            )
+            zero_tail(recv_x, prefix)
+        else:
+            found = routed.nonzero().squeeze(1)[:bound]
+            slots = torch.zeros(bound, dtype=torch.int64, device=self.device)
+            slots[: found.numel()] = found
+            assignments = torch.full_like(slots, -1)
+            assignments[: found.numel()] = found
+            recv_x = gather_rows(self.workspace.views["x"], assignments)
+        tail = (torch.arange(bound, device=self.device) >= count).unsqueeze(-1)
+        return (
+            recv_x,
+            local.index_select(0, slots).masked_fill(tail, -1),
+            weights.index_select(0, slots).masked_fill(tail, 0),
+            slots,
+        )
+
+    def receive_mark(self, key):
+        """The frozen high-water routed count of ``key`` (one MoE layer). Outside the
+        backward it first folds in the counts seen since; a checkpoint recompute runs inside
+        the backward, so it gets the bound its forward had."""
+        mark = self._marks.setdefault(key, [0, 0])
+        if torch._C._current_graph_task_id() == -1:
+            mark[0] = max(mark)
+        return mark[0]
+
+    def clear_marks(self):
+        self._marks.clear()
+
+    def note_count(self, key, count):
+        mark = self._marks.setdefault(key, [0, 0])
+        mark[1] = max(mark[1], count)
 
     def combine(self, local_out, rows, topk_idx, num_local_experts):
         self._enter(Y_FAMILY)
@@ -725,3 +780,157 @@ class _CompactPull(torch.autograd.Function):
             None,
             None,
         )
+
+
+@torch.library.custom_op(DISPATCH_PULL_BOUNDED_OP, mutates_args=())
+def peer_dispatch_pull_bounded(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    local_ids: torch.Tensor,
+    weights: torch.Tensor,
+    routed: torch.Tensor,
+    prefix: torch.Tensor,
+    bound: int,
+    runtime_key: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``peer_dispatch_pull`` over ``bound`` rows instead of the host count: rows past the
+    routed count are zero with ``-1`` ids, zero weights and slot 0."""
+    runtime = _runtime(runtime_key)
+    if bound < 1 or bound > runtime.rows:
+        raise ValueError("bound outside the receive layout")
+    return runtime.dispatch_pull_bounded(local_ids, weights, routed, prefix, bound)
+
+
+@peer_dispatch_pull_bounded.register_fake
+def _peer_dispatch_pull_bounded_fake(
+    x, topk_weights, local_ids, weights, routed, prefix, bound, runtime_key
+):
+    return _peer_dispatch_pull_fake(
+        x, topk_weights, local_ids, weights, routed, prefix, bound, runtime_key
+    )
+
+
+class AsyncCount:
+    """The routed count copied to pinned host memory behind the dispatch; ``value()``
+    waits for that copy only, not for the kernels queued after it."""
+
+    def __init__(self, count):
+        if count.is_cuda:
+            self._host = torch.empty(1, dtype=count.dtype, pin_memory=True)
+            self._host.copy_(count, non_blocking=True)
+            self._event = torch.cuda.Event()
+            self._event.record()
+        else:
+            self._host, self._event = count, None
+        self._value = None
+
+    def value(self):
+        if self._value is None:
+            if self._event is not None:
+                self._event.synchronize()
+            self._value = int(self._host[0])
+        return self._value
+
+
+class _BoundedPull(torch.autograd.Function):
+    """Autograd around ``peer_dispatch_pull_bounded``: the backward drops the rows past the
+    routed count and is then ``_CompactPull``'s."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        topk_weights,
+        local_ids,
+        weights,
+        routed,
+        prefix,
+        bound,
+        routed_count,
+        topk_idx,
+        num_local_experts,
+        runtime_key,
+    ):
+        recv_x, recv_idx, recv_w, slots = peer_dispatch_pull_bounded(
+            x, topk_weights, local_ids, weights, routed, prefix, bound, runtime_key
+        )
+        ctx.save_for_backward(topk_idx, slots)
+        ctx.routed_count = routed_count
+        ctx.num_local_experts = num_local_experts
+        ctx.runtime_key = runtime_key
+        ctx.mark_non_differentiable(recv_idx, slots)
+        return recv_x, recv_idx, recv_w, slots
+
+    @staticmethod
+    def backward(ctx, grad_recv_x, _grad_recv_idx, grad_recv_w, _grad_slots):
+        topk_idx, slots = ctx.saved_tensors
+        count = ctx.routed_count.value()
+        needs_w = ctx.needs_input_grad[1] and grad_recv_w is not None
+        grad_x, grad_w = peer_dispatch_backward(
+            grad_recv_x[:count].contiguous(),
+            grad_recv_w[:count].contiguous() if needs_w else None,
+            topk_idx,
+            slots[:count],
+            ctx.num_local_experts,
+            ctx.runtime_key,
+        )
+        return (grad_x, grad_w if needs_w else None) + (None,) * 9
+
+
+def dispatch_bounded_moe(
+    x,
+    topk_idx,
+    topk_weights,
+    num_local_experts,
+    local_fn,
+    runtime_key,
+    mark_key,
+    row_bound=None,
+):
+    """``combine(local_fn(*compact dispatch))`` without stalling the stream on the count.
+
+    The receive is ``row_bound(mark)`` rows (default ``mark``, never below it), ``mark``
+    the layer's frozen high-water routed count (``PeerDispatch.receive_mark``); the count
+    goes to the host behind the dispatch and is read once ``local_fn`` has been issued, so
+    the host never drains the stream. The combine and the dispatch backward see only the
+    routed rows, so both are exactly compact mode's. A layer's first call (no mark yet)
+    takes the host count up front; a count above the bound re-pulls the exact rows and
+    re-runs ``local_fn`` (the peers' ``x`` stays published until this rank's combine
+    barrier). One call per ``mark_key`` per forward.
+    """
+    runtime = _runtime(runtime_key)
+    local_ids, weights, routed, prefix, count = peer_dispatch_publish(
+        x.detach(), topk_idx, topk_weights.detach(), num_local_experts, runtime_key
+    )
+    mark = runtime.receive_mark(mark_key)
+    route = (topk_idx, num_local_experts, runtime_key)
+    if mark:
+        bound = min(max(row_bound(mark) if row_bound else mark, mark), runtime.rows)
+        routed_count = AsyncCount(count)
+        recv_x, recv_idx, recv_w, slots = _BoundedPull.apply(
+            x,
+            topk_weights,
+            local_ids,
+            weights,
+            routed,
+            prefix,
+            bound,
+            routed_count,
+            *route,
+        )
+        local_out = local_fn(recv_x, recv_idx, recv_w)
+        routed_rows = routed_count.value()
+        runtime.note_count(mark_key, routed_rows)
+        if routed_rows <= bound:
+            return peer_combine(
+                local_out[:routed_rows].contiguous(), slots[:routed_rows], *route
+            )
+        runtime.bound_overflows += 1
+        del local_out, recv_x, recv_idx, recv_w, slots
+    else:
+        routed_rows = int(peer_count_to_host(count).item())
+        runtime.note_count(mark_key, routed_rows)
+    recv_x, recv_idx, recv_w, slots = _CompactPull.apply(
+        x, topk_weights, local_ids, weights, routed, prefix, routed_rows, *route
+    )
+    return peer_combine(local_fn(recv_x, recv_idx, recv_w), slots, *route)

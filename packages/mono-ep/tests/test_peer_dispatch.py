@@ -296,6 +296,162 @@ def test_compact_rows_match_fixed_layout():
             torch.testing.assert_close(compact, fixed)
 
 
+def _rank_bounded_sequence(rank, runtime, xs, routings, experts, results):
+    """The same layer called once per routing; the bounded path, or compact mode when
+    ``results["bounded"]`` is off."""
+    from mono_ep.peer_dispatch import (
+        dispatch_bounded_moe,
+        dispatch_compact,
+        peer_combine,
+    )
+
+    outputs = []
+    for call, (x, (idx, w)) in enumerate(zip(xs[rank], routings[rank], strict=True)):
+        x = x.clone().requires_grad_(True)
+        w = w.clone().requires_grad_(True)
+
+        def local(recv_x, recv_idx, recv_w):
+            return _local_kernel(experts, recv_x, recv_idx, recv_w)
+
+        if results["bounded"]:
+            widen = results["widen"][call]
+            y = dispatch_bounded_moe(
+                x.bfloat16(),
+                idx,
+                w,
+                E_LOCAL,
+                local,
+                runtime.key,
+                "layer",
+                (lambda mark, widen=widen: mark + widen) if widen else None,
+            )
+        else:
+            recv_x, recv_idx, recv_w, slots = dispatch_compact(
+                x.bfloat16(), idx, w, E_LOCAL, runtime.key
+            )
+            y = peer_combine(
+                local(recv_x, recv_idx, recv_w), slots, idx, E_LOCAL, runtime.key
+            )
+        (y.float() * results["grad_out"][rank][call]).sum().backward()
+        outputs.append((y.detach(), x.grad, w.grad))
+    results[rank] = outputs
+
+
+def test_bounded_receive_matches_compact_bitwise():
+    generator = torch.Generator().manual_seed(5)
+    experts_global = torch.randn(WORLD * E_LOCAL, H, H, generator=generator) * 0.1
+    tokens = [CAP, 3, 6]
+    sparse = [_routing(r, tokens[r], generator) for r in range(WORLD)]
+    # every token on two ranks: more rows than the sparse routing on every rank
+    dense = []
+    for r in range(WORLD):
+        t = torch.arange(tokens[r])
+        idx = torch.stack(
+            ((t % WORLD) * E_LOCAL, ((t + 1) % WORLD) * E_LOCAL + 1), dim=1
+        )
+        dense.append((idx, torch.rand(tokens[r], K, generator=generator)))
+    # no mark (exact count), tight bound, widened bound, overflow
+    routings = [[sparse[r], sparse[r], sparse[r], dense[r]] for r in range(WORLD)]
+    widen = [0, 0, 3, 0]
+    xs = [
+        [
+            torch.randn(tokens[r], H, generator=generator).bfloat16().float()
+            for _ in widen
+        ]
+        for r in range(WORLD)
+    ]
+    grad_out = [
+        [torch.randn(tokens[r], H, generator=generator) for _ in widen]
+        for r in range(WORLD)
+    ]
+    outputs = {}
+    for bounded in (False, True):
+        runtimes = _runtimes(barrier=threading.Barrier(WORLD))
+        results = {"grad_out": grad_out, "bounded": bounded, "widen": widen}
+        threads = [
+            threading.Thread(
+                target=_rank_bounded_sequence,
+                args=(
+                    r,
+                    runtimes[r],
+                    xs,
+                    routings,
+                    experts_global[r * E_LOCAL : (r + 1) * E_LOCAL],
+                    results,
+                ),
+            )
+            for r in range(WORLD)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+            assert not thread.is_alive()
+        outputs[bounded] = results
+        if bounded:
+            assert sum(runtime.bound_overflows for runtime in runtimes) > 0
+            for runtime in runtimes:
+                assert runtime.receive_mark("layer") == max(runtime._marks["layer"])
+    for rank in range(WORLD):
+        for compact, bounded in zip(
+            outputs[False][rank], outputs[True][rank], strict=True
+        ):
+            for a, b in zip(compact, bounded, strict=True):
+                assert torch.equal(a, b)
+
+
+def test_bounded_receive_under_checkpoint_recompute():
+    from mono_ep.peer_dispatch import (
+        dispatch_bounded_moe,
+        dispatch_compact,
+        peer_combine,
+    )
+    from torch.utils.checkpoint import checkpoint
+
+    generator = torch.Generator().manual_seed(9)
+    experts = torch.randn(E_LOCAL, H, H, generator=generator) * 0.1
+    sparse = torch.randint(0, 2 * E_LOCAL, (CAP, K), generator=generator)
+    dense = torch.randint(0, E_LOCAL, (CAP, K), generator=generator)
+    w = torch.rand(CAP, K, generator=generator)
+    # no mark, overflow (forward and recompute), bound above the count
+    steps = [sparse, dense, sparse]
+    xs = [torch.randn(CAP, H, generator=generator).bfloat16() for _ in steps]
+
+    def local(recv_x, recv_idx, recv_w):
+        return _local_kernel(experts, recv_x, recv_idx, recv_w)
+
+    def run(bounded):
+        (runtime,) = _runtimes(world=1)
+
+        def layer(x, scores, idx):
+            if bounded:
+                return dispatch_bounded_moe(
+                    x, idx, scores, E_LOCAL, local, runtime.key, "layer"
+                )
+            recv_x, recv_idx, recv_w, slots = dispatch_compact(
+                x, idx, scores, E_LOCAL, runtime.key
+            )
+            return peer_combine(
+                local(recv_x, recv_idx, recv_w), slots, idx, E_LOCAL, runtime.key
+            )
+
+        grads = []
+        for x, idx in zip(xs, steps, strict=True):
+            x = x.clone().requires_grad_(True)
+            scores = w.clone().requires_grad_(True)
+            y = checkpoint(layer, x, scores, idx, use_reentrant=False)
+            y.float().square().sum().backward()
+            grads.append((y.detach(), x.grad, scores.grad))
+        return grads, runtime
+
+    reference, _ = run(False)
+    got, runtime = run(True)
+    assert runtime.bound_overflows == 2
+    for expected, actual in zip(reference, got, strict=True):
+        for a, b in zip(expected, actual, strict=True):
+            assert torch.equal(a, b)
+
+
 def test_same_family_ops_insert_a_barrier():
     barrier = threading.Barrier(1)
     (runtime,) = _runtimes(world=1, barrier=barrier)

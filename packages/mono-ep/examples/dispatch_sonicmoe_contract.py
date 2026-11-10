@@ -43,12 +43,14 @@ VARIANTS = (
     ("mono_ep+grouped_mm", "mono_ep", "grouped_mm", "streamed"),
     ("mono_ep_compact+sonicmoe", "mono_ep", "sonicmoe", "compact"),
     ("mono_ep_compact+grouped_mm", "mono_ep", "grouped_mm", "compact"),
+    ("mono_ep_bounded+sonicmoe", "mono_ep", "sonicmoe", "bounded"),
     ("mono_ep_fused", "mono_ep", None, "fused"),
 )
 RUNTIMES = {
     "legacy": {"transfer": "legacy", "compact": False},
     "streamed": {"transfer": "streamed", "compact": False},
     "compact": {"transfer": "streamed", "compact": True},
+    "bounded": {"transfer": "streamed", "compact": True, "bounded": True},
 }
 # the fused reference lines: FP8 (blockwise) on H100 with FP8 transport + combine, BF16 on B200
 FUSED_PRECISION = {"H100": "fp8", "B200": "bf16"}
@@ -76,6 +78,7 @@ PARITY_PAIRS = (
     ("mono_ep_compact+grouped_mm", "torch+grouped_mm"),
     ("mono_ep+sonicmoe", "mono_ep_legacy+sonicmoe"),
     ("mono_ep_compact+sonicmoe", "mono_ep_legacy+sonicmoe"),
+    ("mono_ep_bounded+sonicmoe", "mono_ep_compact+sonicmoe"),
 )
 # DeepEP rows (``--deep-ep``): axolotl's ``_DeepEPBackend`` (normal-mode intranode kernels,
 # K-wide rows, the plugin's buffer sizing and preset configs) around the same local kernels.
@@ -670,6 +673,10 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
     breakdowns = {}
     for routing in ("balanced", "skewed"):
         ids = _routing(routing, rank)
+        # each routing is its own stationary phase: bounded runtimes restart their marks
+        for runtime in runtimes.values():
+            if runtime.bounded:
+                runtime.clear_receive_marks()
         # warm SonicMoE's quack sweeps (serial in-process compile) outside the timed loop
         started = time.perf_counter()
         for _label, backend, local, runtime_name in variants:

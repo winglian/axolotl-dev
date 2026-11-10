@@ -290,3 +290,40 @@ def test_streamed_matches_legacy_two_gpus():
             for variant in (("streamed", False, kind), ("streamed", True, kind)):
                 for a, b in zip(reference, outs[variant], strict=True):
                     assert torch.equal(a, b), (rank, variant)
+
+
+def test_bounded_pull_limits_and_zero_tail():
+    """A compact pull into ``bound`` rows: above the routed count the tail is zeroed on
+    device, below it the rows past the bound are dropped; the kept rows and slots equal the
+    exact compact pull."""
+    _skip_without_cuda()
+    from mono_ep.peer_stream import pull_rows, zero_tail
+
+    world, cap, width = 4, 257, 512
+    generator = torch.Generator(device="cuda").manual_seed(17)
+    sources = [
+        torch.randn(cap, width, generator=generator, device="cuda").bfloat16()
+        for _ in range(world)
+    ]
+    routed = torch.rand(world * cap, generator=generator, device="cuda") < 0.4
+    prefix = torch.cumsum(routed, 0, dtype=torch.int64)
+    count = int(prefix[-1])
+    exact, exact_slots = pull_rows(sources, routed, 1, prefix=prefix, count=count)
+    for bound in (count + 37, count - 29):
+        out = torch.full((bound, width), 7.0, device="cuda").bfloat16()
+        rows, slots = pull_rows(
+            sources,
+            routed,
+            1,
+            out=out,
+            prefix=prefix,
+            count=bound,
+            slots=torch.zeros(bound, dtype=torch.int64, device="cuda"),
+        )
+        zero_tail(rows, prefix)
+        kept = min(bound, count)
+        assert torch.equal(rows[:kept], exact[:kept])
+        assert torch.equal(slots[:kept], exact_slots[:kept])
+        if bound > count:
+            assert torch.equal(rows[count:], torch.zeros_like(rows[count:]))
+            assert torch.equal(slots[count:], torch.zeros_like(slots[count:]))
