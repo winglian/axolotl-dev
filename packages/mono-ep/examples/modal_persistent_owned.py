@@ -22,9 +22,7 @@ if modal.is_local():
         .add_local_file(
             root / "examples/validate_persistent_training.py", "/probe/training.py"
         )
-        .add_local_file(
-            native / "scheduler/mono_ep.cuh", "/probe/native/scheduler.cuh"
-        )
+        .add_local_file(native / "scheduler/mono_ep.cuh", "/probe/native/scheduler.cuh")
         .add_local_file(
             native / "impls/sm100_bf16_mono_ep.cuh", "/probe/native/kernel.cuh"
         )

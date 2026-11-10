@@ -12,8 +12,8 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
-from torch.utils.checkpoint import checkpoint
 from mono_ep import PersistentMoE, fp8, grouped, recompute as recompute_ops
+from torch.utils.checkpoint import checkpoint
 
 
 def relative(actual, expected, tolerance=0.02):

@@ -18,10 +18,14 @@ if modal.is_local():
 
     root = Path(__file__).resolve().parents[1]
     source = Path(os.environ.get("MONO_EP_SOURCE_DIR", root / "src"))
-    image = base_image.run_commands(
-        "apt-get update && apt-get install -y nsight-compute-2026.4.0"
-    ).add_local_dir(source, "/probe/src").add_local_file(
-        root / "examples/probe_hopper_single_rank.py", "/probe/single_rank.py"
+    image = (
+        base_image.run_commands(
+            "apt-get update && apt-get install -y nsight-compute-2026.4.0"
+        )
+        .add_local_dir(source, "/probe/src")
+        .add_local_file(
+            root / "examples/probe_hopper_single_rank.py", "/probe/single_rank.py"
+        )
     )
 
 
@@ -123,12 +127,15 @@ def profiler_capabilities():
             [executable, "--version"], capture_output=True, text=True, check=False
         ).stdout,
         concurrent_options=[
-            line for line in help_text.splitlines()
+            line
+            for line in help_text.splitlines()
             if any(name in line for name in ("communicator", "lockstep", "app-range"))
         ],
         available_packages=subprocess.run(
             ["apt-cache", "search", "^nsight-compute"],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         ).stdout,
     )
 

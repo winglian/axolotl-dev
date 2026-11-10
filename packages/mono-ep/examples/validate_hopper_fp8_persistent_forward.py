@@ -153,8 +153,8 @@ def _run_original_w1_parity(rank):
 def run():
     import deep_gemm
     from deep_gemm.mega import SymmBuffer, _interleave_weights
-    from torch.utils.cpp_extension import load
     from mono_ep.quantization import quantize_fp8
+    from torch.utils.cpp_extension import load
 
     torch.backends.cuda.matmul.allow_tf32 = False
 

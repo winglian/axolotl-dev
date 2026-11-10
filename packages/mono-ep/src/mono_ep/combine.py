@@ -409,9 +409,7 @@ def _check_wait(source, destination, queue):
     _check_queue(queue, source.device)
 
 
-@torch.library.custom_op(
-    "mono_ep::combine_wait_copy", mutates_args=("destination",)
-)
+@torch.library.custom_op("mono_ep::combine_wait_copy", mutates_args=("destination",))
 def combine_wait_copy(
     source: torch.Tensor, destination: torch.Tensor, queue: torch.Tensor
 ) -> None:
@@ -588,9 +586,7 @@ def _check_slot_reduce(source, destination, queue, topk):
     _check_queue(queue, source.device)
 
 
-@torch.library.custom_op(
-    "mono_ep::combine_wait_reduce", mutates_args=("destination",)
-)
+@torch.library.custom_op("mono_ep::combine_wait_reduce", mutates_args=("destination",))
 def combine_wait_reduce(
     source: torch.Tensor, destination: torch.Tensor, queue: torch.Tensor, topk: int
 ) -> None:

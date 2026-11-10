@@ -10,9 +10,10 @@ import os
 
 import torch
 import torch.distributed as dist
+from axolotl.monkeypatch.trainer.trl_offload import patch_trl_offload_dense_layout
+from mono_ep import MonoEP
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import checkpoint
-from mono_ep import MonoEP
 
 from axolotl.core.trainers.mixins.activation_checkpointing import (
     get_lora_act_offloading_ctx_manager,
@@ -26,7 +27,6 @@ from axolotl.monkeypatch.selective_checkpointing_offload import (
     SacOffloadEngine,
     build_sac_offload_context_fn,
 )
-from axolotl.monkeypatch.trainer.trl_offload import patch_trl_offload_dense_layout
 from axolotl.utils.dict import DictDefault
 
 

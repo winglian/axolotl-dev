@@ -240,9 +240,7 @@ def run():
             dict(
                 rank=rank,
                 reference="BF16 per-route contributions independently FP8-quantized before sum; packed x/dy vs own row pools",
-                dispatch_xdy_pack=os.environ.get(
-                    "MONO_EP_SM90_FP8_DISPATCH_XDY_PACK"
-                ),
+                dispatch_xdy_pack=os.environ.get("MONO_EP_SM90_FP8_DISPATCH_XDY_PACK"),
                 relaxed_spins=os.environ.get("MONO_EP_SM90_FP8_RELAXED_SPINS"),
                 return_buffer_bytes_saved=actual_savings,
                 poisoned_unused_return_capacity=True,

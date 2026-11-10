@@ -95,7 +95,9 @@ def main(
     compiled: bool = False,
 ):
     if compiled and (not training or not recompute or profile):
-        raise ValueError("Compiled timing requires recomputing training without profiling")
+        raise ValueError(
+            "Compiled timing requires recomputing training without profiling"
+        )
     if compare_fusion and (not training or profile):
         raise ValueError("Fusion comparison requires training timing without profiling")
     if profile and not training:

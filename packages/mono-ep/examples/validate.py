@@ -884,8 +884,8 @@ def validate_distributed(
 
 
 def validate_changing_routing():
-    from torch._dynamo.utils import counters
     from mono_ep import FP8Experts, pipelined_moe
+    from torch._dynamo.utils import counters
 
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)

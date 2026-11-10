@@ -34,7 +34,9 @@ if modal.is_local():
 
 
 @app.function(image=image, gpu="H100:2", cpu=16, memory=65536, timeout=900)
-def validate(bound=False, cached=False, cache_dz=False, compact=False, trap_timeouts=False):
+def validate(
+    bound=False, cached=False, cache_dz=False, compact=False, trap_timeouts=False
+):
     result = subprocess.run(
         [
             "python",
