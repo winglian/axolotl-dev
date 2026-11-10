@@ -175,6 +175,101 @@ def cudnn(cases: str = ""):
     return _run("benchmark_cudnn_grouped_gemm_b200.py", 1, env, 7000)
 
 
+NCU_METRICS = (
+    "gpu__time_duration.sum",
+    "dram__bytes_read.sum",
+    "dram__bytes_write.sum",
+    "lts__t_bytes.sum",
+    "lts__t_sector_hit_rate.pct",
+    "lts__t_sector_op_read_hit_rate.pct",
+    "lts__throughput.avg.pct_of_peak_sustained_elapsed",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "l1tex__m_xbar2l1tex_read_bytes.sum",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+)
+
+
+@app.function(image=cudnn_image, gpu="B200", cpu=8, memory=131072, timeout=7200)
+def ncu(cases: str = ""):
+    """Nsight Compute memory metrics of the NVFP4 backward kernel and cuDNN's Dh / Dx
+    GEMMs on the same operands (``ncu_nvfp4_backward_b200.py``)."""
+    import csv
+    import glob
+    import io
+    import shutil
+
+    _overlay_headers()
+    found = [
+        p
+        for p in (
+            "/usr/local/cuda/bin/ncu",
+            shutil.which("ncu"),
+            *glob.glob("/opt/nvidia/nsight-compute/*/ncu"),
+        )
+        if p and os.path.exists(p)
+    ]
+    if not found:
+        return dict(returncode=127, result=None, tail="ncu not found")
+    env = {
+        **os.environ,
+        **ENV,
+        "RANK": "0",
+        "LOCAL_RANK": "0",
+        "WORLD_SIZE": "1",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "29593",
+    }
+
+    def parse(text):
+        lines = [line for line in text.splitlines() if line.startswith('"')]
+        if len(lines) < 3:
+            return []
+        rows = list(csv.reader(io.StringIO("\n".join(lines))))
+        header, units = rows[0], rows[1]
+        return [
+            {k: (v, u) for k, u, v in zip(header, units, row, strict=False)}
+            for row in rows[2:]
+        ]
+
+    runs, tails = {}, []
+    for case in (cases or "beam,qwen30b").split(","):
+        for label, regex, skip, count in (
+            ("mono_ep_backward", "sm100_nvfp4_mono_ep_backward", 2, 1),
+            ("cudnn_dh_dx", "cudnn_kernel", 0, 6),
+        ):
+            command = [
+                found[0], "--target-processes", "all", "--replay-mode", "kernel",
+                "--clock-control", "none", "--kernel-name-base", "demangled",
+                "--kernel-name", f"regex:{regex}", "--launch-skip", str(skip),
+                "--launch-count", str(count), "--metrics", ",".join(NCU_METRICS),
+                "--csv", "--page", "raw",
+                "python", "/probe/examples/ncu_nvfp4_backward_b200.py",
+            ]  # fmt: skip
+            proc = subprocess.run(  # nosec B603
+                command,
+                cwd="/probe",
+                env={**env, "NVFP4_CASE": case},
+                capture_output=True,
+                text=True,
+                timeout=3000,
+                check=False,
+            )
+            kernels = parse(proc.stdout)
+            runs[f"{case}/{label}"] = dict(returncode=proc.returncode, kernels=kernels)
+            tails.append(
+                f"== {case}/{label} rc={proc.returncode}\n{proc.stderr[-3000:]}"
+            )
+    version = subprocess.run(  # nosec B603
+        [found[0], "--version"], capture_output=True, text=True, check=False
+    ).stdout
+    ok = all(r["returncode"] == 0 and r["kernels"] for r in runs.values())
+    return dict(
+        returncode=0 if ok else 1,
+        result=dict(ncu=found[0], ncu_version=version, runs=runs),
+        tail="\n".join(tails),
+    )
+
+
 @app.local_entrypoint()
 def main(job: str = "forward", out: str = "", cases: str = "", requant: str = ""):
     if job == "forward":
@@ -189,6 +284,8 @@ def main(job: str = "forward", out: str = "", cases: str = "", requant: str = ""
         result = profile.remote(cases, requant)
     elif job == "timing_cudnn":
         result = timing_cudnn.remote(cases, requant)
+    elif job == "ncu":
+        result = ncu.remote(cases)
     elif job == "cudnn":
         result = cudnn.remote(cases)
     else:
