@@ -393,7 +393,8 @@ struct MonoEPBuffer {
                   const bool& with_sf,
                   const uint32_t& num_shared_experts = 0,
                   const bool& fp8_l1_only = false,
-                  const bool& fp8_combine = false) {
+                  const bool& fp8_combine = false,
+                  const bool& nvfp4 = false) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -403,15 +404,21 @@ struct MonoEPBuffer {
         const auto num_max_shared_sf_tokens = with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
 
         // Layouts
+        // NOTES: NVFP4 keeps BF16 input tokens and quantizes at the destination: packed FP4 ring tokens
+        //        (half a byte per element) with one UE4M3 scale byte per 16 elements
         const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
         const auto input_token_layout = layout::Data(hidden * (fp8_l1_only ? 1 : num_mma_elem_bytes));
         const auto combine_token_layout = layout::Data(hidden * (fp8_combine ? 1 : 2));
         const auto combine_sf_layout = layout::Data(fp8_combine ? hidden / 128 * sizeof(float) : 0, false);
-        const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
+        const auto intermediate_token_layout = layout::Data(nvfp4 ? intermediate_hidden / 2 : intermediate_hidden * num_mma_elem_bytes);
         const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes);
         const auto input_sf_layout = layout::Data(
             with_sf ? hidden / 32 : (fp8_l1_only ? math::align(hidden / 32, 16u) : 0), false);
-        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / 32 : 0, false);
+        const auto l1_token_layout = nvfp4 ? layout::Data(hidden / 2) : input_token_layout;
+        const auto l1_sf_layout = nvfp4 ? layout::Data(hidden / 16, false) : input_sf_layout;
+        const auto intermediate_sf_layout = layout::Data(nvfp4 ? intermediate_hidden / 16 : (with_sf ? intermediate_hidden / 32 : 0), false);
+        const bool l1_sf_present = with_sf or fp8_l1_only or nvfp4;
+        const bool l2_sf_present = with_sf or nvfp4;
         const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / 32 : 0, false);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
@@ -445,17 +452,17 @@ struct MonoEPBuffer {
 
         // Routed expert ring buffers
         l1_token_buffer = Buffer(
-            input_token_layout, 1, num_ring_tokens,
+            l1_token_layout, 1, num_ring_tokens,
             num_shared_experts > 0 ?
                 (with_sf ? shared_l2_sf_buffer.get_end_ptr() : shared_l2_token_buffer.get_end_ptr()) :
                 input_topk_weights_buffer.get_end_ptr()
         );
         l1_sf_buffer = Buffer(
-            input_sf_layout, 1, fp8_l1_only ? num_ring_tokens : num_sf_ring_tokens,
+            l1_sf_layout, 1, fp8_l1_only ? num_ring_tokens : num_sf_ring_tokens,
             l1_token_buffer.get_end_ptr());
         l1_topk_weights_buffer = Buffer(
             l1_topk_weights_layout, 1, num_ring_tokens,
-            (with_sf or fp8_l1_only) ? l1_sf_buffer.get_end_ptr() : l1_token_buffer.get_end_ptr());
+            l1_sf_present ? l1_sf_buffer.get_end_ptr() : l1_token_buffer.get_end_ptr());
 
         l2_token_buffer = Buffer(
             intermediate_token_layout, 1, num_ring_tokens,
@@ -469,7 +476,7 @@ struct MonoEPBuffer {
             fp8_l1_only ? math::align(intermediate_hidden / 32, 16u) : 0, false);
         l2_cached_token_buffer = Buffer(
             cached_l2_token_layout, 1, fp8_l1_only ? num_ring_tokens : 0,
-            with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+            l2_sf_present ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
         l2_cached_sf_buffer = Buffer(
             cached_l2_sf_layout, 1, fp8_l1_only ? num_ring_tokens : 0,
             l2_cached_token_buffer.get_end_ptr());
@@ -477,7 +484,7 @@ struct MonoEPBuffer {
         combine_token_buffer = Buffer(
             combine_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
             fp8_l1_only ? l2_cached_sf_buffer.get_end_ptr() :
-                (with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr()));
+                (l2_sf_present ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr()));
         combine_sf_buffer = Buffer(
             combine_sf_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u),
             fp8_combine ? num_max_tokens_per_rank : 0,

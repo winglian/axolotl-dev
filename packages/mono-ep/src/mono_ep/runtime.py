@@ -55,10 +55,19 @@ class PersistentMoE:
             raise ValueError("the public DeepGEMM fused forward requires SM90+")
         if experts % dist.get_world_size(group) or min(experts, max_tokens, topk) < 1:
             raise ValueError("invalid expert-parallel geometry")
-        if compute_dtype not in ("bf16", "mxfp8", "blockwise"):
-            raise ValueError("fused forward supports bf16, mxfp8 or blockwise")
+        if compute_dtype not in ("bf16", "mxfp8", "blockwise", "nvfp4_lora"):
+            raise ValueError(
+                "fused forward supports bf16, mxfp8, blockwise or nvfp4_lora"
+            )
         if compute_dtype == "mxfp8" and arch != 10:
             raise ValueError("mxfp8 fused forward currently requires SM100")
+        if compute_dtype == "nvfp4_lora":
+            if arch != 10:
+                raise ValueError("nvfp4_lora fused forward requires SM100")
+            if hidden % 256 or intermediate % 256:
+                raise ValueError(
+                    "nvfp4_lora requires hidden and intermediate multiples of 256"
+                )
         if compute_dtype == "blockwise" and arch != 9:
             raise ValueError("blockwise persistent FP8 currently requires SM90")
         physical_sms = torch.cuda.get_device_properties(
@@ -103,6 +112,8 @@ class PersistentMoE:
                 if compute_dtype == "mxfp8"
                 else "fp8xbf16"
                 if compute_dtype == "blockwise"
+                else "nvfp4"
+                if compute_dtype == "nvfp4_lora"
                 else "bf16xbf16"
             ),
         )
@@ -118,6 +129,55 @@ class PersistentMoE:
     def close(self):
         """Release the compiler handle after all graphs using it have finished."""
         _RUNTIMES.pop(self._key, None)
+
+    def forward_nvfp4(
+        self,
+        x,
+        indices,
+        scores,
+        w1_packed,
+        w1_atoms,
+        w2_packed,
+        w2_atoms,
+        expert_scales,
+    ):
+        """Forward on merged NVFP4 experts, no autograd.
+
+        ``w1_packed`` is ``[E_local, 2I, H / 2]`` uint8 with granularity-8
+        interleaved gate/up rows, ``w2_packed`` ``[E_local, H, I / 2]``; the atoms
+        are the requant cache's ``scale_atoms`` (``[E_local, N / 128, K / 64, 512]``
+        uint8); ``expert_scales`` is ``[E_local, 8]`` fp32 (see ``nvfp4_expert_scales``).
+        """
+        import deep_gemm
+
+        if self.compute_dtype != "nvfp4_lora":
+            raise ValueError("forward_nvfp4 requires compute_dtype='nvfp4_lora'")
+        _check_sm_budget(self)
+        buffer = self.buffer
+        tokens = x.shape[0]
+        if x.dtype != torch.bfloat16 or x.shape[1] != self.hidden:
+            raise ValueError("nvfp4_lora forward takes BF16 tokens of width hidden")
+        if tokens > buffer.num_max_tokens_per_rank:
+            raise ValueError("more tokens than the runtime's max_tokens")
+        buffer.x[:tokens].copy_(x)
+        buffer.topk_idx[:tokens].copy_(indices)
+        buffer.topk_weights[:tokens].copy_(scores)
+        y = torch.empty_like(x)
+        deep_gemm.nvfp4_mono_ep(
+            y,
+            (
+                w1_packed.view(torch.int8),
+                w1_atoms.view(torch.int32).view(*w1_atoms.shape[:3], 128),
+            ),
+            (
+                w2_packed.view(torch.int8),
+                w2_atoms.view(torch.int32).view(*w2_atoms.shape[:3], 128),
+            ),
+            expert_scales,
+            buffer,
+            fast_math=False,
+        )
+        return y
 
     def __call__(self, x, indices, scores, w1, w2):
         local_experts = self.experts // dist.get_world_size(self.group)

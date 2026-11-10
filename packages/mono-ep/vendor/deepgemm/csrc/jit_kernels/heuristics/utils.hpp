@@ -14,6 +14,7 @@ static int get_num_element_bits(const MmaKind& mma_kind) {
         case MmaKind::BF16:     return 16;
         case MmaKind::MXFP8FP4: return 8;
         case MmaKind::MXF4:     return 4;
+        case MmaKind::NVFP4:    return 4;
         default: DG_HOST_UNREACHABLE("Unknown MMA kind");
     }
 }

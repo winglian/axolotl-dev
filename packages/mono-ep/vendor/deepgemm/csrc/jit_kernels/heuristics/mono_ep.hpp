@@ -98,16 +98,24 @@ static void check_ring_capacity_for_mono_ep(
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
     if (mma_type_str == "bf16xbf16" or mma_type_str == "fp8xbf16")
         return MmaKind::BF16;
+    if (mma_type_str == "nvfp4")
+        return MmaKind::NVFP4;
     DG_HOST_ASSERT(mma_type_str == "fp8xfp4" or mma_type_str == "fp8xfp8");
     return MmaKind::MXFP8FP4;
 }
 
+// Storage bytes per MMA element for the 8- and 16-bit kinds; NVFP4 packs two elements per byte and is
+// handled explicitly where sizes matter
 static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::BF16 ? 2 : 1;
 }
 
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
-    return mma_kind == MmaKind::MXFP8FP4;
+    return mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4;
+}
+
+static int get_sf_gran_k(const MmaKind& mma_kind) {
+    return mma_kind == MmaKind::NVFP4 ? 16 : 32;
 }
 
 static std::tuple<int, int, int, int, int, int> get_block_config_for_mono_ep(
@@ -139,7 +147,8 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mono_ep(
                                  mma_kind == MmaKind::MXFP8FP4 ? 24 : 40;
     const int store_block_m_l2 = (block_m == 240 and mma_kind == MmaKind::MXFP8FP4) ? 8 : store_block_m_l1;
 
-    const int block_k = 128 / get_num_mma_elem_bytes(mma_kind);
+    // One 128B swizzle atom of K per stage: 64 BF16, 128 FP8 or 256 packed FP4 elements
+    const int block_k = mma_kind == MmaKind::NVFP4 ? 256 : 128 / get_num_mma_elem_bytes(mma_kind);
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
@@ -163,6 +172,7 @@ static std::pair<int, int> get_pipeline_config_for_mono_ep(
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
     const int num_mma_elem_bytes = get_num_mma_elem_bytes(mma_kind);
+    const bool nvfp4 = mma_kind == MmaKind::NVFP4;
 
     // Always multicast on A
     const int load_block_m = block_m / 2;
@@ -177,7 +187,9 @@ static std::pair<int, int> get_pipeline_config_for_mono_ep(
 
     // C/D output region: max of L1 output staging and L2 BF16 staging.
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
-    const int smem_cd_l1 = num_epilogue_warpgroups * store_block_m_l1 * (block_n / 2) * kNumTMAStoreStages * get_num_mma_elem_bytes(mma_kind);
+    // NOTES: the NVFP4 L1 epilogue writes packed FP4 rows straight to global memory, so it stages nothing
+    const int smem_cd_l1 = nvfp4 ? 0 :
+        num_epilogue_warpgroups * store_block_m_l1 * (block_n / 2) * kNumTMAStoreStages * get_num_mma_elem_bytes(mma_kind);
     const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m_l2 * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
@@ -190,7 +202,7 @@ static std::pair<int, int> get_pipeline_config_for_mono_ep(
     const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2) * 8;
 
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
-    const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
+    const int smem_amax_reduction = (is_mma_with_sf(mma_kind) and not nvfp4) ?
         store_block_m_l1 * num_epilogue_warps * static_cast<int>(sizeof(float)) : 0;
 
     // Tensor memory pointer
@@ -201,8 +213,8 @@ static std::pair<int, int> get_pipeline_config_for_mono_ep(
     const int smem_sfb_per_stage = is_mma_with_sf(mma_kind) ? sf_block_n * (block_k / gran_k) : 0;
 
     // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers.
-    const int smem_a_size_per_stage = load_block_m * block_k * num_mma_elem_bytes;
-    const int smem_b_size_per_stage = block_n * block_k * num_mma_elem_bytes;
+    const int smem_a_size_per_stage = nvfp4 ? load_block_m * block_k / 2 : load_block_m * block_k * num_mma_elem_bytes;
+    const int smem_b_size_per_stage = nvfp4 ? block_n * block_k / 2 : block_n * block_k * num_mma_elem_bytes;
     DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
     DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
     const int smem_stage_barriers = 2 * 8;
@@ -239,15 +251,16 @@ static MonoEPConfig get_mono_ep_config(
     // NOTES: FP8 activations, FP8 weights, and FP4 weights unpacked to 8-bit in smem all use 128B swizzle
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
-    const int gran_k = 32;
+    const int gran_k = get_sf_gran_k(mma_kind);
 
     // Thread layout
     const int num_dispatch_threads = 128;
     const int num_non_epilogue_threads = 128;
 
     // Pull: divide token bytes by 2 until <= num_max_pull_bytes
-    const int num_max_pull_bytes = is_mma_with_sf(mma_kind) ? 8192 : 4096;
-    int num_bytes_per_pull = hidden * get_num_mma_elem_bytes(mma_kind);
+    // NOTES: NVFP4 pulls BF16 rows and quantizes them on arrival
+    const int num_max_pull_bytes = mma_kind == MmaKind::MXFP8FP4 ? 8192 : 4096;
+    int num_bytes_per_pull = hidden * (mma_kind == MmaKind::NVFP4 ? 2 : get_num_mma_elem_bytes(mma_kind));
     while (num_bytes_per_pull > num_max_pull_bytes) {
         DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
         num_bytes_per_pull /= 2;

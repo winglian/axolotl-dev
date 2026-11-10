@@ -197,6 +197,37 @@ def fp8_fp4_mono_ep(y: torch.Tensor,
         fast_math, saved_z
     )
 
+def nvfp4_mono_ep(y: torch.Tensor,
+                   l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                   l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                   expert_scales: torch.Tensor,
+                   sym_buffer: SymmBuffer,
+                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                   activation: str = 'swiglu',
+                   activation_clamp: Optional[float] = None,
+                   fast_math: bool = False):
+    """Persistent NVFP4 forward: `(packed_fp4 [E, N, K / 2], sf_atoms int32 [E, N / 128, K / 64, 128])` per layer."""
+    if _C.get_num_sms() != sym_buffer.num_sms:
+        raise RuntimeError('mono-ep SM count changed after symmetric-buffer allocation')
+    assert sym_buffer.mma_type == 'nvfp4', f'Expected an `nvfp4` symmetric buffer, got `{sym_buffer.mma_type}`'
+    l1_q, l1_sf = l1_weights
+    l2_q, l2_sf = l2_weights
+    _C.nvfp4_mono_ep(
+        y,
+        l1_q, l1_sf,
+        l2_q, l2_sf,
+        expert_scales,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts,
+        sym_buffer.num_topk,
+        activation, activation_clamp,
+        fast_math
+    )
+
 def bf16_mono_ep(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,

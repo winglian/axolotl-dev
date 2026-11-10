@@ -15,6 +15,7 @@
 #include "../jit_kernels/impls/sm100_bf16_mono_ep.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mono_ep_backward.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mono_ep.hpp"
+#include "../jit_kernels/impls/sm100_nvfp4_mono_ep.hpp"
 #include "locality_domain.hpp"
 
 namespace deep_gemm::mega {
@@ -99,13 +100,16 @@ get_symm_buffer_size_for_mono_ep(
     // Parse MMA type
     const bool fp8_combine = mma_type == "fp8xbf16_fp8combine";
     const auto mma_kind = parse_mma_kind(fp8_combine ? "fp8xbf16" : mma_type);
-    const auto with_sf = is_mma_with_sf(mma_kind);
+    // NVFP4 keeps BF16 inputs and only the ring buffers carry scales
+    const bool nvfp4 = mma_kind == MmaKind::NVFP4;
+    const auto with_sf = is_mma_with_sf(mma_kind) and not nvfp4;
     const bool fp8_l1_only = mma_type == "fp8xbf16" or fp8_combine;
-    DG_HOST_ASSERT(not fp8_l1_only or num_shared_experts == 0);
+    DG_HOST_ASSERT(not (fp8_l1_only or nvfp4) or num_shared_experts == 0);
+    DG_HOST_ASSERT(not nvfp4 or (hidden % 256 == 0 and intermediate_hidden % 256 == 0));
 
     // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
-    if (with_sf) {
+    if (with_sf or nvfp4) {
         for (auto block_m: layout::kCandidateBlockM) {
             num_sf_ring_tokens = std::max(
                 num_sf_ring_tokens,
@@ -118,7 +122,7 @@ get_symm_buffer_size_for_mono_ep(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens, with_sf,
-        num_shared_experts, fp8_l1_only, fp8_combine
+        num_shared_experts, fp8_l1_only, fp8_combine, nvfp4
     );
 
     // Check SF buffer requirements
@@ -166,6 +170,28 @@ get_symm_buffer_size_for_mono_ep(
             {1, layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank)},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
 
+        if (nvfp4) {
+            // Packed FP4 ring tokens with MN-major 32-bit scale words (four UE4M3 K groups per word)
+            auto l1_acts = torch::from_blob(
+                math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l1_token_buffer.base)),
+                {num_ring_tokens, hidden / 2},
+                torch::TensorOptions().dtype(kPackedFP4).device(buffer.device()));
+            auto l1_acts_sf = torch::from_blob(
+                math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l1_sf_buffer.base)),
+                {num_sf_ring_tokens, hidden / 64}, {1, num_sf_ring_tokens},
+                torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
+            auto l2_acts = torch::from_blob(
+                math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l2_token_buffer.base)),
+                {num_ring_tokens, intermediate_hidden / 2},
+                torch::TensorOptions().dtype(kPackedFP4).device(buffer.device()));
+            auto l2_acts_sf = torch::from_blob(
+                math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l2_sf_buffer.base)),
+                {num_sf_ring_tokens, intermediate_hidden / 64}, {1, num_sf_ring_tokens},
+                torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
+            return std::make_tuple(x, x_sf, topk_idx, topk_weights,
+                                   shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+                                   l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
+        }
         auto l1_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l1_token_buffer.base)),
             {num_ring_tokens, hidden},
@@ -467,6 +493,95 @@ static void bf16_mono_ep(
         sym_buffer.zero_();
 }
 
+// Persistent NVFP4 forward on packed E2M1 experts (SM100 only)
+// `l1_weights`: `[E, 2I, H / 2]` packed FP4 with granularity-8 interleaved gate/up rows, `l2_weights`: `[E, H, I / 2]`
+// `*_weights_sf`: `[E, N / 128, K / 64, 128]` int32 UTCCP atoms of UE4M3 scales
+// `expert_scales`: `[E, 8]` fp32 `{1 / (6 pts_x), 1 / pts_x, gate fold, up fold, 1 / (6 pts_h), 1 / pts_h, L2 fold, 0}`
+static void nvfp4_mono_ep(
+    const torch::Tensor& y,
+    const torch::Tensor& l1_weights, const torch::Tensor& l1_weights_sf,
+    const torch::Tensor& l2_weights, const torch::Tensor& l2_weights_sf,
+    const torch::Tensor& expert_scales,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math
+) {
+    // Config checks
+    const auto num_tokens = static_cast<int>(y.size(0));
+    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16 and y.is_contiguous());
+
+    // Activation checks
+    const auto activation_clamp =
+        activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+    DG_HOST_ASSERT(activation_clamp >= 0);
+
+    // Tensor checks
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT(l1_weights.dim() == 3 and l2_weights.dim() == 3);
+    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = check_weights_layout_3d(l1_weights);
+    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_weights_layout_3d(l2_weights);
+    DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4 and l2_weights.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
+    DG_HOST_ASSERT(hidden == hidden_);
+    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(hidden % 256 == 0 and intermediate_hidden % 256 == 0);
+    DG_HOST_ASSERT(expert_scales.scalar_type() == torch::kFloat and expert_scales.is_contiguous());
+    DG_HOST_ASSERT(expert_scales.dim() == 2 and expert_scales.size(0) == num_experts_per_rank and expert_scales.size(1) == 8);
+
+    // Check stats counter
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
+    }
+
+    // Check buffer bytes
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto num_experts_ = num_experts_per_rank * num_ranks;
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mono_ep(
+        num_ranks, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        "nvfp4", activation, 0
+    );
+    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+    DG_HOST_ASSERT(num_experts == num_experts_);
+
+    // Already registered tensors
+    const auto [x, _x_sf, topk_idx, topk_weights,
+                _shared_l1_acts, _shared_l1_acts_sf, _shared_l2_acts, _shared_l2_acts_sf,
+                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+
+    if (arch_major == 10) {
+        sm100_nvfp4_mono_ep(y,
+                             l1_acts, l1_acts_sf,
+                             l2_acts, l2_acts_sf,
+                             l1_weights, l1_weights_sf,
+                             l2_weights, l2_weights_sf,
+                             expert_scales,
+                             locality_domain::get_balanced_sm_locality_domains(),
+                             cumulative_local_expert_recv_stats,
+                             sym_buffer_ptrs,
+                             rank_idx, num_max_tokens_per_rank,
+                             num_experts_per_rank,
+                             num_tokens, num_topk,
+                             hidden, intermediate_hidden,
+                             activation_clamp, fast_math);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
+        sym_buffer.zero_();
+}
+
 static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mono_ep", &get_token_alignment_for_mono_ep);
     m.def("get_block_m_for_mono_ep", &get_block_m_for_mono_ep);
@@ -474,6 +589,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_mono_ep", &get_symm_buffer_size_for_mono_ep);
     m.def("fp8_fp4_mono_ep", &fp8_fp4_mono_ep);
     m.def("bf16_mono_ep", &bf16_mono_ep);
+    m.def("nvfp4_mono_ep", &nvfp4_mono_ep);
     m.def("bf16_mono_ep_backward", &bf16_mono_ep_backward);
     m.def("bf16_mono_ep_backward_sm90", &bf16_mono_ep_backward_sm90);
     m.def("fp8_mono_ep_backward_sm90", &fp8_mono_ep_backward_sm90,

@@ -98,6 +98,7 @@ from .mega import (
     transform_weights_for_mono_ep,
     fp8_fp4_mono_ep,
     bf16_mono_ep,
+    nvfp4_mono_ep,
 )
 
 # Epilogue classes
