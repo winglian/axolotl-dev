@@ -27,7 +27,9 @@ M-block, runs the SwiGLU derivative and the score-gradient reduction in the epil
 `dh` and the `dz` the weight gradients need, and scatters `dx` back to the owning ranks. `dH`
 stays CTA-local; `h` and `dz` are written to a per-rank workspace once per K-tile, and the
 weight gradients run afterwards as grouped GEMMs on GPU-resident expert offsets, so there is
-no host size sync. The last wave's dX tiles are split across idle CTAs
+no host size sync. Those GEMMs reduce over each expert's pool rows padded to 128, so on SM100
+the last recompute epilogue of an expert zeroes the x/dy tail rows of its last block; stale
+rows from an earlier launch, possibly non-finite, would otherwise reach dW as 0 x NaN. The last wave's dX tiles are split across idle CTAs
 (`MONO_EP_SM90_FP8_TAIL_SCHEDULE`) so the CTA tail is short.
 
 On SM90 FP8 the x/dy transport, the dX combine and the weight-gradient operands are all E4M3
@@ -91,9 +93,58 @@ backward share one build. All cached layouts are bitwise identical to computing 
 call. The FSDP2 validators (`examples/modal_fsdp2_*weight_cache*.py`) exercise the contract
 with optimizer steps on `dp_shard x EP` meshes, including a stale-cache detector.
 
-## Dispatch-only mode
+## Backward ring floor
 
-A composable mode that runs only the dispatch and combine in the persistent kernels and
-leaves the expert GEMMs to the caller (the contract the Axolotl `deep_ep` backend uses) is
-developed on the `features/mono-ep-compose` branch with its own design note and measurements;
-it is not part of this tree.
+The owned backward keeps one pool block live per owning cluster through all of its phases, but
+its ring was sized by the forward's interleaved schedule. Wide-expert shapes (hidden 5120) then had fewer ring blocks than owners
+(30 blocks against 132 CTAs on H100 and 74 pairs on B200) and serialized on ring slots. The
+backward now takes a floor of one wave of owners, `num_sms x 128` tokens on SM90 and
+`num_sms / 2 x 128` on SM100 (`MONO_EP_BACKWARD_RING_WAVES`, `0` restores the forward sizing;
+`MONO_EP_NVFP4_BACKWARD_RING_WAVES` for the NVFP4 path). The floor only raises the ring, so the
+Qwen3-30B-A3B shape keeps its ring and its kernels; at the Beam shape the B200 BF16 backward
+went from 25.5 to 16.2 ms. The ring size is a template parameter, so a changed ring compiles a
+new kernel.
+
+## MXFP8 backward (SM100, opt-in)
+
+`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8` (option bit 2048) runs dh, the z recompute and dx as
+`kind::mxf8f6f4` GEMMs with E4M3 values and UE8M0 scales per 32 K elements, at BLOCK_K 128. The
+sender quantizes x and dy per token, so NVLink carries 4 KB of E4M3 rows plus 128 bytes of
+scales per routed row instead of 8 KB of BF16. The dispatch warps store the E4M3 pools and
+UTCCP-ordered scale pools and write exact BF16 copies for the unchanged BF16 weight-gradient
+GEMMs; dz is quantized in the staged epilogue stores. The scale factors are copied into TMEM
+after the accumulators, as in the MXFP8 forward. The E4M3 weight forms (W1 interleaved, W2^T,
+W1^T) are built in one Inductor graph and cached under the weight-cache epoch contract. It is
+not bitwise (about 6-7% relative error against an FP32 reference, BF16 0.2%; the loss curve
+stayed within a tenth of the seed gap) and saves about 0.4 ms per backward at the
+Qwen3-30B-A3B shape on 8xB200, so it stays opt-in.
+
+## NVFP4 LoRA path and the CUDA requant (SM100)
+
+`precision="nvfp4_lora"` keeps the experts as frozen NVFP4 weights with LoRA adapters. Each
+optimizer step rebuilds merged NVFP4 weights (base plus the scaled LoRA delta, requantized) in a
+requant cache, and the persistent forward and backward run `kind::mxf4nvf4` GEMMs on them; the
+adapter gradients are BF16 grouped GEMMs on the pools. The rebuild is an SM100 CUDA kernel
+(`MONO_EP_NVFP4_REQUANT=cuda`, the default), which writes the same bytes as the Triton reference
+in two paired passes (each weight with its transposed form) and cut the Beam rebuild from 10.2
+to 3.2 ms per layer per step on 8xB200. `cuda_fused` builds the transposed forms from the
+merged tile, which is faster still but changes `w1t` / `w2t` numerics, so it is opt-in.
+`nvfp4-lora-design.md` has the design; the requant source is vendored under
+`src/mono_ep/nvfp4_requant/` until the Axolotl copy and this one are reconciled.
+
+## Dispatch mode and the bounded compact receive
+
+The dispatch mode (`expert_parallel_mono_ep_mode: dispatch`, `MonoEPDispatchRuntime`) runs only
+the peer transfers and leaves the expert GEMMs to the configured local kernel, so it serves the
+same dispatch/combine contract as the Axolotl `deep_ep` and `torch` backends. Dispatch publishes
+each rank's routed rows and pulls them from the peers' symmetric buffers with bandwidth-shaped
+streaming kernels (32 KB tiles, 16-byte vectors, one peer per program); combine pushes the
+partial rows back and reduces them in one fused FP32 pass. The fixed layout hands the local
+kernel `ep_size x tokens_per_rank` rows. The compact receive (`expert_parallel_mono_ep_compact`)
+hands it only the routed rows, which costs one device-to-host count per layer. The bounded
+receive (`expert_parallel_mono_ep_bounded`) removes the stall on that count: it receives into a
+bound from each layer's high-water routed count, filled to SonicMoE's own row bucket, copies the
+exact count to pinned memory behind the dispatch, and reads it only after the local kernel has
+been issued. Outputs are bitwise those of the compact receive; a count above the bound re-pulls
+and re-runs the layer exactly, and the bound is only updated outside the backward so checkpoint
+recomputes see their forward's bound. `compose-design.md` has the design and the measurements.

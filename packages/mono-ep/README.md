@@ -14,7 +14,9 @@ compiles with `fullgraph=True`. The package has no Axolotl, Transformers or TRL 
 - Precisions: SM90 `bf16` and blockwise `fp8` (E4M3 forward and backward); SM100 `bf16` and
   `mxfp8` (forward). `auto` picks `bf16` on SM90 and `mxfp8` on SM100.
 - Interfaces: Axolotl's `expert_parallel_backend: mono_ep`, or `MonoEPRuntime` from any
-  trainer. Full fine-tuning only; adapters and quantized loading fall back.
+  trainer. The fused kernels need plain SwiGLU experts and full fine-tuning; the dispatch mode
+  (`expert_parallel_mono_ep_mode: dispatch`) runs mono-ep's peer transfers around Axolotl's
+  local experts kernel, so adapters and quantized experts work there.
 
 ## Installation
 
@@ -110,6 +112,7 @@ intermediate 768, Qwen3-235B-A22B hidden 4096 / intermediate 1536.
 | DeepEP + SonicMoE (20 SMs, Axolotl default) | | | 21.5 | 22.1 |
 | DeepEP + SonicMoE (SM-tuned: 40 H100 / 64 B200) | | | 17.6 | 12.8 |
 | torch all-to-all + SonicMoE (Axolotl `torch` backend) | | | 20.9 | 14.4 |
+| mono-ep dispatch mode + SonicMoE (bounded compact receive)² | | | 18.7 | 11.9 |
 | torch all-to-all + grouped_mm | | | 129.7 | 89.7 |
 | NCCL all-to-all backward behind the same forward (same-run control) | 46.5 | 107.1 | 49.6 | 24.5 |
 
@@ -128,6 +131,9 @@ the checkpointed step is forward + recomputed forward + backward, four forwards 
 Using the whole time means dispatch, combine, quantization and the backward kernel's
 internal gate/up recompute count against it. Dense peaks: 1,979 TFLOPS FP8 on H100/H200,
 2,250 TFLOPS BF16 on B200.
+
+² mono-ep's dispatch/combine with SonicMoE as the local kernel, BF16 weights, measured in its
+own job with DeepEP and torch rows of its own (DeepEP at 64 SMs: 17.2 / 12.9 ms there).
 
 Forward/backward splits and their TFLOPS, skewed routing, the Modal run behind every number,
 the validators and what these numbers do not measure are in [docs/benchmarks.md](docs/benchmarks.md).

@@ -891,3 +891,23 @@ that does not need every rank at one barrier.
 
 Config: `expert_parallel_mono_ep_bounded: true` next to `expert_parallel_mono_ep_compact: true`
 (dispatch mode).
+
+### 5.6, 5.8, 5.9: measured and not merged (2026-11-10)
+
+Three rounds built on the dispatch mode measured neutral or slower and are not in this tree;
+their write-ups and artifacts are in the untracked development log, and the code is kept on
+archive tags. The overlap round (`archive/features/mono-ep-dispatch-overlap`): in-layer
+overlap in per-source chunks with the transfers on side streams, SM partitioning with green
+contexts, a quack SM budget, per-source ready flags, pull-direction return and an FP8 `x`
+transport; overlap and partitioning were slower, flags and FP8 `x` neutral. Per-source gated
+fixed-layout dispatch and two micro-batches (`archive/features/mono-ep-independent-overlap`):
+gating trails the bounded receive by 2.0 ms (H100) / 0.5 ms (B200), two micro-batches lose.
+Capped transfer grids next to a shared expert (`archive/features/mono-ep-transfer-programs`):
+negative on both GPUs.
+
+One result from 5.8 is positive and is the next step: running a model's shared expert on a
+side stream next to the dispatch. It saves the bounded dispatch mode 0.31 / 0.29 ms (8 x H100,
+balanced / skewed) and 1.08 / 1.34 ms (8 x B200), and DeepEP 1.17 / 1.38 ms and 3.16 / 3.04 ms,
+bitwise against the serial order. The follow-up is a seam hook that lets the expert-parallel
+plugin run a layer's shared expert on a side stream (Qwen2-MoE, DeepSeek and GLM layers have
+one).

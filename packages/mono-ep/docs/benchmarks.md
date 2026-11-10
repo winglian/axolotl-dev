@@ -143,13 +143,74 @@ and combine kernels. An earlier job with full quack sweeps (8xH100 ap-DPDFL3sbYf
 8xB200 ap-R8iuf9H6IVXAWgpMWmfv9P) put the torch all-to-all + SonicMoE control at 22.68 /
 14.01 ms balanced. Mixture of Kittens (MoK) has not been run on this contract.
 
-## Dispatch-only mode and the DeepEP contract
+## Dispatch mode on the same contract
 
-The Axolotl `deep_ep` and `torch` backends use a dispatch/combine contract (the collective
-moves tokens, the local experts kernel runs between the two halves). A composable mono-ep
-mode that serves that contract from the persistent kernels is developed on
-`features/mono-ep-compose`, with its own design note and its measurements against torch
-all-to-all and the fused path; no numbers for it are claimed here.
+The dispatch mode serves the `deep_ep` / `torch` dispatch/combine contract from mono-ep's peer
+transfers, with SonicMoE as the local kernel and BF16 expert weights, on the same layer,
+routing and timing method as the baselines above; every row of a column ran interleaved in
+one allocation. Checkpointed 2F+B, max-rank median ms, balanced / skewed
+(`compose-design.md` 5.7; 8xH100 ap-u57jzYtyxSFbY5pHpZn9xj, 8xB200 ap-O0F3PmsfwBnZTjWsCzB25T):
+
+| Variant | 8xH100 | 8xB200 |
+|---|---|---|
+| mono-ep dispatch, bounded compact receive (`expert_parallel_mono_ep_bounded`) | 18.72 / 21.36 | 11.91 / 12.60 |
+| mono-ep dispatch, compact receive (count stall) | 19.22 / 22.23 | 12.50 / 13.51 |
+| DeepEP + SonicMoE, 40 SMs | 17.57 / 20.40 | 14.89 / 16.86 |
+| DeepEP + SonicMoE, 64 SMs | 17.24 / 20.02 | 12.94 / 14.09 |
+| torch all-to-all + SonicMoE | 20.85 / 23.53 | 14.51 / 15.31 |
+
+On B200 the bounded receive leads DeepEP at its best measured SM count; on H100 DeepEP keeps
+a lead of about 1.4 ms.
+
+## Mixture of Kittens (separate allocation)
+
+cursor/mixture-of-kittens at f3a8bd2432 built for SM100 on the same B200 image (one-line
+`kittens::detail::tcgen05::commit` qualification), best knobs from a sweep, **shared expert
+included in its timing**, in a **separate allocation** from the mono-ep rows (Modal
+ap-tnRPLy5qgP47OeeadOfmRO). Not a same-run A/B. F / B / checkpointed 2F+B ms:
+
+| Shape | MoK BF16 | MoK MXFP8 | mono-ep (this tree) |
+|---|---|---|---|
+| Qwen3-30B-A3B | 2.27 / 3.50 / 7.01 | 2.20 / 2.79 / 6.32 | BF16 2.10 / 4.17 / 7.66 |
+| Qwen3-235B-A22B | 6.34 / 11.06 / 21.22 | 5.46 / 7.90 / 16.63 | |
+| Beam (256 experts) | 11.77 / 21.73 / 40.78 | 9.19 / 15.31 / 30.41 | |
+
+On one B200 at the 30B shape (BF16, F / B) MoK takes 2.80 / 5.06 ms against mono-ep's 1.27 /
+3.26. At EP8 mono-ep's forward is faster and MoK's backward is about 0.5 ms faster, which
+matches mono-ep's serial weight-gradient phase (0.93 ms).
+
+## SM100 MXFP8 backward on 8xB200
+
+MXFP8 backward (`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`), BF16 and MXFP8 interleaved per
+iteration in one allocation (ap-vNYQUgp8WL4TzRvFuKprVS), weights bumped every step, ms:
+
+| Qwen3-30B-A3B | BF16 | MXFP8 |
+|---|---|---|
+| backward, balanced | 4.164 | 3.794 (-8.9%) |
+| checkpointed 2F+B, balanced | 7.714 | 7.236 (-6.2%) |
+| checkpointed 2F+B, skewed | 9.334 | 8.760 (-6.1%) |
+
+## NVFP4 LoRA (SM100)
+
+`precision="nvfp4_lora"` (frozen NVFP4 experts with LoRA), 8xB200, F / B / checkpointed 2F+B
+ms with the ring floor and the CUDA requant (ap-dJj9XYEA3BDSZ7TDQv3bzS), and the per-step
+merged-weight rebuild per layer:
+
+| Case | nvfp4_lora | rebuild, Triton / `cuda` / `cuda_fused` |
+|---|---|---|
+| Qwen3-30B-A3B, balanced | 2.11 / 4.03 / 7.98 | 0.87 / 0.35 / 0.31 |
+| Qwen3-30B-A3B, skewed | 2.74 / 6.31 / 11.53 | |
+| Beam, balanced | 2.98 / 8.11 / 13.68 | 10.24 / 3.24 / 2.50 |
+| Beam, skewed | 3.64 / 10.35 / 17.44 | |
+
+The ring floor took the Beam backward from 11.35 to about 8 ms; with the `cuda` rebuild a Beam
+optimizer step without gradient accumulation goes from 23.9 to 16.9 ms per layer.
+
+GEMM floor: the cuDNN frontend grouped NVFP4 GEMM on one B200 runs the backward's GEMMs in
+0.568 ms (30B) and 1.551 ms (Beam) against 2.11 and 4.44 ms for the whole persistent backward
+kernel, and its k-loops are 2.2-2.4x faster than the persistent kernel's. As an EP8 layer with an
+all-to-all around it (`cudnn_grouped_a2a`, ap-zZAErn1BHT6XxTyVS0PVIs) it takes 27.82 ms (30B)
+and 36.35 ms (Beam) checkpointed 2F+B against nvfp4_lora's 7.93 and 13.08 in the same run.
 
 ## What these do not measure
 

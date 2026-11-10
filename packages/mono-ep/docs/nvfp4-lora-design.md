@@ -305,7 +305,7 @@ with hardware E2M1 / E4M3 conversions, each weight and its transposed base in
 one paired pass. `MONO_EP_NVFP4_REQUANT=triton` keeps the vendored Triton
 kernel; `cuda_fused` builds w1t / w2t from the merged tile instead of from
 transposed bases (more accurate backward, different bytes, no transposed base
-in memory). See the experiment log, "CUDA NVFP4 requant".
+in memory). `benchmarks.md` has the rebuild timings and the EP8 rows.
 
 - `nvfp4_lora` bypasses `weight_layouts` (the requant output already is the
   kernel layout). One `LayerRequant` per MoE layer builds `{w1, w2, w1t, w2t}`

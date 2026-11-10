@@ -8,7 +8,10 @@ need; the environment variables exist for experiments and for restoring a previo
 | Key | Values | Meaning |
 |---|---|---|
 | `expert_parallel_size` | `1` (off) or a divisor of the world size | Number of EP ranks; experts are split evenly across them. |
-| `expert_parallel_backend` | `auto`, `deep_ep`, `torch`, `mono_ep` | Token dispatch backend. `auto` never picks `mono_ep`; set it explicitly. With `mono_ep` the local experts kernel (`use_sonicmoe`, `use_scattermoe`, `experts_implementation`) is not used. |
+| `expert_parallel_backend` | `auto`, `deep_ep`, `torch`, `mono_ep` | Token dispatch backend. `auto` never picks `mono_ep`; set it explicitly. In the fused mode the local experts kernel (`use_sonicmoe`, `use_scattermoe`, `experts_implementation`) is not used; in the dispatch mode it is. |
+| `expert_parallel_mono_ep_mode` | `auto` (default), `fused`, `dispatch` | `fused`: one persistent kernel per direction (plain SwiGLU experts, full fine-tuning). `dispatch`: mono-ep's peer dispatch and combine around the configured local experts kernel, so LoRA, quantized experts, biases, other activations and clamped SwiGLU work. `auto`: `fused` when the config and model allow it, else `dispatch`. |
+| `expert_parallel_mono_ep_compact` | `false` (default), `true` | Dispatch mode: hand the local kernel only the routed receive rows instead of the fixed `ep_size x tokens_per_rank` layout, at the cost of one device-to-host count per layer (saved under activation checkpointing). |
+| `expert_parallel_mono_ep_bounded` | `false` (default), `true` | With `compact`: receive into a bound from each layer's high-water routed count (filled to SonicMoE's row bucket) and read the count only after the local kernel is issued, so dispatch never stalls on the host. Bitwise equal to `compact`; a count above the bound re-runs that layer exactly. Restore: `false`. |
 | `expert_parallel_mono_ep_precision` | `auto`, `bf16`, `mxfp8`, `fp8`, `fp8_bwd` | Compute precision of the fused kernels (table below). Master weights keep their dtype and weight gradients come back in it. |
 | `expert_parallel_fallback_on_unsupported` | `true` (default), `false` | When `mono_ep` cannot run (table below), fall back to `expert_parallel_backend: torch` with a warning, or raise. |
 | `dp_shard_size` | | FSDP shard axis next to EP; `expert_parallel_size x dp_shard_size` must equal the world size. The EP group must stay inside one NVLink node. |
@@ -83,7 +86,7 @@ before it was made the default; setting that value restores the previous behavio
 | `MONO_EP_SM90_FP8_FORWARD_STAGES` | `5` | `2`..`4` | SM90 FP8 forward TMA pipeline stages. |
 | `MONO_EP_SM90_FP8_BACKWARD_STAGES` | `3` | `0`..`8` | SM90 FP8 backward stages with the cached-dZ layout. |
 | `MONO_EP_SM90_FP8_FORWARD_MAINLOOP` | `1` | `0` | Forward mainloop variant (register allocation and accumulator handling). |
-| `MONO_EP_SM90_FP8_BACKWARD_MAINLOOP` | `0` | `2` (weight-scale prefetch, slower on top of the dispatch-warp pack) | Backward mainloop variant. |
+| `MONO_EP_SM90_FP8_BACKWARD_MAINLOOP` | `0` | `2` (weight-scale prefetch) | Backward mainloop variant. Mode 2 was slower on top of the dispatch-warp pack in round 2b; it excludes the epilogue overlap, and it has not been re-measured since round 4 turned both of those off (one later A/B saw -0.05 ms, within noise). |
 | `MONO_EP_SM90_FP8_FORWARD_ROLE_REGISTERS`, `MONO_EP_SM90_FP8_ROLE_REGISTERS` | `2`, `2` | `0` | `setmaxnreg` placement per warpgroup role. |
 | `MONO_EP_SM90_FP8_TAIL_SCHEDULE` | `1` | `0` | Backward: idle CTAs take the last wave's dX tiles, partial blocks last; mode 1 allows more than 32 local experts. |
 | `MONO_EP_SM90_FP8_OVERLAP_EPILOGUE` | `0` | `1` | Backward epilogue/mainloop overlap sites (measured slower at EP8 with the current defaults). |
@@ -94,14 +97,24 @@ before it was made the default; setting that value restores the previous behavio
 | `MONO_EP_SM90_FP8_ACTIVATION_LOOP` | `2` with `swiglu_fast`, `1` otherwise | `0` | Columns per lane in the SwiGLU epilogue loop. |
 | `MONO_EP_SM90_FP8_COMPACT_FORWARD`, `MONO_EP_SM90_FP8_COMPACT_BACKWARD` | unset | | 384-thread layouts kept for experiments; the 512-thread layouts are the defaults. |
 | `MONO_EP_SM100_BACKWARD_STAGES` | `6` | | SM100 backward pipeline stages. |
-| `MONO_EP_SM100_BACKWARD_PRECISION` | `bf16` | | `mxfp8`: SM100 backward GEMMs (dh, z recompute, dx) as MXFP8 (E4M3, UE8M0 per 32 along K) with E4M3 x/dy over NVLink and dz quantized in the epilogue; the weight gradients stay BF16 GEMMs on exact BF16 copies of the E4M3 x/dy. Not bitwise: about 6-7% relative error against an FP32 reference (BF16: 0.2%), see the experiment log. Needs `hidden % 512 == 0`, `hidden <= 2048`. |
+| `MONO_EP_SM100_BACKWARD_PRECISION` | `bf16` | | `mxfp8`: SM100 backward GEMMs (dh, z recompute, dx) as MXFP8 (E4M3, UE8M0 per 32 along K) with E4M3 x/dy over NVLink and dz quantized in the epilogue; the weight gradients stay BF16 GEMMs on exact BF16 copies of the E4M3 x/dy. Not bitwise: about 6-7% relative error against an FP32 reference (BF16: 0.2%); the loss curve stayed within a tenth of the seed gap. Needs `hidden % 512 == 0`, `hidden <= 2048`. |
 | `MONO_EP_SM100_MXFP8_COMPILED_QUANT` | `1` | `0` (Triton builders) | Build the MXFP8 backward weight forms (W1, W2ᵀ, W1ᵀ) in one Inductor graph; bitwise equal to the Triton path. |
 | `MONO_EP_SM100_BACKWARD_OPTIONS` | `11` | `0` | SM100 backward epilogue option bits (staged pool stores, two-row pulls); bit 2048 is set by `MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`, which requires bit 1 and excludes 4, 16 and 64. |
 | `MONO_EP_SM100_BACKWARD_PULL_BYTES` | two rows (8 KB) when whole rows fit, else `4096` | `4096` | SM100 backward NVLink pull size. |
 | `MONO_EP_SM100_FORWARD_OPTIONS` | lookahead pull when the pull buffer is one row | `0` | SM100 forward option bits. |
 | `MONO_EP_SM100_FORWARD_PULL_BYTES` | per shape | | SM100 forward pull size. |
 | `MONO_EP_SM100_DW_DIRECT` | `0` | | SM100: direct weight-gradient operands (experiment). |
+| `MONO_EP_BACKWARD_RING_WAVES` | `1` | `0` (the forward's interleaved-schedule ring sizing) | Owned-backward ring floor for the BF16 (SM90, SM100) and blockwise-FP8 (SM90) backwards, in waves of owning clusters: one wave is `num_sms x 128` tokens on SM90 and `num_sms / 2 x 128` on SM100. It only raises the ring, so the Qwen3-30B-A3B shape is unchanged; wide-expert shapes (hidden 5120) gain most. The ring size is a kernel template parameter. |
+| `MONO_EP_NVFP4_BACKWARD_RING_WAVES` | `1` | `0` | The same floor for the SM100 NVFP4 LoRA backward. |
+| `MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS` | `3` | `0` | NVFP4 LoRA backward bits: 1 staged h/dz pool stores, 2 TMEM release before the recompute/dH math. |
+| `MONO_EP_SM100_NVFP4_BACKWARD_PULL_BYTES` | whole x and dy rows with lookahead | | Chunked dispatch pull for the NVFP4 backward: four chunks, each a multiple of 128 bytes, at most 4096 and smaller than an x+dy row. |
+| `MONO_EP_SM100_NVFP4_BACKWARD_STAGES` | the most that fit shared memory | | NVFP4 backward TMA/UMMA stages. |
+| `MONO_EP_SM100_NVFP4_OPTIONS` | `1` when the pull buffer holds one row, else `0` | `0` | NVFP4 LoRA forward bits: 1 lookahead dispatch pull. |
+| `MONO_EP_NVFP4_REQUANT` | `cuda` | `triton` | Backend of the per-step NVFP4 merged-weight rebuild (requant cache): `cuda` is the SM100 kernel and writes the Triton kernel's bytes; `cuda_fused` (opt-in) quantizes the transposed forms from the merged tile, which is a numerics change for `w1t` / `w2t`. Python-side, not a JIT key. |
+| `MONO_EP_NVFP4_REQUANT_FFMA2` | `1` | `0` | Paired FP32 FMA (FFMA2) in the CUDA requant's delta math; `0` builds the scalar variant, 2-6% slower. |
+| `MONO_EP_NVFP4_LORA_WGRAD` | unset (grouped GEMMs) | `loop` (per-expert reference loop) | LoRA adapter weight gradients of the NVFP4 path. Python-side. |
+| `MONO_EP_NVFP4_REQUANT_VERBOSE`, `MONO_EP_SM100_NVFP4_PHASE_TRACE` | unset | | Diagnostics: CUDA requant build log, NVFP4 forward phase trace. |
 | `MONO_EP_SM90_FP8_TRAP_TIMEOUTS`, `*_PHASE_TRACE`, `*_DIST_TRACE`, `*_DIAG_ABLATE` | unset | | Diagnostics: trap-only timeouts for compiler experiments, per-phase and per-rank traces, epilogue ablations. Not for training. |
 
-Every selector is part of the JIT key, so changing one compiles a new kernel variant under
-`DG_JIT_CACHE_DIR`.
+Every kernel selector is part of the JIT key, so changing one compiles a new kernel variant under
+`DG_JIT_CACHE_DIR`; the selectors marked Python-side change only host code.
