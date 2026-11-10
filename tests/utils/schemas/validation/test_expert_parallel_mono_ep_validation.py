@@ -48,7 +48,9 @@ class TestMonoEPValidation:
     )
     def test_warns_local_kernel_ignored(self, min_base_cfg, warnings, extra, ignored):
         plugins = [EP_PLUGIN, KERNELS_PLUGIN] if "use_" in ignored else [EP_PLUGIN]
-        _validate(min_base_cfg, plugins=plugins, **extra)
+        _validate(
+            min_base_cfg, plugins=plugins, expert_parallel_mono_ep_mode="fused", **extra
+        )
         assert "local experts kernel" in warnings() and ignored in warnings()
 
     def test_bounded_needs_compact(self, min_base_cfg):
