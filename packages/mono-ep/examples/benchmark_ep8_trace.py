@@ -65,6 +65,13 @@ def _routing(kind, tokens, experts, topk, rank):
     return (logits + gumbel).topk(topk, dim=-1).indices.contiguous()
 
 
+def _cache_stats():
+    import sys
+
+    module = sys.modules.get("mono_ep.weight_cache")
+    return None if module is None else module.cache_stats()
+
+
 def analyze_rank(trace, world, sms):
     """Per-rank summary of one iteration's raw trace (int64 [sms*TRACE_STRIDE + sms*64]).
 
@@ -238,7 +245,18 @@ def run(args):
                 os.environ[ptr_env] = str(trace_buffers[direction].data_ptr())
                 os.environ[dist_env] = "1"
 
-    state = dict(events=[], traces=[])
+    state = dict(events=[], traces=[], host=[])
+    import mono_ep.runtime as runtime_module
+
+    def stamp_entry(function):
+        def stamped(*a, **k):
+            state["host"].append(("entry", time.perf_counter(), None))
+            return function(*a, **k)
+
+        return stamped
+
+    runtime_module._forward_impl = stamp_entry(runtime_module._forward_impl)
+    backend.backward = stamp_entry(backend.backward)
     originals = {d: getattr(deep_gemm._C, e[2]) for d, e in ENVS.items()}
 
     def wrap(direction):
@@ -251,7 +269,9 @@ def run(args):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
+            host_start = time.perf_counter()
             result = original(*call_args, **call_kwargs)
+            state["host"].append(("native", host_start, time.perf_counter()))
             end.record()
             state["events"].append((direction, start, end))
             if tracing:
@@ -268,6 +288,9 @@ def run(args):
         name: {
             scope: dict(
                 host_ms=[],
+                host_to_first_op_ms=[],
+                host_op_prep_ms=[],
+                host_native_call_ms=[],
                 gpu_span_ms=[],
                 native_ms=[],
                 native_offset_ms=[],
@@ -286,14 +309,22 @@ def run(args):
         )
         return gathered.tolist()
 
+    def bump_versions():
+        # Stands in for the optimizer step: new weight versions, values unchanged.
+        if args.bump_versions:
+            for tensor in (w1, w2):
+                torch.autograd.graph.increment_version(tensor)
+
     def step(scope, tracing):
         for tensor in (x, scores, w1, w2):
             tensor.grad = None
+        bump_versions()
         y = operation(x, ids, scores, w1, w2) if scope == "backward" else None
         dist.barrier()
         torch.cuda.synchronize()
         state["events"].clear()
         state["traces"].clear()
+        state["host"].clear()
         span0, span1 = (
             torch.cuda.Event(enable_timing=True),
             torch.cuda.Event(enable_timing=True),
@@ -328,8 +359,14 @@ def run(args):
             scope,
             len(native),
         )
+        entries = [t for kind, t, _ in state["host"] if kind == "entry"]
+        calls = [(t0, t1) for kind, t0, t1 in state["host"] if kind == "native"]
         record = dict(
             host_ms=host,
+            host_to_first_op_ms=(entries[0] - start) * 1000,
+            host_op_prep_ms=sum(c[0] - e for e, c in zip(entries, calls, strict=True))
+            * 1000,
+            host_native_call_ms=sum(t1 - t0 for t0, t1 in calls) * 1000,
             gpu_span_ms=span0.elapsed_time(span1),
             native_ms=sum(s.elapsed_time(e) for s, e in native),
             native_offset_ms=span0.elapsed_time(native[0][0]),
@@ -366,6 +403,50 @@ def run(args):
                 rel_norm=gather(float(diff.norm() / b.float().norm().clamp_min(1e-12))),
             )
         parity[f"{name}_vs_{ref_name}/{scope}"] = entry
+
+    forms_check = None
+    if args.check_weight_forms:
+        from mono_ep.sm90_weight_forms import (
+            cached_forms,
+            quantize_all_forms,
+            quantize_form,
+        )
+
+        fused = quantize_all_forms(w1.detach(), w2.detach())
+        bump_versions()
+        cached = dict(
+            zip(
+                fused,
+                cached_forms(w1.detach(), w2.detach(), list(fused), "1"),
+                strict=True,
+            )
+        )
+        forms_check = {}
+        for label, (values, scales) in fused.items():
+            reference = quantize_form(w1.detach(), w2.detach(), label)
+            forms_check[label] = dict(
+                fused_values_bitwise=gather(
+                    float(
+                        torch.equal(
+                            values.view(torch.uint8), reference[0].view(torch.uint8)
+                        )
+                    )
+                ),
+                fused_scales_bitwise=gather(float(torch.equal(scales, reference[1]))),
+                cached_values_bitwise=gather(
+                    float(
+                        torch.equal(
+                            cached[label][0].view(torch.uint8),
+                            reference[0].view(torch.uint8),
+                        )
+                    )
+                ),
+                cached_scales_bitwise=gather(
+                    float(torch.equal(cached[label][1], reference[1]))
+                ),
+                shapes=[list(values.shape), list(reference[0].shape)],
+            )
+        del fused, cached
 
     quant_check = None
     if args.check_fused_weight_quant:
@@ -429,7 +510,7 @@ def run(args):
         if args.trace_variants == "first"
         else args.trace_variants.split(",")
     )
-    for name in traced:
+    for name in [] if args.skip_phase_trace else traced:
         set_env(variants[name], True)
         for scope in ("forward", "backward"):
             per_iter = []
@@ -454,21 +535,26 @@ def run(args):
     # Profiler breakdown of one step per scope for each traced variant (key 'variant/scope')
     profile = {}
     if args.profile:
+        activities = [torch.profiler.ProfilerActivity.CUDA]
+        if args.profile_cpu:
+            activities.append(torch.profiler.ProfilerActivity.CPU)
+        profile_scopes = ("forward", "forward_again", "backward")
         for profile_name in traced:
             set_env(variants[profile_name], False)
-            for scope in ("forward", "backward"):
+            for scope in profile_scopes:
                 for tensor in (x, scores, w1, w2):
                     tensor.grad = None
-                y = operation(x, ids, scores, w1, w2) if scope == "backward" else None
+                if scope != "forward_again":
+                    bump_versions()
+                y = operation(x, ids, scores, w1, w2) if scope != "forward" else None
                 dist.barrier()
                 torch.cuda.synchronize()
-                with torch.profiler.profile(
-                    activities=[torch.profiler.ProfilerActivity.CUDA]
-                ) as prof:
-                    if scope == "forward":
-                        y = operation(x, ids, scores, w1, w2)
-                    else:
-                        y.backward(dy)
+                with torch.profiler.profile(activities=activities) as prof:
+                    with torch.profiler.record_function("mono_ep_scope"):
+                        if scope.startswith("forward"):
+                            y = operation(x, ids, scores, w1, w2)
+                        else:
+                            y.backward(dy)
                     torch.cuda.synchronize()
                 path = f"/tmp/ep-trace-{profile_name}-{scope}-rank-{rank}.json"  # nosec B108
                 prof.export_chrome_trace(path)
@@ -481,6 +567,23 @@ def run(args):
                     and "dur" in e
                 ]
                 kernels.sort(key=lambda k: k["start_us"])
+                if args.profile_cpu:
+                    host = [
+                        dict(
+                            name=e["name"][:120],
+                            cat=e.get("cat"),
+                            start_us=e["ts"],
+                            duration_us=e["dur"],
+                        )
+                        for e in events
+                        if e.get("cat") in ("cuda_runtime", "cuda_driver")
+                        or (
+                            e.get("cat") == "user_annotation"
+                            and e.get("name") == "mono_ep_scope"
+                        )
+                    ]
+                    host.sort(key=lambda k: k["start_us"])
+                    kernels = dict(kernels=kernels, host=host)
                 objs = [None] * world
                 dist.all_gather_object(objs, kernels)
                 profile[f"{profile_name}/{scope}"] = objs
@@ -512,6 +615,9 @@ def run(args):
             variants=variants,
             parity_first_measured_iteration=parity,
             fused_weight_quant_check=quant_check,
+            weight_forms_check=forms_check,
+            bump_versions=args.bump_versions,
+            weight_cache_stats=_cache_stats(),
             timing={},
         )
         for name in names:
@@ -611,6 +717,9 @@ def run(args):
                 "row_imbalance_max_over_mean",
                 "parity_first_measured_iteration",
                 "fused_weight_quant_check",
+                "weight_forms_check",
+                "bump_versions",
+                "weight_cache_stats",
             )
         }
         brief["timing"] = {
@@ -637,6 +746,14 @@ if __name__ == "__main__":
     parser.add_argument("--trace-warmup", type=int, default=2)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--check-fused-weight-quant", action="store_true")
+    parser.add_argument("--check-weight-forms", action="store_true")
+    parser.add_argument(
+        "--bump-versions",
+        action="store_true",
+        help="increment the weight version counters before every step (optimizer stand-in)",
+    )
+    parser.add_argument("--profile-cpu", action="store_true")
+    parser.add_argument("--skip-phase-trace", action="store_true")
     parser.add_argument("--expect-gpu", default="H100")
     parser.add_argument("--out", default="")
     run(parser.parse_args())

@@ -187,7 +187,25 @@ class NativePersistentBackward:
         if self.finished is not None:
             stream.wait_event(self.finished)
         tokens = x.shape[0]
-        if self.fp8_transport:
+        from .sm90_prep import enabled as fused_prep
+
+        fused = self.fp8_transport and fused_prep()
+        if fused:
+            from .sm90_prep import prepare_tokens
+
+            prepare_tokens(
+                x.contiguous(),
+                self.buffer.x[:tokens],
+                self.buffer.x_sf[:tokens],
+                indices,
+                self.buffer.topk_idx[:tokens],
+                scores,
+                self.buffer.topk_weights[:tokens],
+                dy.contiguous(),
+                self.dy[:tokens],
+                self.dy_sf[:tokens],
+            )
+        elif self.fp8_transport:
             from .token_quantization import quantize_tokens_into
 
             quantize_tokens_into(
@@ -205,10 +223,22 @@ class NativePersistentBackward:
         else:
             self.buffer.x[:tokens].copy_(x)
             self.dy[:tokens].copy_(dy)
-        self.buffer.topk_idx[:tokens].copy_(indices)
-        self.buffer.topk_weights[:tokens].copy_(scores)
+        if not fused:
+            self.buffer.topk_idx[:tokens].copy_(indices)
+            self.buffer.topk_weights[:tokens].copy_(scores)
         scale_args = ()
+        cache = "0"
         if self.blockwise:
+            from .sm90_weight_forms import cache_mode
+
+            cache = cache_mode()
+        if cache != "0":
+            from .sm90_weight_forms import BACKWARD_FORMS, cached_forms
+
+            prepared = cached_forms(w1, w2, BACKWARD_FORMS, cache)
+            interleaved, w2t, w1t = [p[0] for p in prepared]
+            scale_args = ([p[1] for p in prepared],)
+        elif self.blockwise:
             from .quantization import quantize_fp8
             from .weight_quantization import quantize_transposed_weights_128x128
 
@@ -268,7 +298,8 @@ class NativePersistentBackward:
             ),
         )
         x_pool, dy_pool, h_pool, dz_pool = self.pools[:4]
-        ends = self.starts + self.counts
+        if not (fused and self.blockwise):
+            ends = self.starts + self.counts
         if self.blockwise:
             from .hopper_wgrad import weight_grad_fp8_hopper_packed
 

@@ -5,6 +5,7 @@
 
 gpus=8: EP8 balanced and skewed runs plus a same-allocation world-1 run of the same script (GPU 0).
 gpus=2: short functional check of the trace on two ranks.
+gpus=1: world-1 runs (balanced and skewed) on one strict H100, for host-side A/Bs.
 Each run writes a gzip JSON (benchmark_ep8_trace.py --out) that is returned and saved locally.
 """
 
@@ -22,8 +23,12 @@ if modal.is_local():
     from modal_validate import base_image
 
     root = Path(__file__).resolve().parents[1]
-    image = base_image.add_local_dir(root / "src", "/probe/src").add_local_file(
-        root / "examples/benchmark_ep8_trace.py", "/probe/ep_trace.py"
+    image = (
+        base_image.add_local_dir(root / "src", "/probe/src")
+        .add_local_file(root / "examples/benchmark_ep8_trace.py", "/probe/ep_trace.py")
+        .add_local_file(
+            root / "examples/benchmark_persistent_training.py", "/probe/paired.py"
+        )
     )
 
 
@@ -36,16 +41,18 @@ def _run(runs, env):
     out = []
     for run in runs:
         path = f"/tmp/{run['name']}.json.gz"  # nosec B108
+        paired = run.get("script") == "paired"
         command = [
             "python",
             "-m",
             "torch.distributed.run",
             "--standalone",
             f"--nproc-per-node={run['nproc']}",
-            "/probe/ep_trace.py",
-            "--out",
-            path,
-            *run["args"],
+            *(
+                ["/probe/paired.py", *run["args"]]
+                if paired
+                else ["/probe/ep_trace.py", "--out", path, *run["args"]]
+            ),
         ]
         result = subprocess.run(  # nosec B603
             command,
@@ -72,6 +79,8 @@ def _run(runs, env):
         for line in result.stdout.splitlines():
             if line.startswith("EP_TRACE_JSON "):
                 brief = json.loads(line[len("EP_TRACE_JSON ") :])
+            elif paired and line.startswith('{"benchmark"'):
+                brief = json.loads(line)
         out.append(
             dict(
                 name=run["name"],
@@ -102,6 +111,11 @@ def trace2(runs, env):
     return _run(runs, env)
 
 
+@app.function(image=image, gpu="H100!", cpu=8, memory=65536, timeout=3600)
+def trace1(runs, env):
+    return _run(runs, env)
+
+
 @app.local_entrypoint()
 def main(
     out_dir: str,
@@ -110,6 +124,7 @@ def main(
     env: str = "",
     extra_args: str = "",
     runs: str = "ep8_balanced,ep8_skewed,ep1_balanced",
+    paired_control: bool = False,
 ):
     """variants: benchmark_ep8_trace.py --variants (same env applied on every rank)."""
     extra = dict(item.split("=", 1) for item in env.split("+") if item)
@@ -154,7 +169,37 @@ def main(
             ),
         ]
         selected = runs.split(",")
-        result = trace8.remote([r for r in plan if r["name"] in selected], extra)
+        plan = [r for r in plan if r["name"] in selected]
+        if paired_control:
+            # Same allocation: the standard paired native/NCCL timing at the default config.
+            plan.append(
+                dict(
+                    name="paired_native_nccl",
+                    nproc=8,
+                    script="paired",
+                    args=[
+                        "--compute-dtype",
+                        "blockwise",
+                        "--recompute",
+                        "--compare-native",
+                        "--compiled",
+                    ],
+                )
+            )
+        result = trace8.remote(plan, extra)
+    elif gpus == 1:
+        plan = [
+            dict(
+                name=f"ep1_{routing}",
+                nproc=1,
+                args=["--routing", routing, "--variants", variants, *more],
+            )
+            for routing in ("balanced", "skewed")
+        ]
+        selected = runs.split(",")
+        if not any(r["name"] in selected for r in plan):
+            selected = [f"ep1_{routing}" for routing in ("balanced", "skewed")]
+        result = trace1.remote([r for r in plan if r["name"] in selected], extra)
     elif gpus == 2:
         plan = [
             dict(
@@ -178,7 +223,7 @@ def main(
         ]
         result = trace2.remote(plan, extra)
     else:
-        raise ValueError("gpus must be 8 or 2")
+        raise ValueError("gpus must be 8, 2 or 1")
     target = Path(out_dir)
     target.mkdir(parents=True, exist_ok=True)
     app_id = os.environ.get("MODAL_APP_ID") or app.app_id

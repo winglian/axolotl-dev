@@ -175,18 +175,37 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
     if runtime.compute_dtype == "blockwise":
         from .paired_weight_quantization import quantize_paired_gate_up_weights
         from .quantization import quantize_fp8
+        from .sm90_prep import enabled as fused_prep, prepare_tokens
+        from .sm90_weight_forms import FORWARD_FORMS, cache_mode, cached_forms
         from .token_quantization import quantize_tokens_into
 
-        quantize_tokens_into(x, buffer.x[:tokens], buffer.x_sf[:tokens], block_cols=128)
-        buffer.topk_idx[:tokens].copy_(indices)
-        buffer.topk_weights[:tokens].copy_(scores)
-        if os.getenv("MONO_EP_SM90_FP8_FUSED_WEIGHT_QUANT", "1") != "0":
-            from .block_weight_quantization import quantize_weights_128x128
-
-            down = quantize_weights_128x128(w2)
+        if fused_prep():
+            prepare_tokens(
+                x,
+                buffer.x[:tokens],
+                buffer.x_sf[:tokens],
+                indices,
+                buffer.topk_idx[:tokens],
+                scores,
+                buffer.topk_weights[:tokens],
+            )
         else:
-            down = quantize_fp8(w2, block_rows=128, block_cols=128)
-        prepared = [quantize_paired_gate_up_weights(w1), down]
+            quantize_tokens_into(
+                x, buffer.x[:tokens], buffer.x_sf[:tokens], block_cols=128
+            )
+            buffer.topk_idx[:tokens].copy_(indices)
+            buffer.topk_weights[:tokens].copy_(scores)
+        mode = cache_mode()
+        if mode != "0":
+            prepared = list(cached_forms(w1, w2, FORWARD_FORMS, mode))
+        else:
+            if os.getenv("MONO_EP_SM90_FP8_FUSED_WEIGHT_QUANT", "1") != "0":
+                from .block_weight_quantization import quantize_weights_128x128
+
+                down = quantize_weights_128x128(w2)
+            else:
+                down = quantize_fp8(w2, block_rows=128, block_cols=128)
+            prepared = [quantize_paired_gate_up_weights(w1), down]
         y = torch.empty_like(x)
         deep_gemm._C.fp8_mono_ep_forward_sm90(
             y,
