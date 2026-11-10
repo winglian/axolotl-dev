@@ -264,6 +264,18 @@ def _pad_expert_rows(recv_x, idx, weights, num_local_experts):
     )
 
 
+def _local_row_bound(local, num_local_experts, training):
+    """Receive rows for a bounded mono_ep dispatch with high-water count ``mark``: SonicMoE
+    pads the received rows plus ``_pad_expert_rows``' to its own bucket anyway, so the
+    bound fills that bucket (fewer re-runs, same kernel shapes as the exact count)."""
+    if (local or _LOCAL_IMPLEMENTATION) != "sonicmoe":
+        return None
+    from axolotl.integrations.kernels.libs.sonicmoe.experts import ep_padded_rows
+
+    e = num_local_experts
+    return lambda mark: ep_padded_rows(mark + e, training) - e
+
+
 def _run_local(experts, local, recv_x, recv_topk_idx, recv_topk_weights):
     e_local = getattr(experts, "num_local_experts", experts.num_experts)
     idx, weights = _normalize_sentinels(recv_topk_idx, recv_topk_weights, e_local)
@@ -587,6 +599,18 @@ def _ep_forward(
             num_local_experts=E_local,
             group=group,
             chunks=_DISPATCH_CHUNKS,
+        )
+    elif ep_backend is _MonoEPDispatchBackend and getattr(
+        get_mono_ep_runtime(), "bounded", False
+    ):
+        combined = get_mono_ep_runtime().forward_bounded(
+            hidden_states,
+            topk_idx_i64,
+            topk_w_f32,
+            E_local,
+            lambda rx, ri, rw: _run_local(self, local_fn, rx, ri, rw),
+            id(self),
+            _local_row_bound(local, E_local, self.training),
         )
     else:
         recv_x, recv_topk_idx, recv_topk_weights, handle = ep_backend.dispatch(
