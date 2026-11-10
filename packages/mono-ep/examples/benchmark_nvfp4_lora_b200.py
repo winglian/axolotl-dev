@@ -12,6 +12,7 @@ peak memory, and the per-step weight rebuild cost of each LoRA variant
 (requant of the merged forms; for the baseline also the BF16 dequant its
 backward uses). ``NVFP4_BENCH_CASE`` selects ``qwen30b`` or ``beam``."""
 
+import importlib.util
 import json
 import os
 import statistics
@@ -34,6 +35,10 @@ CASES = {
 RANK, SCALING = 16, 2.0
 WARMUP, SAMPLES = 5, 15
 BLOCK = 128
+# cuDNN frontend grouped GEMM: groups padded to m_aligned 256; tile / cluster from the
+# single-B200 sweep in benchmark_cudnn_grouped_gemm_b200.py
+CUDNN_BLOCK = 256
+CUDNN_TILE, CUDNN_CLUSTER = (256, 256), (2, 1)
 
 
 class Fp4CuteMergedExperts(torch.autograd.Function):
@@ -118,6 +123,7 @@ class Fp4CuteA2A:
         )
         self.l2 = GroupedNvfp4Gemm(h, i, self.local)
         self.colvec1 = self.colvec2 = None
+        self.block = BLOCK
 
     def rebuild(self, a1, b1, a2, b2):
         layer = self.layer
@@ -129,7 +135,7 @@ class Fp4CuteA2A:
         self.w2m = layer.dequantized(r2, layer.pts2).bfloat16()
 
     def __call__(self, x, ids, scores, a1, b1, a2, b2):
-        world, local, layer = self.world, self.local, self.layer
+        world, local = self.world, self.local
         tokens, k = ids.shape
         flat = ids.reshape(-1)
         order = torch.argsort(flat, stable=True)
@@ -148,7 +154,7 @@ class Fp4CuteA2A:
         )
         order2 = torch.argsort(exp_ids, stable=True)
         counts_local = recv_counts.view(world, local).sum(0)
-        padded = (counts_local + BLOCK - 1) // BLOCK * BLOCK
+        padded = (counts_local + self.block - 1) // self.block * self.block
         cu = torch.zeros(local + 1, device=x.device, dtype=torch.int64)
         cu[1:] = padded.cumsum(0)
         cu_raw = torch.zeros_like(cu)
@@ -161,15 +167,173 @@ class Fp4CuteA2A:
         xg = x.new_zeros(total, x.shape[1]).index_copy(
             0, pos, xr.index_select(0, order2)
         )
-        self.colvec1 = layer.pts1.repeat_interleave(padded).float()
-        self.colvec2 = layer.pts2.repeat_interleave(padded).float()
-        yg = Fp4CuteMergedExperts.apply(xg, cu, a1, b1, a2, b2, self)
+        yg = self._experts(xg, cu, padded, a1, b1, a2, b2)
         inv2 = torch.empty_like(order2)
         inv2[order2] = torch.arange(order2.numel(), device=x.device)
         yr = yg.index_select(0, pos).index_select(0, inv2)
         ys = _a2a(yr, send_splits, recv_splits)
         weights = scores.reshape(-1).index_select(0, order).to(ys.dtype)
         return x.new_zeros(tokens, x.shape[1]).index_add(0, tok, ys * weights[:, None])
+
+    def _experts(self, xg, cu, padded, a1, b1, a2, b2):
+        layer = self.layer
+        self.colvec1 = layer.pts1.repeat_interleave(padded).float()
+        self.colvec2 = layer.pts2.repeat_interleave(padded).float()
+        return Fp4CuteMergedExperts.apply(xg, cu, a1, b1, a2, b2, self)
+
+
+def _quantize_rows(x, row_scale=None):
+    """NVFP4 rows with the SFA in the cuDNN grouped GEMM's contiguous MMA-packed
+    layout (fp4_cute's fused row quantizer with identity row placement);
+    ``row_scale`` divides each row first (per-row two-level scaling, the GEMM
+    multiplies it back)."""
+    from sonicmoe_lite.triton_nvfp4 import _get_kernels, rowscale_inplace_triton
+
+    x = x.contiguous()
+    if row_scale is not None:
+        x = rowscale_inplace_triton(x.clone(), 1.0 / row_scale)
+    rows, k = x.shape
+    sf_k = k // 16
+    packed = torch.empty(rows, k // 2, dtype=torch.uint8, device=x.device)
+    sfa = torch.zeros(
+        (rows + 127) // 128, sf_k // 4, 512, dtype=torch.uint8, device=x.device
+    )
+    # quantize_grouped_rows would sync on its per-expert row placement
+    dest = torch.arange(rows, device=x.device, dtype=torch.int32)
+    _get_kernels().quant_sfa[(rows, (sf_k + 63) // 64)](
+        x, packed, sfa, dest, K=k, SF_K=sf_k, RK=sf_k // 4, BLOCK_SF=64
+    )
+    return packed.view(torch.float4_e2m1fn_x2), sfa.view(torch.float8_e4m3fn)
+
+
+def _row_scale(t):
+    """mono-ep's dynamic per-row NVFP4 scale for dy / dz: amax / (6 * 448)."""
+    amax = torch.linalg.vector_norm(t, float("inf"), dim=1, dtype=torch.float32)
+    return torch.where(amax > 0, amax / 2688.0, torch.ones_like(amax))
+
+
+def _cudnn_gemm(a_q, sfa, offsets, alpha, form, row_scale=None):
+    from cudnn import grouped_gemm_quant_wrapper_sm100
+
+    b, sfb = form
+    return grouped_gemm_quant_wrapper_sm100(
+        a_tensor=a_q,
+        sfa_tensor=sfa,
+        padded_offsets=offsets,
+        alpha_tensor=alpha,
+        b_tensor=b,
+        sfb_tensor=sfb,
+        row_scale_tensor=row_scale,
+        d_dtype=torch.bfloat16,
+        mma_tiler_mn=CUDNN_TILE,
+        cluster_shape_mn=CUDNN_CLUSTER,
+        sf_vec_size=16,
+        m_aligned=CUDNN_BLOCK,
+        generate_amax=False,
+    )["d_tensor"]
+
+
+class CudnnMergedExperts(torch.autograd.Function):
+    """Local experts on the cuDNN frontend grouped NVFP4 GEMM (four merged forms:
+    concat ``w1``, ``w2``, ``w1t``, ``w2t``). Forward quantizes x and h with a
+    unit static scale; backward quantizes dy and dz per row (``row_scale``) and
+    runs Dh / Dx on the transposed forms; adapter gradients as the fp4_cute
+    baseline (BF16 grouped GEMMs)."""
+
+    @staticmethod
+    def forward(ctx, xg, offsets, a1, b1, a2, b2, eng):
+        layer = eng.layer
+        a_q, sfa = _quantize_rows(xg)
+        z = _cudnn_gemm(a_q, sfa, offsets, layer.pts1, eng.w1)
+        gate, up = z.chunk(2, -1)
+        post = (torch.nn.functional.silu(gate.float()) * up.float()).bfloat16()
+        h_q, sfh = _quantize_rows(post)
+        y = _cudnn_gemm(h_q, sfh, offsets, layer.pts2, eng.w2)
+        ctx.save_for_backward(xg, z, post, offsets, a1, b1, a2, b2)
+        ctx.eng = eng
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        xg, z, post, offs, a1, b1, a2, b2 = ctx.saved_tensors
+        eng = ctx.eng
+        layer = eng.layer
+        dy = dy.contiguous()
+        gmm = torch._grouped_mm
+        s = eng.scaling
+        rs = _row_scale(dy)
+        dy_q, sfdy = _quantize_rows(dy, rs)
+        dh = _cudnn_gemm(dy_q, sfdy, offs, layer.pts2, eng.w2t, rs)
+        p2 = gmm(dy, b2, offs=offs)
+        q2 = gmm(post, a2.transpose(1, 2).contiguous(), offs=offs)
+        da2 = s * gmm(p2.t(), post, offs=offs).float()
+        db2 = s * gmm(dy.t(), q2, offs=offs).float()
+        gate, up = z.float().chunk(2, -1)
+        sig = torch.sigmoid(gate)
+        dhf = dh.float()
+        dz = torch.cat(
+            [dhf * up * (sig + gate * sig * (1 - sig)), dhf * gate * sig], -1
+        ).bfloat16()
+        rz = _row_scale(dz)
+        dz_q, sfdz = _quantize_rows(dz, rz)
+        dx = _cudnn_gemm(dz_q, sfdz, offs, layer.pts1, eng.w1t, rz)
+        p1 = gmm(dz, b1, offs=offs)
+        q1 = gmm(xg, a1.transpose(1, 2).contiguous(), offs=offs)
+        da1 = s * gmm(p1.t(), xg, offs=offs).float()
+        db1 = s * gmm(dz.t(), q1, offs=offs).float()
+        return (
+            dx,
+            None,
+            da1.to(a1.dtype),
+            db1.to(b1.dtype),
+            da2.to(a2.dtype),
+            db2.to(b2.dtype),
+            None,
+        )
+
+
+class CudnnGroupedA2A(Fp4CuteA2A):
+    """The :class:`Fp4CuteA2A` dispatch/combine (groups padded to 256 rows)
+    around :class:`CudnnMergedExperts`."""
+
+    def __init__(self, layer, experts, topk, scaling):
+        _sonicmoe()
+        self.layer, self.experts, self.topk, self.scaling = (
+            layer,
+            experts,
+            topk,
+            scaling,
+        )
+        self.world, self.rank = dist.get_world_size(), dist.get_rank()
+        self.local = experts // self.world
+        self.block = CUDNN_BLOCK
+
+    def rebuild(self, a1, b1, a2, b2):
+        layer = self.layer
+
+        def form(r):
+            return (
+                r.qdata.view(torch.float4_e2m1fn_x2),
+                r.scale_atoms.view(torch.float8_e4m3fn),
+            )
+
+        a1, b1, a2, b2 = (t.detach() for t in (a1, b1, a2, b2))
+        self.w1 = form(layer._requant(layer.q1, layer.s1, layer.pts1, a1, b1))
+        self.w2 = form(layer._requant(layer.q2, layer.s2, layer.pts2, a2, b2))
+        self.w1t = form(
+            layer._requant(
+                layer.q1t, layer.s1t, layer.pts1, b1.transpose(1, 2), a1.transpose(1, 2)
+            )
+        )
+        self.w2t = form(
+            layer._requant(
+                layer.q2t, layer.s2t, layer.pts2, b2.transpose(1, 2), a2.transpose(1, 2)
+            )
+        )
+
+    def _experts(self, xg, cu, padded, a1, b1, a2, b2):
+        offsets = cu[1:].to(torch.int32)
+        return CudnnMergedExperts.apply(xg, offsets, a1, b1, a2, b2, self)
 
 
 def _median(v):
@@ -311,6 +475,13 @@ def main():
         ),
         "fp4_cute_a2a": lambda x, ids, s: a2a(x, ids, s, *adapters),
     }
+    # Only on the image with the cuDNN frontend (Modal job `timing_cudnn`)
+    cudnn_a2a = None
+    if importlib.util.find_spec("cudnn") is not None:
+        cudnn_a2a = CudnnGroupedA2A(layer, experts, topk, SCALING)
+        variants["cudnn_grouped_a2a"] = lambda x, ids, s: cudnn_a2a(
+            x, ids, s, *adapters
+        )
     scopes = ("forward", "backward", "checkpointed_2fb")
     x = (
         torch.randn(tokens, hidden, device=device, generator=gen)
@@ -359,6 +530,16 @@ def main():
             "fp4_cute_a2a/requant_2_forms_plus_bf16_dequant",
             lambda: a2a.rebuild(*adapters),
         ),
+        *(
+            [
+                (
+                    "cudnn_grouped_a2a/requant_4_forms",
+                    lambda: cudnn_a2a.rebuild(*adapters),
+                )
+            ]
+            if cudnn_a2a is not None
+            else []
+        ),
     ):
         samples = []
         for i in range(WARMUP + SAMPLES):
@@ -371,6 +552,32 @@ def main():
         )
     cache.get(layer, adapters)
     a2a.rebuild(*adapters)
+    agreement = {}
+    if cudnn_a2a is not None:
+        # Same layer through both all-to-all baselines: y and dx agreement (two NVFP4 quantizers)
+        cudnn_a2a.rebuild(*adapters)
+        ids, scores = routing(tokens, experts, topk, 0.0, device, gen)
+        outs = {}
+        for name in ("fp4_cute_a2a", "cudnn_grouped_a2a"):
+            x.grad = None
+            y = variants[name](x, ids, scores)
+            y.backward(dy)
+            outs[name] = (y.detach().float(), x.grad.float())
+        x.grad = None
+        (y0, dx0), (y1, dx1) = outs["fp4_cute_a2a"], outs["cudnn_grouped_a2a"]
+        stats = torch.stack(
+            [
+                (y1 - y0).norm() ** 2,
+                y0.norm() ** 2,
+                (dx1 - dx0).norm() ** 2,
+                dx0.norm() ** 2,
+            ]
+        )
+        dist.all_reduce(stats)
+        agreement = dict(
+            y_rel_fro_cudnn_vs_fp4_cute=(stats[0] / stats[1]).sqrt().item(),
+            dx_rel_fro_cudnn_vs_fp4_cute=(stats[2] / stats[3]).sqrt().item(),
+        )
 
     for route in ("balanced", "skewed"):
         ids, scores = routing(
@@ -404,6 +611,36 @@ def main():
             )
             for (v, s), rs in samples.items()
         }
+    # Top CUDA kernels of one backward per all-to-all variant (rank 0's view)
+    from torch.profiler import ProfilerActivity, profile
+
+    backward_kernels = {}
+    for name in [v for v in variants if v.endswith("_a2a")]:
+        x.grad = None
+        y = variants[name](x, ids, scores)
+        dist.barrier()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            y.backward(dy)
+            torch.cuda.synchronize()
+        rows = sorted(
+            (e for e in prof.key_averages() if e.device_time_total > 0),
+            key=lambda e: e.device_time_total,
+            reverse=True,
+        )
+        backward_kernels[name] = dict(
+            total_us=round(sum(e.device_time_total for e in rows), 1),
+            top=[
+                dict(
+                    name=e.key[:90],
+                    total_us=round(e.device_time_total, 1),
+                    count=e.count,
+                )
+                for e in rows[:12]
+            ],
+        )
+        del y
+    x.grad = None
     mem = torch.tensor([peak[v] for v in variants], device=device, dtype=torch.int64)
     dist.all_reduce(mem, op=dist.ReduceOp.MAX)
     summary = dict(
@@ -427,6 +664,8 @@ def main():
         samples=SAMPLES,
         env={k: v for k, v in os.environ.items() if k.startswith("MONO_EP_")},
         rebuild_ms=rebuilds,
+        cudnn_vs_fp4_cute=agreement,
+        a2a_backward_kernels_rank0=backward_kernels,
         peak_memory_gib={
             v: m / 2**30 for v, m in zip(variants, mem.tolist(), strict=True)
         },

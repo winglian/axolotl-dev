@@ -156,6 +156,13 @@ def timing(cases: str = "", requant: str = ""):
     )
 
 
+@app.function(image=cudnn_image, gpu="B200:8", cpu=32, memory=262144, timeout=7200)
+def timing_cudnn(cases: str = "", requant: str = ""):
+    """``timing`` plus the ``cudnn_grouped_a2a`` variant (the runner adds it when the
+    cuDNN frontend is importable)."""
+    return timing.local(cases, requant)
+
+
 @app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=7200)
 def profile(cases: str = "", requant: str = ""):
     env = _requant_env(requant) | ({"NVFP4_CASES": cases} if cases else {})
@@ -180,6 +187,8 @@ def main(job: str = "forward", out: str = "", cases: str = "", requant: str = ""
         result = timing.remote(cases, requant)
     elif job == "profile":
         result = profile.remote(cases, requant)
+    elif job == "timing_cudnn":
+        result = timing_cudnn.remote(cases, requant)
     elif job == "cudnn":
         result = cudnn.remote(cases)
     else:
