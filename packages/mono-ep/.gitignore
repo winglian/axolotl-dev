@@ -5,3 +5,16 @@ vendor/deepgemm/dist/
 __pycache__/
 build/
 dist/
+
+# Raw measurement artifacts and the development log stay out of the tree; the
+# headline numbers are in the README's benchmarks section.
+benchmarks/
+*.json
+!vendor/sources.json
+*.log
+*.sass
+*.ncu-rep
+*.nsys-rep
+*.cubin
+*.ptx
+*.csv
