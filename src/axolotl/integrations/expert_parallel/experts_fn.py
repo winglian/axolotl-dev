@@ -446,9 +446,10 @@ class _MonoEPDispatchBackend:
     """mono-ep's peer-memory dispatch/combine around the configured local kernel.
 
     The runtime returns the DeepEP row layout over a fixed ``world * capacity`` rows (zero
-    rows with all ``-1`` ids where nothing routes here), so ``_run_local`` and the local
-    kernels run unchanged; combine sums the partial rows onto the source tokens without
-    touching the routing weights, exactly as the torch backend does.
+    rows with all ``-1`` ids where nothing routes here; only the routed rows when the
+    runtime is compact), so ``_run_local`` and the local kernels run unchanged; combine
+    sums the partial rows onto the source tokens without touching the routing weights,
+    exactly as the torch backend does. The handle is the runtime's.
     """
 
     cast_bf16 = True
@@ -458,17 +459,13 @@ class _MonoEPDispatchBackend:
     def dispatch(
         hidden_states, topk_idx, topk_w, *, num_experts_global, num_local_experts
     ):
-        recv_x, recv_idx, recv_w = get_mono_ep_runtime().dispatch(
+        return get_mono_ep_runtime().dispatch(
             hidden_states, topk_idx, topk_w, num_local_experts
         )
-        return recv_x, recv_idx, recv_w, (recv_idx, topk_idx, num_local_experts)
 
     @staticmethod
     def combine(local_out, handle):
-        recv_idx, topk_idx, num_local_experts = handle
-        return get_mono_ep_runtime().combine(
-            local_out, recv_idx, topk_idx, num_local_experts
-        )
+        return get_mono_ep_runtime().combine(local_out, handle)
 
 
 class _MonoEPBackend:

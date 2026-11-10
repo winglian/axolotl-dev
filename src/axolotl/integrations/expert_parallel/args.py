@@ -41,6 +41,13 @@ class ExpertParallelArgs(BaseModel):
     config and model support it, otherwise ``dispatch``, otherwise
     ``expert_parallel_fallback_on_unsupported``."""
 
+    expert_parallel_mono_ep_compact: bool = False
+    """Dispatch mode only: hand the local experts kernel just the routed receive rows
+    instead of the fixed ``ep_size * tokens_per_rank`` layout. Costs one device-to-host
+    count per MoE layer (``mono_ep::peer_count_to_host``, saved under activation
+    checkpointing like the torch backend's split counts); smaller receive buffers and
+    less row-count-sized work in the local kernel."""
+
     expert_parallel_mono_ep_precision: Literal[
         "auto", "bf16", "mxfp8", "fp8", "fp8_bwd"
     ] = "auto"

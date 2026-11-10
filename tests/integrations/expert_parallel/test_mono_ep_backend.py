@@ -114,10 +114,12 @@ class _FakeDispatchRuntime:
         recv_idx = torch.nn.functional.pad(local, (0, 0, 0, pad), value=-1)
         recv_w = torch.nn.functional.pad(topk_weights, (0, 0, 0, pad))
         recv_w = recv_w.masked_fill(recv_idx < 0, 0)
-        return torch.nn.functional.pad(x, (0, 0, 0, pad)), recv_idx, recv_w
+        handle = ((recv_idx >= 0).any(-1), topk_idx, num_local_experts)
+        return torch.nn.functional.pad(x, (0, 0, 0, pad)), recv_idx, recv_w, handle
 
-    def combine(self, local_out, recv_idx, topk_idx, num_local_experts):
-        self.calls.append(("combine", local_out, recv_idx, topk_idx, num_local_experts))
+    def combine(self, local_out, handle):
+        rows, topk_idx, num_local_experts = handle
+        self.calls.append(("combine", local_out, rows, topk_idx, num_local_experts))
         return local_out[: topk_idx.shape[0]]
 
     def destroy(self):
@@ -304,8 +306,10 @@ class TestDispatchForward:
         assert seen["idx"][:3].tolist() == [[0, 1], [1, 2], [2, 2]]
         assert seen["w"][2].eq(0).all() and seen["w"][1, 1] == 0
         assert seen["w"][0].gt(0).all() and seen["w"][1, 0] > 0
-        _, local_out, recv_idx, topk_idx, _ = runtime.calls[1]
-        assert local_out.shape == (8, 512) and recv_idx.shape == (8, 2)
+        _, local_out, rows, topk_idx, _ = runtime.calls[1]
+        assert local_out.shape == (8, 512)
+        # token 2's experts [2, 3] are both remote, so its receive row is unrouted
+        assert rows.dtype == torch.bool and rows.tolist() == [True, True] + [False] * 6
         assert topk_idx.tolist() == ids.tolist()
         assert y.dtype == torch.float32
         torch.testing.assert_close(y, (x.bfloat16() * 3).float())

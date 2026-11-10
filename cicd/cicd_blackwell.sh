@@ -54,6 +54,7 @@ python -m pytest -q packages/mono-ep/tests/test_sonic_fp8.py \
   packages/mono-ep/tests/test_recompute_epilogue.py \
   packages/mono-ep/tests/test_backward_schedule.py packages/mono-ep/tests/test_owned_backward.py \
   packages/mono-ep/tests/test_peer_packing.py packages/mono-ep/tests/test_peer_scatter.py \
+  packages/mono-ep/tests/test_peer_dispatch_gpu.py \
   packages/mono-ep/tests/test_ready_bf16.py \
   --junitxml=blackwell-sonic-fp8-junit.xml || status=$?
 

@@ -460,7 +460,10 @@ class ExpertParallelPlugin(BasePlugin):
             register_preferred_save,
         )
 
-        register_mandatory_save(ops={"axolotl::ep_to_host"})
+        # the mono_ep compact dispatch has the same one host count per layer
+        register_mandatory_save(
+            ops={"axolotl::ep_to_host", "mono_ep::peer_count_to_host"}
+        )
         routing_blocks = cls._routing_blocks(model) if model is not None else []
         if routing_blocks:
             register_mandatory_save(ops={"aten::topk"}, within=routing_blocks)
@@ -767,22 +770,29 @@ class ExpertParallelPlugin(BasePlugin):
             )
         if self.__dict__.get("_mono_ep_runtime") is not None:
             return
+        compact = bool(getattr(cfg, "expert_parallel_mono_ep_compact", False))
         runtime = MonoEPDispatchRuntime(
             group=self._resolve_ep_group(cfg),
             max_tokens_per_rank=self._mono_ep_tokens_per_rank(cfg),
             top_k=geometry.top_k,
             hidden=geometry.hidden,
+            compact=compact,
         )
         self._mono_ep_runtime = runtime
         set_mono_ep_runtime(runtime)
         if getattr(cfg, "expert_parallel_save_dispatch", False):
             # same trade as the torch all-to-all saves: hold the received rows so the
             # recompute does not re-run the peer transfers
-            register_preferred_save(ops={runtime.dispatch_op, runtime.combine_op})
+            register_preferred_save(
+                ops=getattr(
+                    runtime, "save_ops", {runtime.dispatch_op, runtime.combine_op}
+                )
+            )
         LOG.info(
             f"expert_parallel: mono_ep peer dispatch runtime, "
             f"{runtime.max_tokens_per_rank} tokens/rank, {runtime.receive_rows} receive "
-            f"rows, top-{geometry.top_k}, hidden {geometry.hidden}"
+            f"rows ({'routed rows only' if compact else 'fixed layout'}), "
+            f"top-{geometry.top_k}, hidden {geometry.hidden}"
         )
 
     @staticmethod
