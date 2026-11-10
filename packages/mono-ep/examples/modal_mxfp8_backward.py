@@ -17,7 +17,7 @@ from pathlib import Path
 
 import modal
 
-app = modal.App("axolotl-mono-ep-mxfp8-validate")
+app = modal.App(os.environ.get("MONO_EP_MODAL_APP", "axolotl-mono-ep-mxfp8-validate"))
 image = None
 if modal.is_local():
     from modal_validate import base_image
@@ -130,6 +130,75 @@ def validate_2(args):
     return _validate(2, args)
 
 
+PAIRED_VARIANTS = (
+    "bf16:MONO_EP_SM100_BACKWARD_PRECISION=bf16,"
+    "mxfp8:MONO_EP_SM100_BACKWARD_PRECISION=mxfp8"
+)
+
+
+@app.function(image=image, gpu="B200:8", cpu=64, memory=524288, timeout=3 * 3600)
+def paired_8(routings):
+    """bf16 vs mxfp8 backward interleaved per iteration (5 warmups, 15 samples), NCCL control,
+    weights bumped every step, compiled checkpointed layer; then one EP8 phase trace."""
+    info = _prepare(8)
+    runs = {}
+    for routing in routings:
+        code, lines = _torchrun(
+            8,
+            "benchmark_persistent_training.py",
+            [
+                "--recompute",
+                "--peer-backward",
+                "--compare-native",
+                "--compiled",
+                "--compute-dtype",
+                "bf16",
+                "--bump-versions",
+                "--routing",
+                routing,
+                "--variants",
+                PAIRED_VARIANTS,
+            ],
+        )
+        payload = [
+            json.loads(line) for line in lines if line.startswith('{"benchmark"')
+        ]
+        runs[routing] = dict(
+            returncode=code,
+            result=payload[-1] if payload else None,
+            tail="".join(lines[-80:]) if code else "",
+        )
+    code, lines = _torchrun(
+        8,
+        "benchmark_ep_trace_b200.py",
+        [
+            "--variants",
+            PAIRED_VARIANTS,
+            "--keys",
+            "bwd/bump",
+            "--rounds",
+            "2",
+            "--iters",
+            "8",
+            "--trace-iters",
+            "6",
+        ],
+    )
+    trace = [
+        json.loads(line[len("EPTRACE_JSON ") :])
+        for line in lines
+        if line.startswith("EPTRACE_JSON ")
+    ]
+    return dict(
+        **info,
+        returncode=max([r["returncode"] for r in runs.values()] + [code]),
+        runs=runs,
+        trace=trace[-1] if trace else None,
+        trace_returncode=code,
+        tail="".join(lines[-80:]) if code else "",
+    )
+
+
 @app.local_entrypoint()
 def main(out: str, mode: str = "validate", world: int = 1, args: str = ""):
     parsed = args.split()
@@ -137,6 +206,8 @@ def main(out: str, mode: str = "validate", world: int = 1, args: str = ""):
         result = (validate_1 if world == 1 else validate_2).remote(parsed)
     elif mode == "trace" and world == 1:
         result = trace_1.remote(parsed)
+    elif mode == "paired":
+        result = paired_8.remote(parsed or ["balanced", "skewed"])
     else:
         raise ValueError(mode)
     result["modal_app_id"] = app.app_id

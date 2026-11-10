@@ -34,7 +34,10 @@ On SM90 FP8 the x/dy transport, the dX combine and the weight-gradient operands 
 with 128-element scale groups (1x128 activations, 128x128 weights); outputs are BF16 and
 weight gradients come back in the master dtype. The SM100 BF16 backward uses two-CTA pairs,
 a six-stage pipeline with two-row pulls, and a recompute SwiGLU-derivative epilogue that
-emits `h`, `dz` and the score partials without storing `z`.
+emits `h`, `dz` and the score partials without storing `z`. An opt-in MXFP8 variant
+(`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`) runs dh, the recompute and dx as block-scaled MXFP8 UMMA
+with E4M3 x/dy transport, UTCCP-ordered scale pools written by the dispatch warps, dz quantized in
+the epilogue, and BF16 weight gradients from exact dequantized copies.
 
 The native backward requires `hidden % 256 == 0`, `intermediate % 256 == 0` and every rank of
 the EP group on one host. Otherwise the same op runs the NCCL reference backward (an

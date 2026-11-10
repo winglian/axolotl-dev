@@ -94,7 +94,9 @@ before it was made the default; setting that value restores the previous behavio
 | `MONO_EP_SM90_FP8_ACTIVATION_LOOP` | `2` with `swiglu_fast`, `1` otherwise | `0` | Columns per lane in the SwiGLU epilogue loop. |
 | `MONO_EP_SM90_FP8_COMPACT_FORWARD`, `MONO_EP_SM90_FP8_COMPACT_BACKWARD` | unset | | 384-thread layouts kept for experiments; the 512-thread layouts are the defaults. |
 | `MONO_EP_SM100_BACKWARD_STAGES` | `6` | | SM100 backward pipeline stages. |
-| `MONO_EP_SM100_BACKWARD_OPTIONS` | `11` | `0` | SM100 backward epilogue option bits (staged pool stores, two-row pulls). |
+| `MONO_EP_SM100_BACKWARD_PRECISION` | `bf16` | | `mxfp8`: SM100 backward GEMMs (dh, z recompute, dx) as MXFP8 (E4M3, UE8M0 per 32 along K) with E4M3 x/dy over NVLink and dz quantized in the epilogue; the weight gradients stay BF16 GEMMs on exact BF16 copies of the E4M3 x/dy. Not bitwise: about 6-7% relative error against an FP32 reference (BF16: 0.2%), see the experiment log. Needs `hidden % 512 == 0`, `hidden <= 2048`. |
+| `MONO_EP_SM100_MXFP8_COMPILED_QUANT` | `1` | `0` (Triton builders) | Build the MXFP8 backward weight forms (W1, W2ᵀ, W1ᵀ) in one Inductor graph; bitwise equal to the Triton path. |
+| `MONO_EP_SM100_BACKWARD_OPTIONS` | `11` | `0` | SM100 backward epilogue option bits (staged pool stores, two-row pulls); bit 2048 is set by `MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`, which requires bit 1 and excludes 4, 16 and 64. |
 | `MONO_EP_SM100_BACKWARD_PULL_BYTES` | two rows (8 KB) when whole rows fit, else `4096` | `4096` | SM100 backward NVLink pull size. |
 | `MONO_EP_SM100_FORWARD_OPTIONS` | lookahead pull when the pull buffer is one row | `0` | SM100 forward option bits. |
 | `MONO_EP_SM100_FORWARD_PULL_BYTES` | per shape | | SM100 forward pull size. |
