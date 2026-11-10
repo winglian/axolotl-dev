@@ -235,6 +235,27 @@ pools and scale pools. Shared memory per stage at `BLOCK_K = 256`: A `64 x 128
 four-stage TMEM opt-in (`options & 4`) would need 520 and is rejected for this
 precision (it is not a default).
 
+Ring floor. The symmetric buffer's L1 ring is sized for the forward's
+interleaved schedule (`get_num_max_live_pool_blocks`). The backward's owned
+schedule keeps one pool block per CTA pair live through all four phases, so at
+wide experts that sizing starves it: at Beam (hidden 5120, inter 2560) the ring
+holds 15-30 blocks for 74 CTA pairs and the dispatch warps spend most of the
+kernel waiting on ring slots. `Nvfp4PersistentBackward` passes a floor of
+`waves * (sms / 2) * 128` tokens to `get_symm_buffer_for_mono_ep`
+(`num_min_ring_tokens`), default one wave; the floor only raises the ring, so
+shapes whose forward sizing is already larger (the Qwen3-30B contract) are
+unchanged. The BF16 / FP8 persistent backward takes the same floor opt-in
+(`MONO_EP_BACKWARD_RING_WAVES`, default 0) so its defaults stay byte-identical.
+
+Dispatch pull. Whole `x + dy` rows per warp (`hidden * 4` bytes) are the
+default; at hidden 5120 that leaves 3 pipeline stages instead of 5. A chunked,
+double-buffered pull (`MONO_EP_SM100_NVFP4_BACKWARD_PULL_BYTES` = 8192, 4096 or
+2048: two slots of one x chunk and one dy chunk; x quantized per chunk with the
+static scale, dy stored BF16 per chunk and quantized from the pool once the row
+amax is known) restores 5-6 stages and is bitwise identical, but measured no
+faster once the ring floor is in (the stage count stops mattering and the dy
+re-read costs the dispatch warps), so it is opt-in only.
+
 **dA, dB run outside the kernel** (`weight_grad_lora`, replacing
 `weight_grad_bf16`), on the BF16 pools grouped by `expert_starts/counts`:
 
@@ -313,6 +334,12 @@ follow-up.
   `MONO_EP_SM100_NVFP4_STAGES`, `MONO_EP_NVFP4_INPUT_SCALE_MODE` (static |
   unit), `MONO_EP_SM100_NVFP4_SAT_COUNT` (diagnostic). The BF16 options
   bitmasks apply unchanged where the code is shared.
+- Backward knobs: `MONO_EP_SM100_NVFP4_BACKWARD_STAGES` (at most the deepest
+  that fits), `MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS` (bits 1 and 2),
+  `MONO_EP_SM100_NVFP4_BACKWARD_PULL_BYTES` (whole rows by default, or a
+  chunked 8192 / 4096 / 2048), `MONO_EP_NVFP4_BACKWARD_RING_WAVES` (ring floor
+  in waves of CTA pairs, default 1, 0 = forward sizing),
+  `MONO_EP_NVFP4_LORA_WGRAD=loop` (per-expert adapter-gradient fallback).
 - Axolotl seam: `expert_parallel/args.py` precision literal, `plugin.py`
   accepts a LoRA adapter only for `nvfp4_lora` on a packed NVFP4 base and
   wires the requant cache + post-step hook, `experts_fn.py` passes the

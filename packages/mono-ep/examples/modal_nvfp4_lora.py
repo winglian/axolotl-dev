@@ -130,6 +130,12 @@ def timing(cases: str = ""):
     )
 
 
+@app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=7200)
+def profile(cases: str = ""):
+    env = {"NVFP4_CASES": cases} if cases else {}
+    return _run("profile_nvfp4_lora_b200.py", 1, env, 7000)
+
+
 @app.local_entrypoint()
 def main(job: str = "forward", out: str = "", cases: str = ""):
     if job == "forward":
@@ -140,6 +146,8 @@ def main(job: str = "forward", out: str = "", cases: str = ""):
         result = fsdp2_training.remote()
     elif job == "timing":
         result = timing.remote(cases)
+    elif job == "profile":
+        result = profile.remote(cases)
     else:
         raise ValueError(job)
     result["modal_app_id"] = app.app_id

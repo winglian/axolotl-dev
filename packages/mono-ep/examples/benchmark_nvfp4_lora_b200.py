@@ -24,7 +24,7 @@ from torch.distributed._functional_collectives import all_to_all_single_autograd
 from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from validate_nvfp4_forward import routing  # noqa: E402
+from validate_nvfp4_forward import _sonicmoe, routing  # noqa: E402
 
 CASES = {
     # tokens per GPU, hidden, intermediate, global experts, top-k
@@ -99,6 +99,7 @@ class Fp4CuteA2A:
     """torch all-to-all EP dispatch/combine around :class:`Fp4CuteMergedExperts`."""
 
     def __init__(self, layer, experts, topk, scaling):
+        _sonicmoe()  # registers sonicmoe_lite from SONICMOE_DIR
         from sonicmoe_lite.fp4_cute import GroupedNvfp4Gemm
 
         self.layer, self.experts, self.topk, self.scaling = (
@@ -281,6 +282,20 @@ def main():
         fuse_activation=True,
         backward_backend="native",
     )
+    # Same BF16 path with the owned-backward ring floor (opt-in for BF16, default on for nvfp4_lora)
+    os.environ["MONO_EP_BACKWARD_RING_WAVES"] = "1"
+    runtime_bf_ring = PersistentMoE(
+        dist.group.WORLD,
+        experts,
+        tokens,
+        topk,
+        hidden,
+        inter,
+        compute_dtype="bf16",
+        fuse_activation=True,
+        backward_backend="native",
+    )
+    os.environ.pop("MONO_EP_BACKWARD_RING_WAVES")
     cache = RequantCache()
     a2a = Fp4CuteA2A(layer, experts, topk, SCALING)
 
@@ -289,6 +304,9 @@ def main():
             x, ids, s, *adapters, runtime_nv, layer, cache
         ),
         "bf16_persistent": lambda x, ids, s: runtime_bf(x, ids, s, w1_bf, w2_bf),
+        "bf16_persistent_ring1": lambda x, ids, s: runtime_bf_ring(
+            x, ids, s, w1_bf, w2_bf
+        ),
         "fp4_cute_a2a": lambda x, ids, s: a2a(x, ids, s, *adapters),
     }
     scopes = ("forward", "backward", "checkpointed_2fb")
@@ -393,6 +411,13 @@ def main():
             v: m / 2**30 for v, m in zip(variants, mem.tolist(), strict=True)
         },
         timings=results,
+        backward_ring_tokens=dict(
+            nvfp4_lora=runtime_nv._nvfp4_backward.buffer.l1_acts.shape[0],
+            bf16_persistent=runtime_bf._peer_backward.buffer.l1_acts.shape[0],
+            bf16_persistent_ring1=runtime_bf_ring._peer_backward.buffer.l1_acts.shape[
+                0
+            ],
+        ),
     )
     if rank == 0:
         print("BENCH_JSON " + json.dumps(summary), flush=True)
@@ -403,6 +428,7 @@ def main():
     dist.barrier()
     runtime_nv.close()
     runtime_bf.close()
+    runtime_bf_ring.close()
     dist.destroy_process_group()
 
 
