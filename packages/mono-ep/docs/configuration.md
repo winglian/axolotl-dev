@@ -25,6 +25,13 @@ need; the environment variables exist for experiments and for restoring a previo
 | `mxfp8` | no | yes |
 | `fp8` (blockwise E4M3 forward and backward, the kernels timed in [benchmarks.md](benchmarks.md)) | yes | no |
 | `fp8_bwd` (BF16 forward, FP8 backward) | not implemented | no |
+| `nvfp4_lora` (frozen packed NVFP4 experts with BF16 LoRA adapters; hidden and intermediate multiples of 256; native backward only, one host) | no | yes, package API only |
+
+`nvfp4_lora` is reachable today only through the package API: `MonoEPRuntime(precision="nvfp4_lora")`
+and `MonoEPRuntime.forward_lora(...)` with a `mono_ep.nvfp4_lora.Nvfp4LoraExperts` base and
+`A1 / B1 / A2 / B2` adapters ([trl-integration.md](trl-integration.md#nvfp4-lora)). The Axolotl
+key `expert_parallel_mono_ep_precision` does not accept it, and an Axolotl `adapter:` falls back
+to `torch` (table below).
 
 ### Fallback conditions
 
@@ -94,9 +101,25 @@ before it was made the default; setting that value restores the previous behavio
 | `MONO_EP_SM90_FP8_FORWARD_SCATTER_MODE` | `0` | `1`, `3` | Forward combine scatter ordering. |
 | `MONO_EP_SM90_FP8_DISPATCH_PULL_BYTES` | 4 KB per row, capped at 2 KB when the stage counts would exceed shared memory (hidden 4096) | | NVLink pull granularity. |
 | `MONO_EP_SM90_FP8_ACTIVATION` | `swiglu_fast` on the 512-thread launches, `swiglu` otherwise | `swiglu` (the bitwise IEEE reference) | Gated activation of the SM90 FP8 epilogues. `swiglu_fast` is not bitwise: it passed the FP32-reference validators and a 300-step loss-curve check against `swiglu`. Other values (`swiglu_tanh`, `swiglu_oai`, `geglu`, ...) exist for kernel experiments; Axolotl falls back for non-SiLU gates. |
+| `MONO_EP_SM90_FP8_ACTIVATION_ALPHA`, `MONO_EP_SM90_FP8_ACTIVATION_LIMIT` | unset (`swiglu_oai`: limit 7) | | Activation parameters: `ALPHA` is the `swiglu_oai` gate slope, `LIMIT` the clamp of the SwiGLU forms. Kept for experiments, not for training: Axolotl falls back for clamped or non-SiLU gates. |
 | `MONO_EP_SM90_FP8_ACTIVATION_LOOP` | `2` with `swiglu_fast`, `1` otherwise | `0` | Columns per lane in the SwiGLU epilogue loop. |
+| `MONO_EP_SM90_FP8_ACTIVATION_CHUNK` | `16` with the activation loop on the 512-thread launch, else `0` (build default) | `0` | Backward: rows per dscore reduction chunk in the activation loop (2, 4, 8, 16, 32; at most 16 with loop mode 2). |
+| `MONO_EP_SM90_FP8_FORWARD_VECTOR_SCATTER` | `1` | `0` | Forward: vectorized combine scatter in the down-GEMM epilogue. |
+| `MONO_EP_SM90_FP8_FORWARD_VECTOR_SWIGLU` | `1` | `0` | Forward: vectorized SwiGLU in the gate/up epilogue. |
+| `MONO_EP_SM90_FP8_FORWARD_VECTOR_HQUANT` | `1` | `0` | Forward: vectorized FP8 quantization of h in the gate/up epilogue. |
+| `MONO_EP_SM90_FP8_FORWARD_SWIZZLE_ACCUM_SMEM` | `1` when the vector scatter and SwiGLU are on | `0` | Forward: swizzled shared-memory staging of the accumulators (needs both vector paths). |
+| `MONO_EP_SM90_FP8_FORWARD_DEFER_COMBINE_FENCE` | `1` | `0` | Forward: one deferred system fence before the combine signal instead of one per store. |
+| `MONO_EP_SM90_FP8_FORWARD_RELAXED_SPINS` | `1` on the 512-thread launch, `0` on compact384 | `0` | Forward: relaxed polls plus one acquire on the dispatch ring, A-loader, epilogue and combine spins. |
+| `MONO_EP_SM90_FP8_RELAXED_SPINS` | `0` | | Backward: the same relaxed polls on the A-loader, dh epilogue and combine-readiness spins. Kept for experiments, not for training. |
+| `MONO_EP_SM90_FP8_DISPATCH_SPIN` | `4` | `0` (acquire spin), `1`, `2`, `3` | Backward: ring-slot release wait. `0` ld.acquire spin, `1` relaxed poll and one acquire, `2`-`4` relaxed poll with nanosleep backoff (32-256, 64-1024, 128-4096 ns). |
+| `MONO_EP_SM90_FP8_XDY_VECTOR_PACK` | `1` with FP8 transport and the caches, else `0` | `0` | Backward: vectorized packing of the x/dy columns on the math warps. |
+| `MONO_EP_SM90_FP8_VECTOR_HDZ_PACK` | `2` | `0`, `1` | Backward: vectorized h/dZ column pack; `1` keeps the original fences, `2` also drops them (the packed columns are read by a later launch). |
+| `MONO_EP_SM90_FP8_VECTOR_DZ_QUANT` | `1` | `0`, `2` | Backward: load-batch depth of the vectorized dZ row-cache quantize (`2` spills in the combined build). |
+| `MONO_EP_SM90_FP8_DX_COMBINE` | `7` (with `MONO_EP_SM90_FP8_COMBINE=1`) | `0` | Backward FP8 dX combine bits: 1 vectorized scatter, 2 one system fence per thread, 4 vectorized tail. Ignored without the FP8 combine. |
+| `MONO_EP_SM90_FP8_DISPATCH_PACK_REGISTERS` | `64/40/200` | `48/40/208` (the split without the pack) | Backward with `MONO_EP_SM90_FP8_DISPATCH_XDY_PACK=1`: `setmaxnreg` split for the dispatch / non-epilogue / epilogue warpgroups. Kept for experiments, not for training. |
 | `MONO_EP_SM90_FP8_COMPACT_FORWARD`, `MONO_EP_SM90_FP8_COMPACT_BACKWARD` | unset | | 384-thread layouts kept for experiments; the 512-thread layouts are the defaults. |
-| `MONO_EP_SM100_BACKWARD_STAGES` | `6` | | SM100 backward pipeline stages. |
+| `MONO_EP_SM100_BACKWARD_STAGES` | `6` | `2` (the old default) | SM100 BF16 backward TMA/UMMA ring depth; unset takes the deepest ring that fits shared memory. |
+| `MONO_EP_SM100_BACKWARD_BLOCK_K` | `64` | | SM100 BF16 backward BLOCK_K: `64` or `128` (the MXFP8 backward uses 128; in-kernel dW needs 64). |
 | `MONO_EP_SM100_BACKWARD_PRECISION` | `bf16` | | `mxfp8`: SM100 backward GEMMs (dh, z recompute, dx) as MXFP8 (E4M3, UE8M0 per 32 along K) with E4M3 x/dy over NVLink and dz quantized in the epilogue; the weight gradients stay BF16 GEMMs on exact BF16 copies of the E4M3 x/dy. Not bitwise: about 6-7% relative error against an FP32 reference (BF16: 0.2%); the loss curve stayed within a tenth of the seed gap. Needs `hidden % 512 == 0`, `hidden <= 2048`. |
 | `MONO_EP_SM100_MXFP8_COMPILED_QUANT` | `1` | `0` (Triton builders) | Build the MXFP8 backward weight forms (W1, W2ᵀ, W1ᵀ) in one Inductor graph; bitwise equal to the Triton path. |
 | `MONO_EP_SM100_BACKWARD_OPTIONS` | `11` | `0` | SM100 backward epilogue option bits (staged pool stores, two-row pulls); bits 512 and 1024 are set by `MONO_EP_SM100_INKERNEL_DW` and `_WIDE`, bit 2048 by `MONO_EP_SM100_BACKWARD_PRECISION=mxfp8` (which requires bit 1 and excludes 4, 16 and 64); the two features do not combine. |
@@ -117,7 +140,27 @@ before it was made the default; setting that value restores the previous behavio
 | `MONO_EP_NVFP4_REQUANT_FFMA2` | `1` | `0` | Paired FP32 FMA (FFMA2) in the CUDA requant's delta math; `0` builds the scalar variant, 2-6% slower. |
 | `MONO_EP_NVFP4_LORA_WGRAD` | unset (grouped GEMMs) | `loop` (per-expert reference loop) | LoRA adapter weight gradients of the NVFP4 path. Python-side. |
 | `MONO_EP_NVFP4_REQUANT_VERBOSE`, `MONO_EP_SM100_NVFP4_PHASE_TRACE` | unset | | Diagnostics: CUDA requant build log, NVFP4 forward phase trace. |
-| `MONO_EP_SM90_FP8_TRAP_TIMEOUTS`, `*_PHASE_TRACE`, `*_DIST_TRACE`, `*_DIAG_ABLATE` | unset | | Diagnostics: trap-only timeouts for compiler experiments, per-phase and per-rank traces, epilogue ablations. Not for training. |
+| `MONO_EP_SM90_FP8_TRAP_TIMEOUTS`, `*_PHASE_TRACE`, `*_DIST_TRACE`, `*_DIAG_ABLATE` | unset | | Diagnostics: trap-only timeouts for compiler experiments, per-phase and per-rank traces, epilogue ablations. Not for training. By name: `MONO_EP_SM90_FP8_PHASE_TRACE`, `MONO_EP_SM90_FP8_FORWARD_PHASE_TRACE`, `MONO_EP_SM90_FP8_DIST_TRACE`, `MONO_EP_SM90_FP8_FORWARD_DIST_TRACE`, `MONO_EP_SM90_FP8_DIAG_ABLATE`, `MONO_EP_SM90_FP8_FORWARD_DIAG_ABLATE`, `MONO_EP_SM100_PHASE_TRACE`, `MONO_EP_SM100_FORWARD_PHASE_TRACE`, `MONO_EP_SM100_DIAG_ABLATE`, `MONO_EP_SM100_FORWARD_DIAG_ABLATE`. |
 
 Every kernel selector is part of the JIT key, so changing one compiles a new kernel variant under
 `DG_JIT_CACHE_DIR`; the selectors marked Python-side change only host code.
+
+## Troubleshooting
+
+- **The first step takes minutes.** Every kernel variant compiles on first use and is cached
+  under `DG_JIT_CACHE_DIR`; point it at a persistent, shared directory so later runs and other
+  ranks reuse the builds. Changing a kernel selector or the layer shape compiles a new variant.
+- **A hang, then `DeepGEMM grid sync timeout` or `DeepGEMM combine peers timeout`.** The
+  persistent kernels occupy every SM they are given; a NCCL collective that needs more CTAs than
+  the reserved SMs hold waits behind them. Export `nccl_env(reserved_sms=...)` (or let the
+  Axolotl plugin do it) before the process group is created, keep `NCCL_MAX_CTAS` at or below
+  `reserved_sms // 2`, and raise `reserved_sms` if FSDP collectives still stall; the four-GPU
+  `dp_shard 2 x EP 2` mesh on B200 needed 24. `check_nccl_env` raises early when the variable
+  is missing or too large.
+- **`expert_parallel_backend=mono_ep is unsupported here: <reason>. Falling back to
+  expert_parallel_backend=torch ...`** The model or config hits a fallback condition (table
+  above). Set `expert_parallel_fallback_on_unsupported: false` to raise instead, or
+  `expert_parallel_mono_ep_mode: dispatch` when only the fused mode is excluded (LoRA,
+  quantized experts, biases, other activations).
+- **Restoring a previous default.** Every selector above lists the value that restores the
+  behaviour before its current default; set it in the environment of every rank.
