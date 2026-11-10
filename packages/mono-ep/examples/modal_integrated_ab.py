@@ -166,15 +166,18 @@ def _summarize(result):
             continue
         for variant, value in run["diag"]["results"].items():
             entry = summary.setdefault(
-                f"{run['tree']}/{variant}", dict(samples_ms=[], parity_vs_ref=[])
+                f"{run['tree']}/{variant}",
+                dict(samples_ms=[], call_samples_ms=[], parity_vs_ref=[]),
             )
             entry["samples_ms"].extend(value["samples_ms"])
+            entry["call_samples_ms"].extend(value.get("call_samples_ms", []))
             entry["parity_vs_ref"].append(
                 dict(round=run["round"], parity=value.get("parity_vs_ref"))
             )
     for entry in summary.values():
         entry["samples"] = len(entry["samples_ms"])
         entry["median_ms"] = _median(entry["samples_ms"])
+        entry["call_median_ms"] = _median(entry["call_samples_ms"])
     return summary
 
 
@@ -232,7 +235,7 @@ def main(
                     modal_app_id=result["modal_app_id"],
                     medians={
                         f"{c['direction']}/{c['routing']}": {
-                            k: (v["median_ms"], v["samples"])
+                            k: (v["median_ms"], v["call_median_ms"], v["samples"])
                             for k, v in c["summary"].items()
                         }
                         for c in result["configs"]
@@ -261,15 +264,18 @@ def main(
             continue
         for variant, value in run["diag"]["results"].items():
             entry = summary.setdefault(
-                f"{run['tree']}/{variant}", dict(samples_ms=[], parity_vs_ref=[])
+                f"{run['tree']}/{variant}",
+                dict(samples_ms=[], call_samples_ms=[], parity_vs_ref=[]),
             )
             entry["samples_ms"].extend(value["samples_ms"])
+            entry["call_samples_ms"].extend(value.get("call_samples_ms", []))
             entry["parity_vs_ref"].append(
                 dict(round=run["round"], parity=value.get("parity_vs_ref"))
             )
     for entry in summary.values():
         entry["samples"] = len(entry["samples_ms"])
         entry["median_ms"] = _median(entry["samples_ms"])
+        entry["call_median_ms"] = _median(entry["call_samples_ms"])
     result.update(
         direction=direction,
         routing=routing,

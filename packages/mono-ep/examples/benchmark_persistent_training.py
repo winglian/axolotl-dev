@@ -50,6 +50,162 @@ def _skewed_routing(tokens, experts, topk, rank):
     return (logits + gumbel).topk(topk, dim=-1).indices.contiguous()
 
 
+def _four_layer_stack(
+    operation,
+    runtime,
+    native_backend,
+    x,
+    ids,
+    scores,
+    dy,
+    shapes,
+    variant_envs,
+    bump,
+    world,
+):
+    """Four independent layers (own weights, shared runtime), each a checkpointed 2F+B, back to back.
+
+    Layer i's output (detached) is layer i+1's input, so every op boundary is visible to the host:
+    CUDA events and perf_counter stamps around each of the 4 forward and 4 backward calls give the
+    per-op GPU span, the host call time and the GPU idle gap between consecutive ops.
+    """
+    w1_shape, w2_shape = shapes
+    layers = [
+        (
+            (
+                torch.randn(w1_shape, device="cuda") / w1_shape[2] ** 0.5
+            ).requires_grad_(),
+            (
+                torch.randn(w2_shape, device="cuda") / w2_shape[2] ** 0.5
+            ).requires_grad_(),
+        )
+        for _ in range(4)
+    ]
+    managed = {key for _, env in variant_envs for key in env}
+    runtime._peer_backward = native_backend
+    gathered = torch.empty(world, device="cuda", dtype=torch.float64)
+    keys = ("wall", "gpu_span_sum", "gpu_gap_sum", "gpu_gap_max", "host_call_sum")
+    stats = {name: {k: [] for k in keys} for name, _ in variant_envs}
+    stats_mean = {name: {k: [] for k in keys} for name, _ in variant_envs}
+    per_op = {name: [] for name, _ in variant_envs}
+
+    def reduce(value, op):
+        dist.all_gather_into_tensor(
+            gathered, torch.tensor([value], device="cuda", dtype=torch.float64)
+        )
+        values = gathered.tolist()
+        return max(values) if op == "max" else statistics.mean(values)
+
+    for iteration in range(20):
+        order = variant_envs if iteration % 2 == 0 else variant_envs[::-1]
+        for name, env in order:
+            for key in managed:
+                os.environ.pop(key, None)
+            os.environ.update(env)
+            for tensor in (x, scores, *[w for layer in layers for w in layer]):
+                tensor.grad = None
+            if bump:
+                for layer in layers:
+                    for tensor in layer:
+                        torch.autograd.graph.increment_version(tensor)
+            dist.barrier()
+            torch.cuda.synchronize()
+            ops = []
+            start = time.perf_counter()
+
+            def timed(label, fn, ops=ops):
+                begin, end = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                h0 = time.perf_counter()
+                begin.record()
+                out = fn()
+                end.record()
+                ops.append((label, begin, end, (time.perf_counter() - h0) * 1000))
+                return out
+
+            inputs, outputs = [], []
+            for i, (w1, w2) in enumerate(layers):
+                xi = x if i == 0 else outputs[-1].detach().requires_grad_()
+                inputs.append(xi)
+                outputs.append(
+                    timed(
+                        f"forward{i}",
+                        lambda xi=xi, w1=w1, w2=w2: checkpoint(
+                            operation,
+                            xi,
+                            ids,
+                            scores,
+                            w1,
+                            w2,
+                            use_reentrant=False,
+                            preserve_rng_state=False,
+                        ),
+                    )
+                )
+            grad = dy
+            for i in reversed(range(4)):
+                timed(f"backward{i}", lambda y=outputs[i], grad=grad: y.backward(grad))
+                grad = inputs[i].grad
+            torch.cuda.synchronize()
+            wall = (time.perf_counter() - start) * 1000
+            spans = [b.elapsed_time(e) for _, b, e, _ in ops]
+            gaps = [ops[j][2].elapsed_time(ops[j + 1][1]) for j in range(len(ops) - 1)]
+            host = [h for *_, h in ops]
+            values = dict(
+                wall=wall,
+                gpu_span_sum=sum(spans),
+                gpu_gap_sum=sum(gaps),
+                gpu_gap_max=max(gaps),
+                host_call_sum=sum(host),
+            )
+            if iteration >= 5:
+                for k, v in values.items():
+                    stats[name][k].append(reduce(v, "max"))
+                    stats_mean[name][k].append(reduce(v, "mean"))
+                if dist.get_rank() == 0:
+                    per_op[name].append(
+                        dict(
+                            labels=[label for label, *_ in ops],
+                            gpu_span_ms=spans,
+                            gpu_gap_after_ms=gaps,
+                            host_call_ms=host,
+                        )
+                    )
+            del inputs, outputs
+    for key in managed:
+        os.environ.pop(key, None)
+
+    def med(samples):
+        return {k: statistics.median(v) for k, v in samples.items()}
+
+    def op_medians(records):
+        labels = records[0]["labels"]
+        return {
+            field: {
+                label: statistics.median(r[field][j] for r in records)
+                for j, label in enumerate(labels[: len(records[0][field])])
+            }
+            for field in ("gpu_span_ms", "gpu_gap_after_ms", "host_call_ms")
+        }
+
+    return dict(
+        layers=4,
+        scope="per layer: checkpointed 2F+B; 4 forwards then 4 backwards, detached hand-off",
+        warmup_iterations=5,
+        measured_iterations=15,
+        max_rank_median_ms={n: med(stats[n]) for n in stats},
+        mean_rank_median_ms={n: med(stats_mean[n]) for n in stats_mean},
+        per_layer_wall_max_rank_median_ms={
+            n: statistics.median(stats[n]["wall"]) / 4 for n in stats
+        },
+        rank0_per_op_median_ms={n: op_medians(per_op[n]) for n in per_op if per_op[n]},
+        bump_versions_every_step=bump,
+        weight_cache_entries=os.getenv("MONO_EP_WEIGHT_CACHE_ENTRIES", "2"),
+    )
+
+
 def run(
     profile=False,
     compute_dtype="bf16",
@@ -66,8 +222,11 @@ def run(
     compare_kernel_layouts=False,
     variants="",
     routing="balanced",
+    bump_versions=False,
+    four_layer_variants="",
 ):
     variant_envs = _parse_variants(variants)
+    four_layer_envs = _parse_variants(four_layer_variants)
     if variant_envs and (not compare_native or compare_kernel_layouts or profile):
         raise ValueError("Variant lists apply to native timing only")
     if compare_forward_layouts and compare_kernel_layouts:
@@ -302,6 +461,10 @@ def run(
                 runtime._peer_backward.owned_blocks = owned
             for tensor in (x, scores, w1, w2):
                 tensor.grad = None
+            if bump_versions:
+                # Stands in for an optimizer step: new weight versions, same values.
+                for tensor in (w1, w2):
+                    torch.autograd.graph.increment_version(tensor)
             y = operation(x, ids, scores, w1, w2) if scope == "backward" else None
             dist.barrier()
             torch.cuda.synchronize()
@@ -384,6 +547,24 @@ def run(
     captured.clear()
     for key in managed_env:
         os.environ.pop(key, None)
+    four_layer = None
+    if four_layer_envs:
+        try:
+            four_layer = _four_layer_stack(
+                operation,
+                runtime,
+                native_backend,
+                x,
+                ids,
+                scores,
+                dy,
+                (w1.shape, w2.shape),
+                four_layer_envs,
+                bump_versions,
+                world,
+            )
+        except Exception as error:  # noqa: BLE001
+            four_layer = dict(error=repr(error))
     if not profile:
         memory_tensor = torch.tensor(
             list(peak_memory.values()), device="cuda", dtype=torch.int64
@@ -401,6 +582,8 @@ def run(
                     routing=routing,
                     variants={name: env for name, env in variant_envs},
                     variant_parity_first_measured_iteration=variant_parity,
+                    bump_versions_every_step=bump_versions,
+                    four_layer_stack=four_layer,
                     timeout_handler=(
                         "trap_only"
                         if os.getenv("MONO_EP_SM90_FP8_TRAP_TIMEOUTS") == "1"
@@ -653,6 +836,12 @@ if __name__ == "__main__":
         "--variants", default="", help="native env variants 'name:ENV=V+ENV2=V2,...'"
     )
     parser.add_argument("--routing", choices=("balanced", "skewed"), default="balanced")
+    parser.add_argument("--bump-versions", action="store_true")
+    parser.add_argument(
+        "--four-layer-variants",
+        default="",
+        help="native env variants for the four-layer stack 'name:ENV=V+...,...'",
+    )
     args = parser.parse_args()
     if args.compiled and not args.recompute:
         parser.error("Compiled timing requires recomputation")
@@ -725,4 +914,6 @@ if __name__ == "__main__":
         args.compare_kernel_layouts,
         args.variants,
         args.routing,
+        args.bump_versions,
+        args.four_layer_variants,
     )

@@ -238,8 +238,30 @@ def run(args):
         return _forward_impl(x, ids, scores, w1, w2, runtime)[0]
 
     results = {
-        name: dict(samples_ms=[], env=values) for name, values in variants.items()
+        name: dict(samples_ms=[], call_samples_ms=[], env=values)
+        for name, values in variants.items()
     }
+    call_intervals = []
+
+    def bump_versions():
+        # PROBE_BUMP_VERSIONS=1 stands in for an optimizer step (new weight versions, same values),
+        # so a weight cache misses on every call.
+        if os.environ.get("PROBE_BUMP_VERSIONS") == "1":
+            for tensor in (w1, w2):
+                torch.autograd.graph.increment_version(tensor)
+
+    def timed_call(fn):
+        bump_versions()
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        start.record()
+        out = fn()
+        end.record()
+        call_intervals.append((start, end))
+        return out
+
     reference = None
     deep_gemm._C.fp8_mono_ep_forward_sm90 = timed_native
     try:
@@ -248,7 +270,7 @@ def run(args):
                 set_env(values)
                 intervals.clear()
                 for _ in range(args.warmup):
-                    y = forward()
+                    y = timed_call(forward)
                 torch.cuda.synchronize()
                 if round_idx == 0:
                     y = y.clone()
@@ -268,9 +290,13 @@ def run(args):
                     results[name]["parity_vs_ref"] = compare_ref(name, y)
                 intervals.clear()
                 traces.clear()
+                call_intervals.clear()
                 for _ in range(args.iters):
-                    forward()
+                    timed_call(forward)
                 torch.cuda.synchronize()
+                results[name]["call_samples_ms"].extend(
+                    a.elapsed_time(b) for a, b in call_intervals
+                )
                 results[name]["samples_ms"].extend(
                     a.elapsed_time(b) for a, b in intervals
                 )
@@ -296,6 +322,7 @@ def run(args):
     for value in results.values():
         value["median_ms"] = _median(value["samples_ms"])
         value["samples"] = len(value["samples_ms"])
+        value["call_median_ms"] = _median(value["call_samples_ms"])
     print(
         "DIAG_JSON "
         + json.dumps(

@@ -36,6 +36,8 @@ def _benchmark(
     variants: str = "",
     routings: str = "",
     routing_override: str = "",
+    bump_versions: bool = False,
+    four_layer_variants: str = "",
 ):
     import torch
 
@@ -54,6 +56,8 @@ def _benchmark(
                     expected_gpu,
                     variants,
                     routing_override=routing,
+                    bump_versions=bump_versions,
+                    four_layer_variants=four_layer_variants,
                 ),
             )
             for routing in routings.split(",")
@@ -66,6 +70,7 @@ def _benchmark(
         )
 
     actual_gpu = torch.cuda.get_device_name()
+    print(f"device {actual_gpu}", flush=True)
     if expected_gpu not in actual_gpu:
         raise RuntimeError(f"Expected {expected_gpu}, allocated {actual_gpu}")
     if fp8_combine and not fp8_transport:
@@ -88,6 +93,12 @@ def _benchmark(
             *(["--compare-kernel-layouts"] if compare_kernel_layouts else []),
             *(["--variants", variants] if variants else []),
             *(["--routing", routing_override] if routing_override else []),
+            *(["--bump-versions"] if bump_versions else []),
+            *(
+                ["--four-layer-variants", four_layer_variants]
+                if four_layer_variants
+                else []
+            ),
         ],
         env={
             **os.environ,
@@ -129,6 +140,8 @@ def main(
     variants: str = "",
     routings: str = "",
     out: str = "",
+    bump_versions: bool = False,
+    four_layer_variants: str = "",
 ):
     """variants: native env variants 'name:ENV=V+ENV2=V2,...'; routings: e.g. 'balanced,skewed'."""
     if compare_forward_layouts and compare_kernel_layouts:
@@ -149,6 +162,8 @@ def main(
         trap_timeouts,
         variants=variants,
         routings=routings,
+        bump_versions=bump_versions,
+        four_layer_variants=four_layer_variants,
     )
     result["modal_app_id"] = os.environ.get("MODAL_APP_ID") or app.app_id
     if out:

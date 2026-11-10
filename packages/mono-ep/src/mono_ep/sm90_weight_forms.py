@@ -18,6 +18,13 @@ per-call quantizers.
 * ``forms``: cache, but build only the requested forms with the per-form kernels.
 
 The cache follows the invalidation contract of :mod:`mono_ep.weight_cache`.
+
+The transposed forms are quantized from a second, transposed read of the master block rather
+than from ``tl.trans`` of a tile: ptxas 12.9 (the assembler Triton 3.8 uses for pre-Blackwell
+targets) miscompiles the 8-bit layout conversion that a transpose of an e4m3 tile lowers to
+(see ``tests/test_triton_fp8_transpose.py``). The strides of those reads are hidden from
+Triton's axis analysis so the reads are not layout anchors and take the stores' layout; the
+cast then happens in the layout it is stored in and no 8-bit conversion remains.
 """
 
 import os
@@ -38,6 +45,14 @@ def _e4m3_scale(amax):
     exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
     exponent = tl.minimum(tl.maximum(exponent, 1), 254)
     return (exponent << 23).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _opaque(stride):
+    # hides the stride from axis analysis: a load through it is not a layout anchor
+    return tl.inline_asm_elementwise(
+        "mov.b32 $0, $1;", "=r,r", [stride], dtype=tl.int32, is_pure=True, pack=1
+    )
 
 
 @triton.jit
@@ -108,12 +123,16 @@ def _quantize_forms(
 
         sg = _e4m3_scale(tl.max(g_rows, 0))
         su = _e4m3_scale(tl.max(u_rows, 0))
-        gt = tl.trans(
-            tl.minimum(tl.maximum(g / sg, -448.0), 448.0).to(Q1T.dtype.element_ty)
+        base_t = (
+            W1
+            + expert * E1S
+            + cols[:, None] * _opaque(C1S)
+            + rows[None, :] * _opaque(R1S)
         )
-        ut = tl.trans(
-            tl.minimum(tl.maximum(u / su, -448.0), 448.0).to(Q1T.dtype.element_ty)
-        )
+        gT = tl.load(base_t).to(tl.float32)
+        uT = tl.load(base_t + INNER * R1S).to(tl.float32)
+        gt = tl.minimum(tl.maximum(gT / sg, -448.0), 448.0).to(Q1T.dtype.element_ty)
+        ut = tl.minimum(tl.maximum(uT / su, -448.0), 448.0).to(Q1T.dtype.element_ty)
         t_rows = (kb * 128 + r).to(tl.int64)[:, None]
         t_cols = (cb * 128 + c).to(tl.int64)[None, :]
         t_out = Q1T + expert * HIDDEN * (2 * INNER) + t_rows * (2 * INNER) + t_cols
@@ -135,9 +154,13 @@ def _quantize_forms(
         tl.store(
             Q2 + expert * HIDDEN * INNER + rows[:, None] * INNER + cols[None, :], q
         )
-        # Transposing the shared FP8 tile miscompiles (w2t bytes differ); transpose the FP32 tile.
-        wt = tl.trans(w)
-        qt = tl.minimum(tl.maximum(wt / s, -448.0), 448.0).to(Q2T.dtype.element_ty)
+        wT = tl.load(
+            W2
+            + expert * E2S
+            + cols[:, None] * _opaque(C2S)
+            + rows[None, :] * _opaque(R2S)
+        ).to(tl.float32)
+        qt = tl.minimum(tl.maximum(wT / s, -448.0), 448.0).to(Q2T.dtype.element_ty)
         t_rows = (cb * 128 + r).to(tl.int64)[:, None]
         t_cols = (rb * 128 + c).to(tl.int64)[None, :]
         tl.store(Q2T + expert * INNER * HIDDEN + t_rows * HIDDEN + t_cols, qt)
@@ -156,6 +179,8 @@ def _fusable(w1, w2):
         and w1.dtype in (torch.bfloat16, torch.float32)
         and w2.dtype in (torch.bfloat16, torch.float32)
         and all(s > 0 for s in (*w1.stride(), *w2.stride()))
+        # the row/column strides pass through a 32-bit inline-asm move in the kernel
+        and all(s < 2**31 for s in (*w1.stride()[1:], *w2.stride()[1:]))
     )
 
 
