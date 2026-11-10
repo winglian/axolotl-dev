@@ -51,6 +51,17 @@ class TestMonoEPValidation:
         _validate(min_base_cfg, plugins=plugins, **extra)
         assert "local experts kernel" in warnings() and ignored in warnings()
 
+    def test_bounded_needs_compact(self, min_base_cfg):
+        with pytest.raises(ValueError, match="needs expert_parallel_mono_ep_compact"):
+            _validate(min_base_cfg, expert_parallel_mono_ep_bounded=True)
+        cfg = _validate(
+            min_base_cfg,
+            expert_parallel_mono_ep_mode="dispatch",
+            expert_parallel_mono_ep_compact=True,
+            expert_parallel_mono_ep_bounded=True,
+        )
+        assert cfg.expert_parallel_mono_ep_bounded
+
     def test_warns_dispatch_chunks_ignored(self, min_base_cfg, warnings):
         _validate(min_base_cfg, expert_parallel_dispatch_chunks=2)
         assert "dispatch_chunks is ignored" in warnings()

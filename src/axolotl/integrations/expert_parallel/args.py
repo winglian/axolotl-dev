@@ -48,6 +48,13 @@ class ExpertParallelArgs(BaseModel):
     checkpointing like the torch backend's split counts); smaller receive buffers and
     less row-count-sized work in the local kernel."""
 
+    expert_parallel_mono_ep_bounded: bool = False
+    """With ``expert_parallel_mono_ep_compact``: receive into a bound from each layer's
+    high-water routed count (filled to SonicMoE's own row bucket) and read the count only
+    after the local kernel was issued, so the dispatch never stalls the stream on it.
+    Outputs and gradients are bitwise those of the compact rows; a count above the bound
+    re-runs that layer exactly."""
+
     expert_parallel_mono_ep_precision: Literal[
         "auto", "bf16", "mxfp8", "fp8", "fp8_bwd"
     ] = "auto"
@@ -97,6 +104,14 @@ class ExpertParallelArgs(BaseModel):
             raise ValueError(
                 f"expert_parallel_token_capacity must be >= 1 when set "
                 f"(got {self.expert_parallel_token_capacity!r}). Use None to disable the cap."
+            )
+
+        if (
+            self.expert_parallel_mono_ep_bounded
+            and not self.expert_parallel_mono_ep_compact
+        ):
+            raise ValueError(
+                "expert_parallel_mono_ep_bounded needs expert_parallel_mono_ep_compact: true"
             )
 
         if self.expert_parallel_size > 1 and self.expert_parallel_num_rdma_bytes != 0:

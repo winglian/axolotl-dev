@@ -771,12 +771,16 @@ class ExpertParallelPlugin(BasePlugin):
         if self.__dict__.get("_mono_ep_runtime") is not None:
             return
         compact = bool(getattr(cfg, "expert_parallel_mono_ep_compact", False))
+        bounded = compact and bool(
+            getattr(cfg, "expert_parallel_mono_ep_bounded", False)
+        )
         runtime = MonoEPDispatchRuntime(
             group=self._resolve_ep_group(cfg),
             max_tokens_per_rank=self._mono_ep_tokens_per_rank(cfg),
             top_k=geometry.top_k,
             hidden=geometry.hidden,
             compact=compact,
+            bounded=bounded,
         )
         self._mono_ep_runtime = runtime
         set_mono_ep_runtime(runtime)
@@ -791,7 +795,8 @@ class ExpertParallelPlugin(BasePlugin):
         LOG.info(
             f"expert_parallel: mono_ep peer dispatch runtime, "
             f"{runtime.max_tokens_per_rank} tokens/rank, {runtime.receive_rows} receive "
-            f"rows ({'routed rows only' if compact else 'fixed layout'}), "
+            f"rows ({'routed rows only' if compact else 'fixed layout'}"
+            f"{', bounded receive' if bounded else ''}), "
             f"top-{geometry.top_k}, hidden {geometry.hidden}"
         )
 

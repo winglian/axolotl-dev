@@ -759,8 +759,11 @@ class TestRuntimeLifecycle:
         assert _FakeDispatchRuntime.instances == []
 
     @pytest.mark.parametrize("save_dispatch", [False, True])
+    @pytest.mark.parametrize(
+        "compact,bounded", [(False, False), (True, False), (True, True)]
+    )
     def test_dispatch_runtime_lifecycle(
-        self, monkeypatch, mono_ep_package, save_dispatch
+        self, monkeypatch, mono_ep_package, save_dispatch, compact, bounded
     ):
         from torch.utils.checkpoint import CheckpointPolicy
 
@@ -773,6 +776,8 @@ class TestRuntimeLifecycle:
         cfg = _cfg(
             expert_parallel_mono_ep_mode="dispatch",
             expert_parallel_save_dispatch=save_dispatch,
+            expert_parallel_mono_ep_compact=compact,
+            expert_parallel_mono_ep_bounded=bounded,
             activation_checkpointing={"enabled": False},
         )
         plugin = ExpertParallelPlugin()
@@ -785,6 +790,8 @@ class TestRuntimeLifecycle:
             "max_tokens_per_rank": 2000,  # no kernel token alignment in dispatch mode
             "top_k": 2,
             "hidden": 512,
+            "compact": compact,
+            "bounded": bounded,
         }
         assert experts_fn.get_mono_ep_runtime() is runtime
         for name in ("mono_ep::peer_dispatch", "mono_ep::peer_combine"):
