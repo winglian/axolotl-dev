@@ -459,6 +459,8 @@ same hardware (ratio below 1 is faster):
 | 235B-A22B | backward | 21.124 | 24.6 | 0.859 | 90.498 |
 | 235B-A22B | checkpointed 2F+B | 37.333 | 43.7 | 0.854 | 107.124 |
 
+Run ap-V06KM1a7K9KSAOsvOo4CU4 (one allocation, `NVIDIA H200` asserted in-process).
+
 Skewed routing (one rank owns the hot experts) costs 26% on the 30B 2F+B (15.504 ms) and
 28% on the 235B 2F+B (47.799 ms) on the same build; the NCCL control moves by 5-8%.
 
@@ -472,6 +474,10 @@ Skewed routing (one rank owns the hot experts) costs 26% on the 30B 2F+B (15.504
 | round 4 (this tree's SM90 defaults) | 3.385 | 7.036 | 12.998 | 49.647 |
 | this branch, gate run | 3.458 | 7.266 | 13.021 | 49.616 |
 
+Runs, top to bottom: ap-optFhUPUcC5ywxp9zJPPRe, ap-EsrRmakdPLt73RGAS69kK4,
+ap-ICtWLrsXD20dMONnCSd4Nz, ap-9N7kM7V67pDfcDRXl81ZP5, ap-05NnV2Ph9NslFfBVYrnbLq. Skewed
+routing on the gate run: 4.028 / 8.996 / 16.198 ms, control 52.146 (ap-tsjPCzmlgpvljSIRdiLOVi).
+
 8xB200, 30B-A3B, BF16, balanced, max-rank median ms, weight versions bumped every iteration:
 
 | Build | Forward | Backward | Checkpointed 2F+B | Peer control | NCCL control |
@@ -481,15 +487,23 @@ Skewed routing (one rank owns the hot experts) costs 26% on the 30B 2F+B (15.504
 | round 2 | 2.137 | 4.256 | 7.845 | 17.260 | 24.537 |
 | round 3 (this tree's SM100 defaults) | 2.112 | 4.138 | 7.659 | 17.196 | 24.531 |
 | round 3 with 16 reserved SMs (the FSDP2 setting) | 2.114 | 4.272 | 7.823 | 17.391 | 24.670 |
+| this branch, gate run | 2.098 | 4.172 | 7.660 | 17.046 | 24.242 |
+
+Runs, top to bottom: ap-6Js1FDCUJz1HfsUbBOqL3b, ap-PFK8nCymI9bow1IChnsdrD,
+ap-VBok02Nuf6psSFDeShXEHF, ap-rxwVgU6xxIwEFdt6fNcX3o (both round-3 rows),
+ap-afG15T7ayDA5cPEJnqpPcC.
 
 What these do not measure: the H100 and B200 rows are not hardware- or precision-matched
 with the prime-rl H200 FP8 figure; the controls share the persistent forward, so they are
 not prime-rl's complete baseline; absolute timings move by up to 16% between allocations of
 the same GPU type, so rows from different allocations are reproductions rather than A/Bs;
 and these are layer timings, not end-to-end training throughput. Correctness rests on the
-two-GPU FP32-reference and FP8-combine validators, the four-GPU FSDP2 weight-cache contract
-test with optimizer steps, the bitwise parity of every default against its restore value,
-and the Axolotl parity test (`tests/e2e/multigpu/test_ep_mono_ep.py`); long-training
+two-GPU FP32-reference and FP8-combine validators (ap-VN6mzQm22BwbfnE68DZ5rO,
+ap-wufiJKL44xoazIZkfVaBQv, ap-gK4emj87Im7xQLO4dvCUXF on 2xH100), the four-GPU FSDP2
+weight-cache contract test with optimizer steps (ap-TCBnqZV1beO55aH6SDxtBO on 4xH100,
+ap-mkqekSW1wzK9nne3lsmOne on 4xB200 with 24 reserved SMs), the bitwise parity of every
+default against its restore value, and the Axolotl parity test
+(`tests/e2e/multigpu/test_ep_mono_ep.py`); long-training
 convergence has only the round-2a loss-curve check (2xH100, 739M Qwen3-MoE, 300 steps, two
 seeds).
 
