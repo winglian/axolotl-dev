@@ -20,7 +20,7 @@ import time
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn
+from torch.distributed._functional_collectives import all_to_all_single_autograd
 from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -88,6 +88,13 @@ class Fp4CuteMergedExperts(torch.autograd.Function):
         )
 
 
+def _a2a(t, output_splits, input_splits):
+    out = all_to_all_single_autograd(
+        t.contiguous(), output_splits, input_splits, dist.group.WORLD
+    )
+    return out.wait() if hasattr(out, "wait") else out
+
+
 class Fp4CuteA2A:
     """torch all-to-all EP dispatch/combine around :class:`Fp4CuteMergedExperts`."""
 
@@ -130,7 +137,7 @@ class Fp4CuteA2A:
         send_splits = counts.view(world, local).sum(1).tolist()
         recv_splits = recv_counts.view(world, local).sum(1).tolist()
         xs = x.index_select(0, tok)
-        xr = dist_nn.all_to_all_single(xs, recv_splits, send_splits)
+        xr = _a2a(xs, recv_splits, send_splits)
         exp_ids = (
             torch.arange(local, device=x.device)
             .repeat(world)
@@ -157,7 +164,7 @@ class Fp4CuteA2A:
         inv2 = torch.empty_like(order2)
         inv2[order2] = torch.arange(order2.numel(), device=x.device)
         yr = yg.index_select(0, pos).index_select(0, inv2)
-        ys = dist_nn.all_to_all_single(yr, send_splits, recv_splits)
+        ys = _a2a(yr, send_splits, recv_splits)
         weights = scores.reshape(-1).index_select(0, order).to(ys.dtype)
         return x.new_zeros(tokens, x.shape[1]).index_add(0, tok, ys * weights[:, None])
 
