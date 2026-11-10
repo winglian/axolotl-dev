@@ -170,6 +170,110 @@ class NativePersistentBackward:
             )
             self.padded_counts = torch.empty_like(self.starts)
         self.finished = None
+        self._mx = None
+
+    def precision(self):
+        """``MONO_EP_SM100_BACKWARD_PRECISION``: ``bf16`` (default) or ``mxfp8`` (SM100 BF16 runtimes)."""
+        value = os.getenv("MONO_EP_SM100_BACKWARD_PRECISION", "bf16")
+        if value not in ("bf16", "mxfp8"):
+            raise ValueError("MONO_EP_SM100_BACKWARD_PRECISION must be bf16 or mxfp8")
+        if value == "mxfp8" and (self.arch != 10 or self.blockwise):
+            raise ValueError(
+                "The MXFP8 persistent backward requires SM100 and a BF16 runtime"
+            )
+        return value
+
+    def _mx_resources(self):
+        """E4M3 transport buffers and pools, allocated on the first MXFP8 call (collective on the EP group)."""
+        if self._mx is not None:
+            return self._mx
+        import types
+
+        import deep_gemm
+
+        runtime = self.runtime
+        buffer = deep_gemm.get_symm_buffer_for_mono_ep(
+            self.group,
+            runtime.experts,
+            runtime.max_tokens,
+            runtime.topk,
+            runtime.hidden,
+            runtime.intermediate,
+            mma_type="fp8xbf16",
+        )
+        capacity = buffer.num_max_tokens_per_rank
+        if capacity != self.buffer.num_max_tokens_per_rank:
+            raise RuntimeError(
+                "MXFP8 transport buffer capacity differs from the BF16 one"
+            )
+        dy, dy_pointers = self._allocate(
+            (capacity, runtime.hidden), torch.float8_e4m3fn
+        )
+        dy_sf, dy_sf_pointers = self._allocate(
+            (capacity, runtime.hidden // 128), torch.int32
+        )
+        rows = self.world * capacity * runtime.topk + self.experts * 128
+        if self.pools[0].shape[0] != rows:
+            raise RuntimeError("MXFP8 scale pools must span the BF16 pools")
+        device = self.dy.device
+        pools = [
+            torch.zeros(rows, width, device=device, dtype=torch.float8_e4m3fn)
+            for width in (runtime.hidden, runtime.hidden, 2 * runtime.intermediate)
+        ] + [
+            torch.zeros(width // 128, rows, device=device, dtype=torch.int32)
+            for width in (runtime.hidden, runtime.hidden, 2 * runtime.intermediate)
+        ]
+        self._mx = types.SimpleNamespace(
+            buffer=buffer,
+            dy=dy,
+            dy_pointers=dy_pointers,
+            dy_sf=dy_sf,
+            dy_sf_pointers=dy_sf_pointers,
+            pools=pools,
+        )
+        return self._mx
+
+    def _backward_mxfp8(self, dy, x, indices, scores, w1, w2):
+        import deep_gemm
+
+        from .token_quantization import quantize_persistent_mxfp8_into
+        from .weight_cache import mxfp8_backward_weight_forms
+
+        mx = self._mx_resources()
+        tokens = x.shape[0]
+        quantize_persistent_mxfp8_into(
+            x.contiguous(), mx.buffer.x[:tokens], mx.buffer.x_sf[:tokens]
+        )
+        quantize_persistent_mxfp8_into(
+            dy.contiguous(), mx.dy[:tokens], mx.dy_sf[:tokens]
+        )
+        mx.buffer.topk_idx[:tokens].copy_(indices)
+        mx.buffer.topk_weights[:tokens].copy_(scores)
+        forms = mxfp8_backward_weight_forms(w1, w2)
+        dx = torch.empty_like(x)
+        ds = torch.empty_like(scores, dtype=torch.float32)
+        deep_gemm._C.mxfp8_mono_ep_backward(
+            dx,
+            ds,
+            *[f[0] for f in forms],
+            [f[1] for f in forms],
+            self.pools[:4] + mx.pools,
+            self.starts,
+            self.counts,
+            mx.buffer.buffer,
+            mx.buffer.handle.buffer_ptrs,
+            mx.dy,
+            mx.dy_pointers,
+            mx.dy_sf,
+            mx.dy_sf_pointers,
+            self.ds_partials,
+            self.ds_pointers,
+            self.rank,
+            mx.buffer.num_max_tokens_per_rank,
+            mx.buffer.l1_acts.shape[0],
+            self.runtime.topk,
+        )
+        return dx, ds
 
     def _allocate(self, shape, dtype):
         allocator = torch if self.world == 1 else symm_mem
@@ -200,6 +304,9 @@ class NativePersistentBackward:
         stream = torch.cuda.current_stream(x.device)
         if self.finished is not None:
             stream.wait_event(self.finished)
+        if self.arch == 10 and not self.blockwise and self.precision() == "mxfp8":
+            dx, ds = self._backward_mxfp8(dy, x, indices, scores, w1, w2)
+            return self._finish_bf16_sm100(dx, ds, scores, stream)
         tokens = x.shape[0]
         from .sm90_prep import enabled as fused_prep
 
@@ -348,6 +455,16 @@ class NativePersistentBackward:
         else:
             dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)
             dw2 = weight_grad_bf16(dy_pool, h_pool, ends, None, self.experts, True)
+        self.finished = torch.cuda.Event()
+        self.finished.record(stream)
+        return dx, ds.to(scores.dtype), dw1, dw2
+
+    def _finish_bf16_sm100(self, dx, ds, scores, stream):
+        """SM100 BF16 weight gradients from the BF16 pools (the MXFP8 backward dequantizes x and dy into them)."""
+        x_pool, dy_pool, h_pool, dz_pool = self.pools[:4]
+        ends = self.starts + self.counts
+        dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)
+        dw2 = weight_grad_bf16(dy_pool, h_pool, ends, None, self.experts, True)
         self.finished = torch.cuda.Event()
         self.finished.record(stream)
         return dx, ds.to(scores.dtype), dw1, dw2

@@ -250,3 +250,44 @@ def quantize_transposed_weights(x, block_cols=32):
             enable_fp_fusion=False,
         )
     return values, scales
+
+
+def quantize_persistent_mxfp8_into(x, q_out, s_out):
+    """Quantize token rows into caller-owned E4M3 values and packed UE8M0 words (``[rows, cols / 128]``)."""
+    rows, cols = x.shape if x.ndim == 2 else (-1, -1)
+    if (
+        x.ndim != 2
+        or not x.is_cuda
+        or not x.is_contiguous()
+        or x.dtype not in (torch.bfloat16, torch.float32)
+        or cols % 128
+        or q_out.shape != x.shape
+        or q_out.dtype != torch.float8_e4m3fn
+        or not q_out.is_contiguous()
+        or s_out.shape != (rows, cols // 128)
+        or s_out.element_size() != 4
+        or s_out.stride(1) != 1
+        or s_out.stride(0) != cols // 128
+    ):
+        raise ValueError("invalid caller-owned MXFP8 token buffers")
+    if rows:
+        _quantize[(triton.cdiv(rows, 16), cols // 32)](
+            x,
+            q_out,
+            s_out,
+            rows,
+            cols,
+            cols // 32,
+            32,
+            16,
+            True,
+            False,
+            False,
+            cols // 128,
+            rows,
+            x,
+            False,
+            False,
+            enable_fp_fusion=False,
+        )
+    return q_out, s_out

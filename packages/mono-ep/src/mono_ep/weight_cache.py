@@ -377,3 +377,34 @@ def _storage_entry(w1, w2, with_pointer):
         dict(s1=weakref.ref(s1), s2=weakref.ref(s2), layouts={}),
         lambda v: v.get("s1") is not None and (v["s1"]() is s1 or v["s2"]() is s2),
     )
+
+
+MXFP8_BACKWARD_FORMS = ("sm100_mx_w1", "sm100_mx_w2t", "sm100_mx_w1t")
+
+
+def mxfp8_backward_weight_forms(w1, w2):
+    """E4M3 values and packed UE8M0 scales of the interleaved W1, W2^T and W1^T for the SM100 MXFP8 backward.
+
+    Scales run along each form's GEMM K (H for W1 and W2^T, 2I for W1^T); the forms share the
+    ``(w1, w2)`` cache entry, key and epoch of the BF16 layouts.
+    """
+    from .token_quantization import prepare_persistent_mxfp8
+
+    def build(missing):
+        built = {}
+        for name in missing:
+            if name == "sm100_mx_w1":
+                built[name] = prepare_persistent_mxfp8(
+                    w1.contiguous(), weights=True, interleave=True
+                )
+            else:
+                source = w2 if name == "sm100_mx_w2t" else w1
+                built[name] = prepare_persistent_mxfp8(
+                    source.transpose(1, 2).contiguous(), weights=True
+                )
+        return built
+
+    if _mode() != "1":
+        built = build(MXFP8_BACKWARD_FORMS)
+        return tuple(built[name] for name in MXFP8_BACKWARD_FORMS)
+    return cached_weight_forms(w1, w2, MXFP8_BACKWARD_FORMS, build)

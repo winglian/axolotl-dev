@@ -114,6 +114,11 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_shared_l2_weights);
     }
 
+    // 2048: MXFP8 GEMM operands (E4M3 values, UE8M0 scales per 32 K elements; dh, z recompute and dx run as
+    // kind::mxf8f6f4). x and dy travel over NVLink as MXFP8; the dispatch warps store the E4M3 pools and their
+    // scales and dequantize BF16 copies for the unchanged BF16 weight-gradient GEMMs; dz is quantized in the epilogue.
+    constexpr bool kMXFP8 = kOptions & 2048u;
+
     // Workspaces and Buffer
     const auto buffer = layout::MonoEPBuffer(
         sym_buffer.get_base_ptr(),
@@ -122,15 +127,16 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         kNumMaxTokensPerRank, kNumTopk,
         kNumRingTokens, 0,
         /*with_sf=*/ false,
-        kNumSharedExperts
+        kNumSharedExperts,
+        /*fp8_l1_only=*/ kMXFP8
     );
     const auto workspace = buffer.workspace;
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
 
     // Data types
-    using a_dtype_t = cutlass::bfloat16_t;
-    using b_dtype_t = cutlass::bfloat16_t;
+    using a_dtype_t = cute::conditional_t<kMXFP8, cutlass::float_e4m3_t, cutlass::bfloat16_t>;
+    using b_dtype_t = cute::conditional_t<kMXFP8, cutlass::float_e4m3_t, cutlass::bfloat16_t>;
     using d_dtype_t = cutlass::bfloat16_t;
 
     // MMA configs
@@ -138,8 +144,9 @@ sm100_bf16_mono_ep_backward_impl(void* y,
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
     constexpr uint32_t UMMA_N = BLOCK_M;  // Swap AB
-    constexpr uint32_t UMMA_BLOCK_K = 64;
-    constexpr uint32_t UMMA_K = 16;
+    constexpr uint32_t UMMA_BLOCK_K = kMXFP8 ? 128 : 64;
+    constexpr uint32_t UMMA_K = kMXFP8 ? 32 : 16;
+    DG_STATIC_ASSERT(not kMXFP8 or (BLOCK_K == 128 and BLOCK_M == 128), "MXFP8 backward uses 128 x 128 operand tiles");
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
@@ -173,6 +180,8 @@ sm100_bf16_mono_ep_backward_impl(void* y,
     constexpr auto kDispatchLoadHint = (kOptions & 256u) ?
         cute::TMA::CacheHintSm100::EVICT_NORMAL : cute::TMA::CacheHintSm100::EVICT_FIRST;
     DG_STATIC_ASSERT(not kEvictFirstHStores or kStagedPoolStores, "Evict-first h stores need the staged stores");
+    DG_STATIC_ASSERT(not kMXFP8 or (kStagedPoolStores and not (kOptions & 4u) and not kLookaheadPull),
+                     "MXFP8 needs the staged pool stores, two TMEM stages and its own pull loop");
 
     // Epilogue configs
     constexpr uint32_t kNumEpilogueStages = (kOptions & 4u) ? 4 : 2;
@@ -192,7 +201,11 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
     // Tensor memory size
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
-    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols>();
+    // MXFP8: one 128-row UTCCP block of scale factors per operand after the accumulators
+    constexpr uint32_t kNumSFTmemCols = kMXFP8 ? 4 : 0;
+    constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
+    constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFTmemCols;
+    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + 2 * kNumSFTmemCols>();
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
     // Assign shared memory
@@ -220,12 +233,23 @@ sm100_bf16_mono_ep_backward_impl(void* y,
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
+    // MXFP8 scale-factor stages (SFA then SFB, 128 packed UE8M0 words each) follow the shared storage
+    constexpr uint32_t kNumSFWordsPerStage = 128;
+    constexpr uint32_t kSFSmemOffset = math::constexpr_align<uint32_t>(static_cast<uint32_t>(sizeof(SharedStorage)), kSharedMemoryAlignment);
+    constexpr uint32_t kNumSmemBytes = kMXFP8 ? kSFSmemOffset + 2 * kNumStages * kNumSFWordsPerStage * sizeof(uint32_t) :
+        static_cast<uint32_t>(sizeof(SharedStorage));
+    const auto smem_sfa = [&](const uint32_t& stage) {
+        return reinterpret_cast<uint32_t*>(smem_buffer + kSFSmemOffset) + stage * kNumSFWordsPerStage;
+    };
+    const auto smem_sfb = [&](const uint32_t& stage) {
+        return reinterpret_cast<uint32_t*>(smem_buffer + kSFSmemOffset) + (kNumStages + stage) * kNumSFWordsPerStage;
+    };
     if constexpr (kNumStages > 2) {
-        DG_STATIC_ASSERT(sizeof(SharedStorage) <= 232448, "Shared storage exceeds the SM100 opt-in capacity");
+        DG_STATIC_ASSERT(kNumSmemBytes <= 232448, "Shared storage exceeds the SM100 opt-in capacity");
         // Deeper opt-in pipelines size shared memory on the host; refuse to run past the allocation.
         uint32_t dynamic_smem_bytes;
         asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dynamic_smem_bytes));
-        if (sizeof(SharedStorage) > dynamic_smem_bytes)
+        if (kNumSmemBytes > dynamic_smem_bytes)
             asm volatile("trap;");
     }
 
@@ -501,98 +525,229 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         const uint64_t trace_pull_start = trace_clock();
         uint64_t trace_ring_wait = 0, trace_copy = 0, trace_rows = 0;
-        if constexpr (kLookaheadPull) {
+        // Row-at-a-time pull loops with the next row resolved while this one is in flight
+        if constexpr (kMXFP8 or kLookaheadPull) {
+        struct PullRow {
+            const void* src_x;
+            const void* src_dy;
+            float weight;
+            uint32_t pool_token_idx;
+            uint32_t rank;
+            uint32_t src_token_idx;
+            uint32_t src_topk_idx;
+            bool is_last_token;
+        };
+        const auto resolve = [&](const uint32_t& token_idx, PullRow& row) -> bool {
+            int old_expert_idx = current_expert_idx;
+            while (token_idx >= expert_end_idx) {
+                if (++ current_expert_idx >= kNumExpertsPerRank)
+                    break;
+                expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
+                expert_start_idx = expert_end_idx;
+                expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
+            }
+            if (current_expert_idx >= kNumExpertsPerRank)
+                return false;
+            if (old_expert_idx != current_expert_idx) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    stored_rank_count[i] = j < kNumRanks ?
+                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
+                }
+            }
+            uint32_t current_rank_in_expert_idx = 0;
+            uint32_t remaining[kNumRanksPerLane];
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                remaining[i] = stored_rank_count[i];
+            uint32_t offset = 0;
+            const uint32_t token_idx_in_expert = token_idx - expert_start_idx;
+            uint32_t slot_idx = token_idx_in_expert;
+            uint32_t token_idx_in_rank = 0;
+            while (true) {
+                uint32_t num_actives_in_lane = 0;
+                uint32_t min_in_lane = 0xffffffff;
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                    num_actives_in_lane += remaining[i] > 0;
+                    if (remaining[i] > 0)
+                        min_in_lane = cute::min(min_in_lane, remaining[i]);
+                }
+                const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
+                const uint32_t length = __reduce_min_sync(0xffffffff, min_in_lane);
+                const uint32_t num_round_tokens = length * num_active_ranks;
+                if (slot_idx < num_round_tokens) {
+                    const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
+                    uint32_t num_seen_ranks = 0;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        const uint32_t mask = __ballot_sync(0xffffffff, remaining[i] > 0);
+                        const uint32_t num_active_lanes = __popc(mask);
+                        if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
+                            current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
+                        num_seen_ranks += num_active_lanes;
+                    }
+                    token_idx_in_rank = offset + (slot_idx / num_active_ranks);
+                    break;
+                }
+                slot_idx -= num_round_tokens;
+                offset += length;
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                    remaining[i] -= cute::min(remaining[i], length);
+            }
+            const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
+                current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+            row.src_token_idx = src_token_topk_idx / kNumTopk;
+            row.src_topk_idx = src_token_topk_idx % kNumTopk;
+            row.rank = current_rank_in_expert_idx;
+            row.pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+            row.is_last_token = token_idx == expert_end_idx - 1;
+            row.src_x = sym_buffer.map(
+                buffer.input_token_buffer.get_data_buffer(row.src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+            if constexpr (kMXFP8) {
+                row.src_dy = backward.dy.map(
+                    backward.dy.get_base_ptr<uint8_t*>() + static_cast<uint64_t>(row.src_token_idx) * kHidden,
+                    current_rank_in_expert_idx);
+            } else {
+            row.src_dy = backward.dy.map(
+                backward.dy.get_base_ptr<__nv_bfloat16*>() + static_cast<uint64_t>(row.src_token_idx) * kHidden,
+                current_rank_in_expert_idx);
+            }
+            // Consumed only at publish, so the remote load overlaps the row copy
+            row.weight = *sym_buffer.map(
+                buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, current_rank_in_expert_idx);
+            return true;
+        };
+        if constexpr (kMXFP8) {
+            // E4M3 x and dy rows (one NVLink round trip per routed row) plus one packed UE8M0 word per 128 columns,
+            // fetched by one lane each; the next row's load is issued as soon as this row's buffer has been read.
+            constexpr uint32_t kRowBytes = kHidden;
+            constexpr uint32_t kNumSFWords = kHidden / 128;
+            DG_STATIC_ASSERT(kHidden % 512 == 0 and 2 * kNumSFWords <= 32, "MXFP8 transport needs hidden % 512 == 0 and hidden <= 2048");
+            DG_STATIC_ASSERT(kNumBytesPerPull == 2 * kRowBytes, "The MXFP8 pull buffer holds one x and one dy row");
+            DG_STATIC_ASSERT(not (kDiagAblate & 64u), "The copy ablation is BF16-only");
+            constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
+            constexpr uint32_t kSFPoolRows = kNumRanks * kNumMaxTokensPerRank * kNumTopk + kNumExpertsPerRank * 128;
+            const auto smem_x = pull_buffer.get_base_ptr();
+            const auto smem_dy = math::advance_ptr(smem_x, kRowBytes);
+            const auto issue = [&](const PullRow& row, uint32_t& sf_word) {
+                if (cute::elect_one_sync()) {
+                    ptx::tma_load_1d(smem_x, row.src_x, pull_mbarrier, kRowBytes, kDispatchLoadHint);
+                    ptx::tma_load_1d(smem_dy, row.src_dy, pull_mbarrier, kRowBytes, kDispatchLoadHint);
+                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, 2 * kRowBytes);
+                }
+                __syncwarp();
+                if (lane_idx < kNumSFWords) {
+                    sf_word = *sym_buffer.map(
+                        buffer.input_sf_buffer.get_data_buffer(row.src_token_idx).template get_base_ptr<uint32_t>() + lane_idx, row.rank);
+                } else if (lane_idx < 2 * kNumSFWords) {
+                    sf_word = *backward.dy_sf.map(
+                        backward.dy_sf.template get_base_ptr<uint32_t*>() + static_cast<uint64_t>(row.src_token_idx) * kNumSFWords +
+                        (lane_idx - kNumSFWords), row.rank);
+                }
+            };
+            uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
+            PullRow cur, next;
+            uint32_t cur_sf = 0, next_sf = 0;
+            bool has_cur = resolve(token_idx, cur);
+            if (has_cur)
+                issue(cur, cur_sf);
+            while (has_cur) {
+                token_idx += kNumGlobalWarps;
+                const bool has_next = resolve(token_idx, next);
+
+                // Ring slot wait for this row only (no other row of this warp is unpublished)
+                const uint32_t pool_token_idx = cur.pool_token_idx;
+                const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
+                const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
+                const uint64_t trace_ring0 = trace_clock();
+                if (l1_empty_count_target > 0) {
+                    const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                }
+                const uint64_t trace_copy0 = trace_clock();
+                trace_ring_wait += trace_copy0 - trace_ring0;
+                ++ trace_rows;
+
+                // Every lane reads the landed rows below
+                ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+                if (cute::elect_one_sync()) {
+                    ptx::tma_store_1d(backward.qx_pool + static_cast<uint64_t>(pool_token_idx) * kHidden, smem_x, kRowBytes);
+                    ptx::tma_store_1d(backward.qdy_pool + static_cast<uint64_t>(pool_token_idx) * kHidden, smem_dy, kRowBytes);
+                    cute::tma_store_arrive();
+                }
+                __syncwarp();
+
+                // Scale words into the UTCCP-ordered (MN-major, 4 x 32 transposed) pools the GEMM loaders read
+                const uint32_t sf_row = (pool_token_idx / 128) * 128 + (pool_token_idx % 32) * 4 + (pool_token_idx % 128) / 32;
+                if (lane_idx < 2 * kNumSFWords) {
+                    auto* sf_pool = reinterpret_cast<uint32_t*>(lane_idx < kNumSFWords ? backward.sx_pool : backward.sdy_pool);
+                    sf_pool[static_cast<uint64_t>(lane_idx % kNumSFWords) * kSFPoolRows + sf_row] = cur_sf;
+                }
+
+                // Exact BF16 copies (E4M3 times a power of two) for the BF16 weight-gradient GEMMs; 8 values per lane
+                // and step keep the dispatch warps inside their register budget
+                #pragma unroll 1
+                for (uint32_t step = 0; step < 2 * kRowBytes / (8 * 32); ++ step) {
+                    const uint32_t op = step / (kRowBytes / (8 * 32));
+                    const uint32_t chunk = (step % (kRowBytes / (8 * 32))) * 32 + lane_idx;
+                    const uint32_t word = __shfl_sync(0xffffffff, cur_sf, op * kNumSFWords + chunk / 16);
+                    const float scale = __uint_as_float(((word >> (((chunk / 4) % 4) * 8)) & 0xffu) << 23);
+                    const auto packed = *reinterpret_cast<const uint2*>(
+                        static_cast<const uint8_t*>(op == 0 ? smem_x : smem_dy) + chunk * 8);
+                    uint32_t out[4];
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 4; ++ j) {
+                        const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(
+                            static_cast<__nv_fp8x2_storage_t>(((j < 2 ? packed.x : packed.y) >> ((j % 2) * 16)) & 0xffffu), __NV_E4M3);
+                        const float2 value = __half22float2(*reinterpret_cast<const __half2*>(&raw));
+                        const auto bf16 = __float22bfloat162_rn(make_float2(value.x * scale, value.y * scale));
+                        out[j] = *reinterpret_cast<const uint32_t*>(&bf16);
+                    }
+                    *reinterpret_cast<uint4*>((op == 0 ? backward.x_pool : backward.dy_pool) +
+                        static_cast<uint64_t>(pool_token_idx) * kHidden + chunk * 8) = make_uint4(out[0], out[1], out[2], out[3]);
+                }
+
+                // The scale words were written by the generic proxy and are read by TMA
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+                __syncwarp();
+                if (cute::elect_one_sync())
+                    cute::tma_store_wait<0>();
+                __syncwarp();
+                if (has_next)
+                    issue(next, next_sf);
+
+                if (cute::elect_one_sync()) {
+                    ptx::tma_store_wait<0>();
+                    *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = cur.weight;
+                    *workspace.get_token_src_metadata_ptr(pool_token_idx) = {cur.rank, cur.src_token_idx, cur.src_topk_idx};
+                    ptx::red_add_rel(
+                        workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
+                        cur.is_last_token ? BLOCK_M - (pool_token_idx % BLOCK_M) : 1u);
+                }
+                __syncwarp();
+                const uint64_t trace_row_copy = trace_clock() - trace_copy0;
+                trace_copy += trace_row_copy;
+                if constexpr (kDistTrace) {
+                    if (lane_idx == 0) {
+                        const uint64_t arrival = trace_globaltimer();
+                        dist_add(8 + cur.rank, 1);
+                        dist_max(16 + cur.rank, ~arrival);
+                        dist_max(24 + cur.rank, arrival);
+                        dist_add(32 + cur.rank, trace_row_copy);
+                    }
+                }
+                cur = next;
+                cur_sf = next_sf;
+                has_cur = has_next;
+            }
+        } else {
             constexpr uint32_t kRowBytes = kHidden * sizeof(nv_bfloat16);
             DG_STATIC_ASSERT(kAsyncDispatchCopy and kNumBytesPerPull == 2 * kRowBytes,
                              "The lookahead pull needs whole x and dy rows in one pull buffer");
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-            struct PullRow {
-                const void* src_x;
-                const void* src_dy;
-                float weight;
-                uint32_t pool_token_idx;
-                uint32_t rank;
-                uint32_t src_token_idx;
-                uint32_t src_topk_idx;
-                bool is_last_token;
-            };
-            const auto resolve = [&](const uint32_t& token_idx, PullRow& row) -> bool {
-                int old_expert_idx = current_expert_idx;
-                while (token_idx >= expert_end_idx) {
-                    if (++ current_expert_idx >= kNumExpertsPerRank)
-                        break;
-                    expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
-                    expert_start_idx = expert_end_idx;
-                    expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
-                }
-                if (current_expert_idx >= kNumExpertsPerRank)
-                    return false;
-                if (old_expert_idx != current_expert_idx) {
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                        const uint32_t j = i * 32 + lane_idx;
-                        stored_rank_count[i] = j < kNumRanks ?
-                            static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
-                    }
-                }
-                uint32_t current_rank_in_expert_idx = 0;
-                uint32_t remaining[kNumRanksPerLane];
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
-                    remaining[i] = stored_rank_count[i];
-                uint32_t offset = 0;
-                const uint32_t token_idx_in_expert = token_idx - expert_start_idx;
-                uint32_t slot_idx = token_idx_in_expert;
-                uint32_t token_idx_in_rank = 0;
-                while (true) {
-                    uint32_t num_actives_in_lane = 0;
-                    uint32_t min_in_lane = 0xffffffff;
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                        num_actives_in_lane += remaining[i] > 0;
-                        if (remaining[i] > 0)
-                            min_in_lane = cute::min(min_in_lane, remaining[i]);
-                    }
-                    const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
-                    const uint32_t length = __reduce_min_sync(0xffffffff, min_in_lane);
-                    const uint32_t num_round_tokens = length * num_active_ranks;
-                    if (slot_idx < num_round_tokens) {
-                        const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
-                        uint32_t num_seen_ranks = 0;
-                        #pragma unroll
-                        for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                            const uint32_t mask = __ballot_sync(0xffffffff, remaining[i] > 0);
-                            const uint32_t num_active_lanes = __popc(mask);
-                            if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
-                                current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
-                            num_seen_ranks += num_active_lanes;
-                        }
-                        token_idx_in_rank = offset + (slot_idx / num_active_ranks);
-                        break;
-                    }
-                    slot_idx -= num_round_tokens;
-                    offset += length;
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
-                        remaining[i] -= cute::min(remaining[i], length);
-                }
-                const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
-                    current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
-                row.src_token_idx = src_token_topk_idx / kNumTopk;
-                row.src_topk_idx = src_token_topk_idx % kNumTopk;
-                row.rank = current_rank_in_expert_idx;
-                row.pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
-                row.is_last_token = token_idx == expert_end_idx - 1;
-                row.src_x = sym_buffer.map(
-                    buffer.input_token_buffer.get_data_buffer(row.src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
-                row.src_dy = backward.dy.map(
-                    backward.dy.get_base_ptr<__nv_bfloat16*>() + static_cast<uint64_t>(row.src_token_idx) * kHidden,
-                    current_rank_in_expert_idx);
-                // Consumed only at publish, so the remote load overlaps the row copy
-                row.weight = *sym_buffer.map(
-                    buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, current_rank_in_expert_idx);
-                return true;
-            };
             const auto smem_x = pull_buffer.get_base_ptr();
             const auto smem_dy = math::advance_ptr(smem_x, kRowBytes);
             const auto issue = [&](const PullRow& row) {
@@ -657,6 +812,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 cur = next;
                 has_cur = has_next;
             }
+        }
         } else
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
@@ -1009,9 +1165,17 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
                         tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
                     }
+                    if constexpr (kMXFP8) {
+                        // Both CTAs load the whole M-block's scales (the 2-CTA UTCCP reads each CTA's copy)
+                        const auto tensor_map_sfa_ptr = task_info.block_phase == sched::BlockPhase::BackwardDh ? &tensor_map_shared_l1_output :
+                            task_info.block_phase == sched::BlockPhase::BackwardDx ? &tensor_map_shared_l2_acts : &tensor_map_shared_l1_acts;
+                        tma::copy<BLOCK_M, 1, 0>(tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], smem_sfa(stage_idx),
+                                                 pool_block_idx * BLOCK_M, k_block_idx * (BLOCK_K / 128), 2);
+                    }
                     if (is_leader_cta) {
                         // Multicast
-                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_a[0]) * 2);
+                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                            sizeof(shared_storage.smem_a[0]) * 2 + (kMXFP8 ? kNumSFWordsPerStage * sizeof(uint32_t) * 2 : 0));
                     } else {
                         shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
@@ -1054,8 +1218,16 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 if (cute::elect_one_sync()) {
                     tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4, kWeightCacheHint>(
                         tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                    if constexpr (kMXFP8) {
+                        // Weight scales: [expert * K / 128][N] packed words, UTCCP-ordered along N
+                        const auto tensor_map_sfb_ptr = task_info.block_phase == sched::BlockPhase::BackwardDh ? &tensor_map_l1_output :
+                            task_info.block_phase == sched::BlockPhase::BackwardDx ? &tensor_map_shared_l2_weights : &tensor_map_shared_l1_weights;
+                        tma::copy<BLOCK_N, 1, 0>(tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], smem_sfb(stage_idx),
+                                                 n_idx, expert_idx * (shape_k / 128) + k_block_idx * (BLOCK_K / 128), 2);
+                    }
                     if (is_leader_cta) {
-                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_b[0]) * 2);
+                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                            sizeof(shared_storage.smem_b[0]) * 2 + (kMXFP8 ? kNumSFWordsPerStage * sizeof(uint32_t) * 2 : 0));
                     } else {
                         shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
@@ -1071,7 +1243,17 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         if (is_leader_cta) {
             // Make instruction descriptor
             // NOTES: always swap A/B
-            auto instr_desc = cute::UMMA::make_instr_desc<b_dtype_t, a_dtype_t, float, UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+            auto instr_desc = [] {
+                if constexpr (kMXFP8) {
+                    return cute::UMMA::make_instr_desc_block_scaled<b_dtype_t, a_dtype_t, float, cutlass::float_ue8m0_t,
+                                                                    UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+                } else {
+                    return cute::UMMA::make_instr_desc<b_dtype_t, a_dtype_t, float, UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+                }
+            }();
+            [[maybe_unused]] auto sf_desc = [] {
+                if constexpr (kMXFP8) return mma::sm100::make_sf_desc(nullptr); else return 0;
+            }();
 
             DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
             auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, UMMA_BLOCK_K, kSwizzleAMode>(shared_storage.smem_a[0], 0, 0);
@@ -1135,6 +1317,14 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     if (cute::elect_one_sync()) {
                         #pragma unroll
                         for (uint32_t umma_k_block_idx = 0; umma_k_block_idx < BLOCK_K / UMMA_BLOCK_K; ++ umma_k_block_idx) {
+                            if constexpr (kMXFP8) {
+                                // UTCCP copy SFA and SFB to TMEM
+                                using cute_utccp_t = cute::SM100_UTCCP_4x32dp128bit_2cta;
+                                mma::sm100::replace_smem_desc_addr(sf_desc, smem_sfa(stage_idx));
+                                cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA);
+                                mma::sm100::replace_smem_desc_addr(sf_desc, smem_sfb(stage_idx));
+                                cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB);
+                            }
                             // Issue UMMA
                             #pragma unroll
                             for (uint32_t k = 0; k < UMMA_BLOCK_K / UMMA_K; ++ k) {
@@ -1142,10 +1332,18 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                                     cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_desc_base_lo, umma_k_block_idx * UMMA_BLOCK_K * LOAD_BLOCK_M, k * UMMA_K);
                                 b_desc.lo = mma::sm100::advance_umma_desc_lo<
                                     cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, umma_k_block_idx * UMMA_BLOCK_K * LOAD_BLOCK_N, k * UMMA_K);
+                                if constexpr (kMXFP8) {
+                                    ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
+                                        b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                        k_block_idx > 0 or umma_k_block_idx > 0 or k > 0,
+                                        mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, k, k),
+                                        kTmemStartColOfSFB, kTmemStartColOfSFA);
+                                } else {
                                 ptx::SM100_MMA_F16BF16_2x1SM_SS::fma(
                                     b_desc, a_desc, accum_stage_idx * UMMA_N,
                                     k_block_idx > 0 or umma_k_block_idx > 0 or k > 0,
                                     static_cast<uint64_t>(static_cast<uint32_t>(instr_desc)) << 32);
+                                }
                             }
                         }
                     }
@@ -1353,6 +1551,42 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                                         }
                                     } else {
                                         *reinterpret_cast<float4*>(dst) = value;
+                                    }
+                                    if constexpr (kMXFP8) {
+                                        if (o > 0) {
+                                            // E4M3 dz for the dX GEMM: one UE8M0 scale per 32 columns (4 adjacent lanes)
+                                            const auto bf16 = reinterpret_cast<const nv_bfloat162*>(&value);
+                                            float2 f[4];
+                                            float amax = 0.0f;
+                                            #pragma unroll
+                                            for (uint32_t j = 0; j < 4; ++ j) {
+                                                f[j] = __bfloat1622float2(bf16[j]);
+                                                amax = fmaxf(amax, fmaxf(fabsf(f[j].x), fabsf(f[j].y)));
+                                            }
+                                            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+                                            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+                                            const uint32_t sf_exp = math::get_ue8m0_sf_exp(amax);
+                                            const float sf_inv = math::get_ue8m0_sf_inv<float>(sf_exp);
+                                            uint32_t q[2];
+                                            #pragma unroll
+                                            for (uint32_t j = 0; j < 2; ++ j) {
+                                                const uint32_t lo = __nv_cvt_float2_to_fp8x2(
+                                                    make_float2(f[2 * j].x * sf_inv, f[2 * j].y * sf_inv), __NV_SATFINITE, __NV_E4M3);
+                                                const uint32_t hi = __nv_cvt_float2_to_fp8x2(
+                                                    make_float2(f[2 * j + 1].x * sf_inv, f[2 * j + 1].y * sf_inv), __NV_SATFINITE, __NV_E4M3);
+                                                q[j] = lo | (hi << 16);
+                                            }
+                                            const uint32_t col = (o - 1) * kIntermediateHidden + n;
+                                            *reinterpret_cast<uint2*>(backward.qdz_pool + packed * (2 * kIntermediateHidden) + col) = make_uint2(q[0], q[1]);
+                                            if (chunk % 4 == 0) {
+                                                constexpr uint32_t kSFPoolRows = kNumRanks * kNumMaxTokensPerRank * kNumTopk + kNumExpertsPerRank * 128;
+                                                const auto p = static_cast<uint32_t>(packed);
+                                                const uint32_t sf_row = (p / 128) * 128 + (p % 32) * 4 + (p % 128) / 32;
+                                                const uint32_t group = col / 32;
+                                                reinterpret_cast<uint8_t*>(backward.sdz_pool)[
+                                                    (static_cast<uint64_t>(group / 4) * kSFPoolRows + sf_row) * 4 + group % 4] = static_cast<uint8_t>(sf_exp);
+                                            }
+                                        }
                                     }
                                 }
                                 ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
