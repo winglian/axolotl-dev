@@ -29,4 +29,15 @@ struct MoEBackwardNvfp4Buffers : MoEBackwardBuffers {
     float *nv_rdy = nullptr, *nv_rdz = nullptr;
     uint32_t nv_pool_rows = 0;
 };
+
+// In-kernel weight gradients of the SM100 BF16 backward (option 512). Travels by value in an otherwise unused
+// 128-byte tensor-map parameter slot, so the default instantiation keeps its parameter layout.
+struct MoEBackwardDwParams {
+    float* dw1;         // [local experts, 2 * intermediate, hidden], every element written
+    float* dw2;         // [local experts, hidden, intermediate], every element written
+    uint32_t* ready;    // [local experts] finished (M block, CTA) h/dz halves; zero between launches
+    uint32_t* claims;   // [local experts] claimed dW tiles; zero between launches
+    uint32_t per_block; // ready dW tiles the scheduler takes after each M block
+};
+static_assert(sizeof(MoEBackwardDwParams) <= 128, "dW parameters must fit a tensor-map slot");
 } // namespace deep_gemm::layout

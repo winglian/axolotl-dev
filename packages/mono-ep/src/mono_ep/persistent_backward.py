@@ -170,7 +170,19 @@ class NativePersistentBackward:
             )
             self.padded_counts = torch.empty_like(self.starts)
         self.finished = None
+        self.dw_state = None
         self._mx = None
+
+    def inkernel_dw(self):
+        """SM100 BF16: compute dW1/dW2 inside the persistent backward (``MONO_EP_SM100_INKERNEL_DW``)."""
+        value = os.getenv("MONO_EP_SM100_INKERNEL_DW", "0")
+        if value not in ("0", "1"):
+            raise ValueError("MONO_EP_SM100_INKERNEL_DW must be 0 or 1")
+        if value == "0" or self.arch != 10 or self.blockwise:
+            return False
+        if self.experts > 32:
+            raise ValueError("In-kernel dW supports at most 32 local experts")
+        return True
 
     def precision(self):
         """``MONO_EP_SM100_BACKWARD_PRECISION``: ``bf16`` (default) or ``mxfp8`` (SM100 BF16 runtimes)."""
@@ -305,6 +317,12 @@ class NativePersistentBackward:
         if self.finished is not None:
             stream.wait_event(self.finished)
         if self.arch == 10 and not self.blockwise and self.precision() == "mxfp8":
+            if self.inkernel_dw():
+                # Both reuse the kernel's shared-expert operand slots and need different BLOCK_K
+                raise ValueError(
+                    "MONO_EP_SM100_INKERNEL_DW=1 does not combine with "
+                    "MONO_EP_SM100_BACKWARD_PRECISION=mxfp8"
+                )
             dx, ds = self._backward_mxfp8(dy, x, indices, scores, w1, w2)
             return self._finish_bf16_sm100(dx, ds, scores, stream)
         tokens = x.shape[0]
@@ -386,7 +404,25 @@ class NativePersistentBackward:
             )
         dx = torch.empty_like(x)
         ds = torch.empty_like(scores, dtype=torch.float32)
-        getattr(deep_gemm._C, self.native_name)(
+        inkernel_dw = self.inkernel_dw()
+        dw_args = ()
+        native_name = self.native_name
+        if inkernel_dw:
+            if self.dw_state is None:
+                # Readiness and claim counters; the kernel leaves them zeroed for the next launch
+                self.dw_state = torch.zeros(
+                    2 * self.experts, device=x.device, dtype=torch.int32
+                )
+            hidden, inner = self.runtime.hidden, self.runtime.intermediate
+            dw1 = torch.empty(
+                (self.experts, 2 * inner, hidden), device=x.device, dtype=torch.float32
+            )
+            dw2 = torch.empty(
+                (self.experts, hidden, inner), device=x.device, dtype=torch.float32
+            )
+            dw_args = (dw1, dw2, self.dw_state)
+            native_name = "bf16_mono_ep_backward_dw"
+        getattr(deep_gemm._C, native_name)(
             dx,
             ds,
             interleaved,
@@ -418,11 +454,14 @@ class NativePersistentBackward:
                 if self.blockwise
                 else ()
             ),
+            *dw_args,
         )
         x_pool, dy_pool, h_pool, dz_pool = self.pools[:4]
-        if not (fused and self.blockwise):
+        if not (fused and self.blockwise) and not inkernel_dw:
             ends = self.starts + self.counts
-        if self.blockwise:
+        if inkernel_dw:
+            dw1, dw2 = dw_args[:2]
+        elif self.blockwise:
             from .hopper_wgrad import weight_grad_fp8_hopper_packed
 
             qx, qdy, qh, qdz, sx, sdy, sh, sdz = self.pools[10:]

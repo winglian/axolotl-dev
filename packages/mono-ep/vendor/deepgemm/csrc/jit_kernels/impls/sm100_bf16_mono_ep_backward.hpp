@@ -3,7 +3,9 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstring>
 #include <format>
+#include <optional>
 #include <limits>
 #include <string>
 #include <torch/python.h>
@@ -17,7 +19,14 @@ namespace deep_gemm {
 // Default kernel variant bitmask for the SM100 BF16 persistent backward.
 static constexpr uint32_t kDefaultBackwardOptions = 11;
 
-static void bf16_mono_ep_backward(
+// In-kernel weight gradients (options bit 512): dW1 [local experts, 2I, H] and dW2 [local experts, H, I] FP32,
+// written in full by the kernel, and a persistent int32 [2 * local experts] readiness/claim state (zero between
+// launches; the kernel resets it).
+struct MonoEPBackwardDw {
+    torch::Tensor dw1, dw2, state;
+};
+
+static void bf16_mono_ep_backward_launch(
     const torch::Tensor& dx, const torch::Tensor& ds,
     const torch::Tensor& w1, const torch::Tensor& w2t, const torch::Tensor& w1t,
     const std::vector<torch::Tensor>& pools,
@@ -25,7 +34,7 @@ static void bf16_mono_ep_backward(
     const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_ptrs,
     const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
     const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
-    int rank, int max_tokens, int ring_tokens, int topk) {
+    int rank, int max_tokens, int ring_tokens, int topk, const std::optional<MonoEPBackwardDw>& dw) {
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(dx.is_cuda() and dx.dim() == 2);
     const auto check = [&](const torch::Tensor& t, torch::ScalarType dtype) {
@@ -81,6 +90,38 @@ static void bf16_mono_ep_backward(
     };
     const auto tx = acts(pools[0]), ty = acts(pools[1]), tz = acts(pools[3]);
     const auto tw1 = weights(w1), tw2t = weights(w2t), tw1t = weights(w1t);
+    // Unused shared-expert slots carry the in-kernel dW operands: the h-pool descriptor and the dW parameters, and
+    // with wide tiles the 64 x 32 pool boxes
+    auto l1_output = tx, shared_l1_acts = tx, shared_l1_output = tx, shared_l2_acts = tz;
+    auto shared_l2_weights = tw1t;
+    if (dw.has_value()) {
+        check(dw->dw1, torch::kFloat32);
+        check(dw->dw2, torch::kFloat32);
+        check(dw->state, torch::kInt32);
+        DG_HOST_ASSERT(dw->dw1.dim() == 3 and dw->dw1.size(0) == experts and dw->dw1.size(1) == 2 * inner and dw->dw1.size(2) == hidden);
+        DG_HOST_ASSERT(dw->dw2.dim() == 3 and dw->dw2.size(0) == experts and dw->dw2.size(1) == hidden and dw->dw2.size(2) == inner);
+        DG_HOST_ASSERT(dw->state.dim() == 1 and dw->state.numel() == 2 * experts and experts <= 32);
+        shared_l1_output = acts(pools[2]);
+        const char* wide = std::getenv("MONO_EP_SM100_INKERNEL_DW_WIDE");
+        if (wide != nullptr and std::string(wide) == "1") {
+            const auto acts32 = [&](const torch::Tensor& t) {
+                return make_tma_2d_desc(t, t.size(1), rows, 64, 32, t.stride(0), 128);
+            };
+            l1_output = acts32(pools[0]);
+            shared_l1_acts = acts32(pools[1]);
+            shared_l1_output = acts32(pools[2]);
+            shared_l2_acts = acts32(pools[3]);
+        }
+        const char* per_block_selector = std::getenv("MONO_EP_SM100_INKERNEL_DW_PER_BLOCK");
+        const int per_block = per_block_selector == nullptr ? 2 : std::atoi(per_block_selector);
+        DG_HOST_ASSERT(per_block >= 0 and per_block <= 64);
+        const auto state = reinterpret_cast<uint32_t*>(dw->state.data_ptr<int>());
+        const layout::MoEBackwardDwParams params{
+            dw->dw1.data_ptr<float>(), dw->dw2.data_ptr<float>(), state, state + experts, static_cast<uint32_t>(per_block)};
+        static_assert(sizeof(params) <= sizeof(shared_l2_weights));
+        std::memset(&shared_l2_weights, 0, sizeof(shared_l2_weights));
+        std::memcpy(&shared_l2_weights, &params, sizeof(params));
+    }
     const int sms = get_num_sms_for_mono_ep();
     DG_HOST_ASSERT(sms % 2 == 0);
     int pull = hidden * 2;
@@ -103,6 +144,7 @@ static void bf16_mono_ep_backward(
     const char* block_k_selector = std::getenv("MONO_EP_SM100_BACKWARD_BLOCK_K");
     const int block_k = block_k_selector == nullptr ? 64 : std::atoi(block_k_selector);
     DG_HOST_ASSERT(block_k == 64 or block_k == 128);
+    DG_HOST_ASSERT(not dw.has_value() or block_k == 64);
     const int stage_bytes = (64 + 128) * block_k * 2 + 16;
     const int forward_stage_bytes = (64 + 128) * 64 * 2 + 16;
     const int fixed_smem = forward_smem - stages * forward_stage_bytes + backward_extra;
@@ -142,9 +184,13 @@ static void bf16_mono_ep_backward(
     DG_HOST_ASSERT(smem <= SM100ArchSpec::smem_capacity);
     // Kernel variant bitmask (see kOptions in the kernel); 0 restores the original epilogue/dispatch code.
     const char* options_selector = std::getenv("MONO_EP_SM100_BACKWARD_OPTIONS");
-    const uint32_t options = options_selector == nullptr ? kDefaultBackwardOptions :
+    const uint32_t selected = options_selector == nullptr ? kDefaultBackwardOptions :
         static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10));
-    DG_HOST_ASSERT(options < 512);
+    DG_HOST_ASSERT(selected < 512);
+    // MONO_EP_SM100_INKERNEL_DW_WIDE=1: 256 x 256 dW tiles over 32-row stages (option 1024)
+    const char* wide_selector = std::getenv("MONO_EP_SM100_INKERNEL_DW_WIDE");
+    const bool dw_wide = dw.has_value() and wide_selector != nullptr and std::string(wide_selector) == "1";
+    const uint32_t options = selected | (dw.has_value() ? 512u : 0u) | (dw_wide ? 1024u : 0u);
     DG_HOST_ASSERT(not (options & 64u) or (options & 1u));
     DG_HOST_ASSERT(pull <= hidden * 2 or (options & 8u));
     // 16 (lookahead pull) needs the overlapped copy and whole x/dy rows in the pull buffer
@@ -182,13 +228,42 @@ static void instantiate() {{
     jit->launch(kernel, {.num_smem_bytes = smem, .grid_dim = dim3(sms),
         .block_dim = dim3(512), .cluster_dim = dim3(2, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),
-        tx, tw1, tx, tz, tw1t, tx, tw1, tx, tz, tw1t,
+        tx, tw1, l1_output, tz, tw1t, shared_l1_acts, tw1, shared_l1_output, shared_l2_acts, shared_l2_weights,
         static_cast<const uint8_t*>(nullptr), reinterpret_cast<__nv_bfloat16*>(phase_trace_ptr), ty, tw2t, buffers);
+}
+
+static void bf16_mono_ep_backward(
+    const torch::Tensor& dx, const torch::Tensor& ds,
+    const torch::Tensor& w1, const torch::Tensor& w2t, const torch::Tensor& w1t,
+    const std::vector<torch::Tensor>& pools,
+    const torch::Tensor& starts, const torch::Tensor& counts,
+    const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_ptrs,
+    const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
+    const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
+    int rank, int max_tokens, int ring_tokens, int topk) {
+    bf16_mono_ep_backward_launch(dx, ds, w1, w2t, w1t, pools, starts, counts, sym_buffer, sym_ptrs,
+        dy, dy_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, std::nullopt);
+}
+
+// The same backward with dW1 = dz^T x and dW2 = dy^T h computed inside the persistent kernel.
+static void bf16_mono_ep_backward_dw(
+    const torch::Tensor& dx, const torch::Tensor& ds,
+    const torch::Tensor& w1, const torch::Tensor& w2t, const torch::Tensor& w1t,
+    const std::vector<torch::Tensor>& pools,
+    const torch::Tensor& starts, const torch::Tensor& counts,
+    const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_ptrs,
+    const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
+    const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
+    int rank, int max_tokens, int ring_tokens, int topk,
+    const torch::Tensor& dw1, const torch::Tensor& dw2, const torch::Tensor& state) {
+    bf16_mono_ep_backward_launch(dx, ds, w1, w2t, w1t, pools, starts, counts, sym_buffer, sym_ptrs,
+        dy, dy_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, MonoEPBackwardDw{dw1, dw2, state});
 }
 
 // MXFP8 variant (MONO_EP_SM100_BACKWARD_PRECISION=mxfp8): E4M3 x/dy transport with packed UE8M0 scales, kind::mxf8f6f4
 // dh, z recompute and dx GEMMs (BLOCK_K 128), dz quantized in the epilogue. The weight-gradient pools stay BF16.
-// Options bit 2048 selects it in the shared kernel; the operand and scale tensor maps reuse the unused shared-expert slots.
+// Options bit 2048 selects it in the shared kernel (512 and 1024 are in-kernel dW); the operand and scale tensor maps
+// reuse the unused shared-expert slots, which in-kernel dW also uses, so the two do not combine.
 static void mxfp8_mono_ep_backward(
     const torch::Tensor& dx, const torch::Tensor& ds,
     const torch::Tensor& w1, const torch::Tensor& w2t, const torch::Tensor& w1t,
@@ -297,7 +372,7 @@ static void mxfp8_mono_ep_backward(
     const char* options_selector = std::getenv("MONO_EP_SM100_BACKWARD_OPTIONS");
     const uint32_t options = (options_selector == nullptr ? kDefaultBackwardOptions :
         static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10))) | 2048u;
-    DG_HOST_ASSERT(options < 4096 and not (options & 1536u));
+    DG_HOST_ASSERT(options < 4096 and not (options & (512u | 1024u)));
     DG_HOST_ASSERT((options & 1u) and not (options & 4u) and not (options & 16u) and not (options & 64u));
     const auto exact_smem_for = [&](const int& n) {
         int offset = math::align(experts * world * 4, 1024) + 4 * pull;   // token counts, 4 dispatch pull buffers

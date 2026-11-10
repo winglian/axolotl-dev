@@ -179,7 +179,7 @@ On one B200 at the 30B shape (BF16, F / B) MoK takes 2.80 / 5.06 ms against mono
 3.26. At EP8 mono-ep's forward is faster and MoK's backward is about 0.5 ms faster, which
 matches mono-ep's serial weight-gradient phase (0.93 ms).
 
-## SM100 MXFP8 backward on 8xB200
+## SM100 opt-ins on 8xB200
 
 MXFP8 backward (`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`), BF16 and MXFP8 interleaved per
 iteration in one allocation (ap-vNYQUgp8WL4TzRvFuKprVS), weights bumped every step, ms:
@@ -189,6 +189,14 @@ iteration in one allocation (ap-vNYQUgp8WL4TzRvFuKprVS), weights bumped every st
 | backward, balanced | 4.164 | 3.794 (-8.9%) |
 | checkpointed 2F+B, balanced | 7.714 | 7.236 (-6.2%) |
 | checkpointed 2F+B, skewed | 9.334 | 8.760 (-6.1%) |
+
+In-kernel weight gradients (`MONO_EP_SM100_INKERNEL_DW`), off / on / wide, one allocation
+(ap-HXzwyX5kvITeMHznIApH69), backward and checkpointed 2F+B ms:
+
+| Shape | off | on (256 x 128) | wide (256 x 256) |
+|---|---|---|---|
+| Qwen3-30B-A3B, balanced | 4.164 / 7.665 | 4.273 / 7.798 | 4.243 / 7.757 |
+| H 5120 / I 2560, 32 local experts | 21.914 / 32.208 | 21.254 / 31.903 | 20.625 / 30.860 |
 
 ## NVFP4 LoRA (SM100)
 

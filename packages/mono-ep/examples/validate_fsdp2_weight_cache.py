@@ -604,6 +604,7 @@ def main():
                     reserved_sms=args.reserved_sms,
                     backward_precision=args.precision,
                     nccl_max_ctas=os.environ.get("NCCL_MAX_CTAS"),
+                    inkernel_dw=os.environ.get("MONO_EP_SM100_INKERNEL_DW", "0"),
                     cases=outputs,
                 )
             ),

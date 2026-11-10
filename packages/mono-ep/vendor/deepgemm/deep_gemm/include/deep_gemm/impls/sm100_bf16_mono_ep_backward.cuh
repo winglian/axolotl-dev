@@ -111,7 +111,8 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_shared_l1_weights);
         cute::prefetch_tma_descriptor(&tensor_map_shared_l1_output);
         cute::prefetch_tma_descriptor(&tensor_map_shared_l2_acts);
-        cute::prefetch_tma_descriptor(&tensor_map_shared_l2_weights);
+        if constexpr (not (kOptions & 512u))
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l2_weights);
     }
 
     // 2048: MXFP8 GEMM operands (E4M3 values, UE8M0 scales per 32 K elements; dh, z recompute and dx run as
@@ -180,8 +181,27 @@ sm100_bf16_mono_ep_backward_impl(void* y,
     constexpr auto kDispatchLoadHint = (kOptions & 256u) ?
         cute::TMA::CacheHintSm100::EVICT_NORMAL : cute::TMA::CacheHintSm100::EVICT_FIRST;
     DG_STATIC_ASSERT(not kEvictFirstHStores or kStagedPoolStores, "Evict-first h stores need the staged stores");
+    // 512: in-kernel weight gradients. Per local expert, 256 x BLOCK_M FP32 tiles of dW1 = dz^T x and dW2 = dy^T h
+    // over all of the expert's pool rows (MN-major operands from the row-major pools), scheduled once the
+    // expert's h/dz rows are final. Pointers ride in the unused `tensor_map_shared_l2_weights` slot, the h-pool
+    // descriptor in `tensor_map_shared_l1_output`.
+    constexpr bool kInkernelDw = kOptions & 512u;
+    DG_STATIC_ASSERT(not kInkernelDw or (BLOCK_K == 64 and BLOCK_M == 128 and kNumEpilogueWarpgroups == 2),
+                     "In-kernel dW expects 64 x 64 pool boxes and two epilogue warpgroups");
+    // 1024 (with 512): wide 256 x 256 dW tiles over 32-row stages (one third fewer operand bytes per FLOP); the
+    // 64 x 32 pool boxes ride in unused slots (x, dy, h, dz: l1_output, shared_l1_acts, shared_l1_output,
+    // shared_l2_acts) and every TMEM accumulator stage is 256 columns wide.
+    constexpr bool kDwWide = kInkernelDw and (kOptions & 1024u);
+    constexpr uint32_t DW_BLOCK_N = kDwWide ? 2 * BLOCK_M : BLOCK_M;
+    constexpr uint32_t DW_BLOCK_K = kDwWide ? 32 : BLOCK_K;
+    const auto& dw_params = *reinterpret_cast<const layout::MoEBackwardDwParams*>(&tensor_map_shared_l2_weights);
+    const auto is_dw_task = [](const auto& info) {
+        return kInkernelDw and (info.block_phase == sched::BlockPhase::BackwardDw1 or
+                                info.block_phase == sched::BlockPhase::BackwardDw2);
+    };
     DG_STATIC_ASSERT(not kMXFP8 or (kStagedPoolStores and not (kOptions & 4u) and not kLookaheadPull),
                      "MXFP8 needs the staged pool stores, two TMEM stages and its own pull loop");
+    DG_STATIC_ASSERT(not (kInkernelDw and kMXFP8), "In-kernel dW (BLOCK_K 64) and the MXFP8 backward (BLOCK_K 128) share operand slots");
 
     // Epilogue configs
     constexpr uint32_t kNumEpilogueStages = (kOptions & 4u) ? 4 : 2;
@@ -200,7 +220,8 @@ sm100_bf16_mono_ep_backward_impl(void* y,
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
 
     // Tensor memory size
-    constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
+    constexpr uint32_t kTmemStageCols = kDwWide ? 2 * UMMA_N : UMMA_N;
+    constexpr uint32_t kNumAccumTmemCols = kTmemStageCols * kNumEpilogueStages;
     // MXFP8: one 128-row UTCCP block of scale factors per operand after the accumulators
     constexpr uint32_t kNumSFTmemCols = kMXFP8 ? 4 : 0;
     constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
@@ -381,6 +402,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
         phase ^= stage_idx == 0;
     };
+
+    // In-kernel dW k-blocks: the expert's padded pool rows, at least one so that every role consumes the task
+    // through the same barriers (a zero-row expert's tile loads one unused box, skips the MMA and stores zeros)
+    const auto dw_num_k_blocks = [](const auto& info) -> uint32_t { return cute::max(1u, info.shape_k / DW_BLOCK_K); };
 
     // Intra-SM Barrier indices
     constexpr uint32_t kDispatchBarrierIdx = 0;
@@ -1089,6 +1114,9 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 if (thread_idx == 0) {
                     backward.expert_starts[i] = expert_pool_block_offset * BLOCK_M;
                     backward.expert_counts[i] = num_recv_tokens;
+                    // Every task of this rank finished before the epilogue grid sync that precedes this cleanup
+                    if constexpr (kInkernelDw)
+                        dw_params.ready[i] = dw_params.claims[i] = 0;
                 }
 
                 // Wait read count ready
@@ -1140,6 +1168,32 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         task_info_t task_info;
         uint64_t trace_l1_spin = 0, trace_l2_spin = 0, trace_a_empty = 0;
         while (scheduler.get_next_task(task_info)) {
+            if constexpr (kInkernelDw) {
+                if (is_dw_task(task_info)) {
+                    // dW N side (UMMA B): x (dW1) or h (dW2) columns, MN-major, LOAD_BLOCK_M per CTA
+                    const auto desc = task_info.block_phase == sched::BlockPhase::BackwardDw1 ?
+                        (kDwWide ? &tensor_map_l1_output : &tensor_map_l1_acts) : &tensor_map_shared_l1_output;
+                    const uint32_t n_idx = task_info.n_cluster_idx * DW_BLOCK_N + (is_leader_cta ? 0u : DW_BLOCK_N / 2);
+                    const uint32_t row_idx = task_info.pool_block_idx * BLOCK_M;
+                    while (ptx::ld_acq(dw_params.ready + task_info.local_expert_idx) < 2 * task_info.shape_k / BLOCK_M);
+                    for (uint32_t k_block_idx = 0; k_block_idx < dw_num_k_blocks(task_info); advance_pipeline(k_block_idx)) {
+                        shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
+                        if (cute::elect_one_sync()) {
+                            DG_STATIC_ASSERT(DW_BLOCK_N / 2 * DW_BLOCK_K == LOAD_BLOCK_M * BLOCK_K, "dW N side must fill an A stage");
+                            tma::copy<DW_BLOCK_N / 2, DW_BLOCK_K, kSwizzleAMode, a_dtype_t>(
+                                desc, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx],
+                                n_idx, row_idx + k_block_idx * DW_BLOCK_K, 2);
+                            if (is_leader_cta) {
+                                shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_a[0]) * 2);
+                            } else {
+                                shared_storage.full_barriers[stage_idx].arrive(0u);
+                            }
+                        }
+                        __syncwarp();
+                    }
+                    continue;
+                }
+            }
             const auto tensor_map_a_ptr = task_info.block_phase == sched::BlockPhase::BackwardDh ? &tensor_map_dy :
                 task_info.block_phase == sched::BlockPhase::BackwardDx ? &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto num_k_blocks = math::ceil_div(task_info.shape_k, BLOCK_K);
@@ -1227,6 +1281,32 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         // GEMM TMA load warp for weights
         task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
+            if constexpr (kInkernelDw) {
+                if (is_dw_task(task_info)) {
+                    // dW M side (UMMA A): dz (dW1) or dy (dW2) columns, MN-major, two 64-column boxes per CTA
+                    const auto desc = task_info.block_phase == sched::BlockPhase::BackwardDw1 ?
+                        (kDwWide ? &tensor_map_shared_l2_acts : &tensor_map_l2_acts) :
+                        (kDwWide ? &tensor_map_shared_l1_acts : &tensor_map_dy);
+                    const uint32_t m_idx = task_info.m_block_idx * (BLOCK_N * 2) + (is_leader_cta ? 0u : BLOCK_N);
+                    const uint32_t row_idx = task_info.pool_block_idx * BLOCK_M;
+                    while (ptx::ld_acq(dw_params.ready + task_info.local_expert_idx) < 2 * task_info.shape_k / BLOCK_M);
+                    for (uint32_t k_block_idx = 0; k_block_idx < dw_num_k_blocks(task_info); advance_pipeline(k_block_idx)) {
+                        shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
+                        if (cute::elect_one_sync()) {
+                            tma::copy<LOAD_BLOCK_N, DW_BLOCK_K, kSwizzleBMode, b_dtype_t>(
+                                desc, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx],
+                                m_idx, row_idx + k_block_idx * DW_BLOCK_K, 2);
+                            if (is_leader_cta) {
+                                shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(LOAD_BLOCK_N * DW_BLOCK_K * sizeof(b_dtype_t) * 2);
+                            } else {
+                                shared_storage.full_barriers[stage_idx].arrive(0u);
+                            }
+                        }
+                        __syncwarp();
+                    }
+                    continue;
+                }
+            }
             const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::BackwardDh ? &tensor_map_dh_weights :
                 task_info.block_phase == sched::BlockPhase::BackwardDx ? &tensor_map_l2_weights : &tensor_map_l1_weights;
             const auto shape_k = task_info.shape_k;
@@ -1306,6 +1386,69 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 if (lane_idx == 0) dist_set(48, trace_globaltimer());
             }
             while (scheduler.get_next_task(task_info)) {
+                if constexpr (kInkernelDw) {
+                    if (is_dw_task(task_info)) {
+                        const uint64_t trace_dw_task = trace_clock();
+                        uint64_t trace_dw_full = 0;
+                        const uint32_t num_dw_k_blocks = dw_num_k_blocks(task_info);
+                        const bool has_rows = task_info.shape_k > 0;
+                        const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
+                        const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+                        shared_storage.tmem_empty_barriers[accum_stage_idx].wait(accum_phase ^ 1);
+                        ptx::tcgen05_after_thread_sync();
+                        const uint64_t trace_dw_empty_done = trace_clock();
+                        // Both operands MN-major (K = pool rows), UMMA N = BLOCK_M; built per task to keep the
+                        // descriptors out of the main loop's live registers
+                        auto dw_a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::MN, DW_BLOCK_N / 2, DW_BLOCK_K, kSwizzleAMode>(
+                            shared_storage.smem_a[0], 0, 0);
+                        auto dw_b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::MN, LOAD_BLOCK_N, DW_BLOCK_K, kSwizzleBMode>(
+                            shared_storage.smem_b[0], 0, 0);
+                        const uint32_t dw_a_desc_lo = dw_a_desc.lo;
+                        const uint32_t dw_b_desc_lo = dw_b_desc.lo;
+                        constexpr auto dw_instr_desc = cute::UMMA::make_instr_desc<b_dtype_t, a_dtype_t, float, UMMA_M, DW_BLOCK_N,
+                                                                                   cute::UMMA::Major::MN, cute::UMMA::Major::MN>();
+                        for (uint32_t k_block_idx = 0; k_block_idx < num_dw_k_blocks; advance_pipeline(k_block_idx)) {
+                            const uint64_t trace_full0 = trace_clock();
+                            shared_storage.full_barriers[stage_idx].wait(phase);
+                            ptx::tcgen05_after_thread_sync();
+                            trace_dw_full += trace_clock() - trace_full0;
+                            const uint32_t a_base_lo = dw_a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16;
+                            const uint32_t b_base_lo = dw_b_desc_lo + stage_idx * sizeof(SharedStorage::smem_b[0]) / 16;
+                            if (has_rows and cute::elect_one_sync()) {
+                                #pragma unroll
+                                for (uint32_t k = 0; k < DW_BLOCK_K / UMMA_K; ++ k) {
+                                    dw_a_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                        cute::UMMA::Major::MN, DW_BLOCK_N / 2, kSwizzleAMode, a_dtype_t>(a_base_lo, 0, k * UMMA_K);
+                                    dw_b_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                        cute::UMMA::Major::MN, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_base_lo, 0, k * UMMA_K);
+                                    ptx::SM100_MMA_F16BF16_2x1SM_SS::fma(
+                                        dw_b_desc, dw_a_desc, accum_stage_idx * kTmemStageCols, k_block_idx > 0 or k > 0,
+                                        static_cast<uint64_t>(static_cast<uint32_t>(dw_instr_desc)) << 32);
+                                }
+                            }
+                            __syncwarp();
+                            constexpr uint16_t kCTAMask = (1 << 2) - 1;
+                            cutlass::arch::umma_arrive_multicast_2x1SM(
+                                reinterpret_cast<uint64_t*>(&shared_storage.empty_barriers[stage_idx]), kCTAMask);
+                            if (k_block_idx == num_dw_k_blocks - 1)
+                                cutlass::arch::umma_arrive_multicast_2x1SM(
+                                    reinterpret_cast<uint64_t*>(&shared_storage.tmem_full_barriers[accum_stage_idx]), kCTAMask);
+                            __syncwarp();
+                        }
+                        if constexpr (kPhaseTrace) {
+                            const uint64_t trace_dw_end = trace_clock();
+                            if (lane_idx == 0) {
+                                trace_add(30, trace_dw_empty_done - trace_dw_task);
+                                trace_add(71, trace_dw_end - trace_dw_empty_done);
+                                trace_add(72, trace_dw_full);
+                                trace_add(73, has_rows ? num_dw_k_blocks : 0);
+                                trace_add(42, trace_dw_task - trace_mma_prev);
+                            }
+                            trace_mma_prev = trace_dw_end;
+                        }
+                        continue;
+                    }
+                }
                 const uint64_t trace_mma_task = trace_clock();
                 uint64_t trace_mma_full = 0;
                 const auto num_k_blocks = task_info.shape_k / BLOCK_K;
@@ -1370,7 +1513,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                                         kTmemStartColOfSFB, kTmemStartColOfSFA);
                                 } else {
                                 ptx::SM100_MMA_F16BF16_2x1SM_SS::fma(
-                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    b_desc, a_desc, accum_stage_idx * kTmemStageCols,
                                     k_block_idx > 0 or umma_k_block_idx > 0 or k > 0,
                                     static_cast<uint64_t>(static_cast<uint32_t>(instr_desc)) << 32);
                                 }
@@ -1416,7 +1559,9 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
         // Do mainloop by the leader CTA
         if (is_leader_cta) {
-            if constexpr (kOwnMBlocks)
+            if constexpr (kOwnMBlocks and kInkernelDw)
+                scheduler.template mainloop_owned_backward_dw<DW_BLOCK_N>(dw_params.ready, dw_params.claims, dw_params.per_block);
+            else if constexpr (kOwnMBlocks)
                 scheduler.template mainloop_owned<true>();
             else
                 scheduler.mainloop(num_tokens, sm_locality_domains);
@@ -1477,6 +1622,61 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
             // Now we can release the task
             scheduler.release_task_info();
+
+            if constexpr (kInkernelDw) {
+                if (is_dw_task(task_info)) {
+                    // TMEM lane = dW row of this CTA's 128-row half, column = dW column; each warpgroup stores 64
+                    // columns, each thread one row segment, straight from registers
+                    const bool is_dw1 = task_info.block_phase == sched::BlockPhase::BackwardDw1;
+                    const uint32_t num_cols = is_dw1 ? kHidden : kIntermediateHidden;
+                    const uint32_t num_rows = is_dw1 ? 2 * kIntermediateHidden : kHidden;
+                    constexpr uint32_t kWGCols = DW_BLOCK_N / kNumEpilogueWarpgroups;
+                    const uint32_t row = task_info.m_block_idx * (BLOCK_N * 2) + (is_leader_cta ? 0u : BLOCK_N) +
+                                         warp_idx_in_wg * 32 + lane_idx;
+                    const uint32_t col = task_info.n_cluster_idx * DW_BLOCK_N + epilogue_wg_idx * kWGCols;
+                    float* dst = (is_dw1 ? dw_params.dw1 : dw_params.dw2) +
+                        (static_cast<uint64_t>(task_info.local_expert_idx) * num_rows + row) * num_cols + col;
+                    const bool has_rows = task_info.shape_k > 0;
+                    constexpr uint32_t kChunk = 16;
+                    #pragma unroll 1
+                    for (uint32_t chunk = 0; chunk < kWGCols / kChunk; ++ chunk) {
+                        uint32_t v[kChunk];
+                        if (has_rows) {
+                            cute::SM100_TMEM_LOAD_32dp32b16x::copy(
+                                accum_stage_idx * kTmemStageCols + epilogue_wg_idx * kWGCols + chunk * kChunk,
+                                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                                v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+                            cutlass::arch::fence_view_async_tmem_load();
+                        } else {
+                            #pragma unroll
+                            for (uint32_t j = 0; j < kChunk; ++ j)
+                                v[j] = 0;
+                        }
+                        if (chunk == kWGCols / kChunk - 1) {
+                            ptx::tcgen05_before_thread_sync();
+                            shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                        }
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kChunk / 4; ++ j) {
+                            *reinterpret_cast<float4*>(dst + chunk * kChunk + j * 4) = make_float4(
+                                __uint_as_float(v[j * 4]), __uint_as_float(v[j * 4 + 1]),
+                                __uint_as_float(v[j * 4 + 2]), __uint_as_float(v[j * 4 + 3]));
+                        }
+                    }
+                    if constexpr (kPhaseTrace) {
+                        const uint64_t trace_end = trace_clock();
+                        if (trace_leader) {
+                            trace_add(68, 1);
+                            trace_add(69, trace_end - trace_got);
+                            trace_add(70, trace_got - trace_task);
+                            trace_add(26, trace_task - trace_prev_end);
+                            trace_set(75, trace_end);
+                        }
+                        trace_prev_end = trace_end;
+                    }
+                    continue;
+                }
+            }
 
             // Compute offsets
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen
@@ -1655,7 +1855,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     uint32_t atom_values[kNumAtoms][8];
                     #pragma unroll
                     for (uint32_t atom = 0; atom < kNumAtoms; ++atom) {
-                        const auto tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + atom * ATOM_M;
+                        const auto tmem_addr = accum_stage_idx * kTmemStageCols + epilogue_wg_idx * WG_BLOCK_M + atom * ATOM_M;
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr, atom_values[atom][0], atom_values[atom][1], atom_values[atom][2], atom_values[atom][3]);
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000, atom_values[atom][4], atom_values[atom][5], atom_values[atom][6], atom_values[atom][7]);
                     }
@@ -1667,7 +1867,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                         process_atom(atom, atom_values[atom]);
                 } else {
                     for (uint32_t atom = 0; atom < kNumAtoms; ++atom) {
-                        const auto tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + atom * ATOM_M;
+                        const auto tmem_addr = accum_stage_idx * kTmemStageCols + epilogue_wg_idx * WG_BLOCK_M + atom * ATOM_M;
                         uint32_t values[8];
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr, values[0], values[1], values[2], values[3]);
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000, values[4], values[5], values[6], values[7]);
@@ -1681,6 +1881,8 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     ptx::tcgen05_before_thread_sync();
                     shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                 }
+                [[maybe_unused]] const bool is_last_recompute = task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
+                    task_info.n_cluster_idx + 1 == kIntermediateHidden / (2 * BLOCK_N);
                 // The weight-gradient GEMMs reduce over each expert's padded pool rows: zero the x/dy tail of the
                 // expert's last block (stale, possibly non-finite rows from earlier launches) before its h/dz are
                 // published, so 0 * stale never reaches dW; CTA c clears column half c
@@ -1702,6 +1904,11 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                         L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
                         ptx::red_add(workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                        // This CTA's h/dz rows of the block are final (every recompute epilogue fenced before its sync)
+                        if constexpr (kInkernelDw) {
+                            if (is_last_recompute)
+                                ptx::red_add_rel(dw_params.ready + task_info.local_expert_idx, 1u);
+                        }
                     }
                     if (task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
                         task_info.n_cluster_idx + 1 == kIntermediateHidden / (2 * BLOCK_N)) {
@@ -1762,7 +1969,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     for (uint32_t i = 0; i < STORE_BLOCK_M / ATOM_M; ++ i) {
                         // Load from TMEM using .16x256b shape to satisfy STSM layout requirements
                         // Start from lane index 0 and 16
-                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                        uint32_t tmem_addr = accum_stage_idx * kTmemStageCols + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
                         uint32_t values[ATOM_M];
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
                                                                values[0], values[1], values[2], values[3]);
@@ -1881,6 +2088,8 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                         if (not trace_is_dh and not trace_is_dx) trace_add(base + 6, trace_atoms);
                         if (trace_is_dx) trace_add(base + 7, trace_atoms);
                     }
+                    if constexpr (kInkernelDw)
+                        trace_set(74, trace_end);
                 }
                 trace_prev_end = trace_end;
             }

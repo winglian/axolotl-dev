@@ -105,6 +105,20 @@ Qwen3-30B-A3B shape keeps its ring and its kernels; at the Beam shape the B200 B
 went from 25.5 to 16.2 ms. The ring size is a template parameter, so a changed ring compiles a
 new kernel.
 
+## In-kernel weight gradients (SM100, opt-in)
+
+`MONO_EP_SM100_INKERNEL_DW=1` (option bit 512) computes dW1 = dz^T x and dW2 = dy^T h inside
+the persistent backward instead of as grouped GEMMs after it. Each task is a 256 x 128 FP32
+tile (256 x 256 with `_WIDE=1`, bit 1024) reduced over all of one expert's pool rows. The
+scheduler interleaves dW tiles between M-blocks by readiness: per expert, a counter of finished
+h/dz M-block halves is released after the recompute epilogue and acquired by the TMA loaders,
+and after each M-block the scheduler claims up to `_PER_BLOCK` ready tiles before draining the
+rest. The pool operands are read MN-major through the existing 64 x 64 pool boxes, the epilogue
+stores FP32 straight from TMEM, and the dW pointers and counters ride in an unused tensor-map
+slot. At most 32 local experts. It pays at wide shapes
+(-1.29 ms per backward with wide tiles at H 5120 / I 2560, 8xB200) and costs about 0.1 ms at
+the Qwen3-30B-A3B shape, so it stays opt-in.
+
 ## MXFP8 backward (SM100, opt-in)
 
 `MONO_EP_SM100_BACKWARD_PRECISION=mxfp8` (option bit 2048) runs dh, the z recompute and dx as
@@ -117,7 +131,8 @@ after the accumulators, as in the MXFP8 forward. The E4M3 weight forms (W1 inter
 W1^T) are built in one Inductor graph and cached under the weight-cache epoch contract. It is
 not bitwise (about 6-7% relative error against an FP32 reference, BF16 0.2%; the loss curve
 stayed within a tenth of the seed gap) and saves about 0.4 ms per backward at the
-Qwen3-30B-A3B shape on 8xB200, so it stays opt-in.
+Qwen3-30B-A3B shape on 8xB200, so it stays opt-in. It does not combine with in-kernel dW: both
+use the kernel's unused shared-expert operand slots and they need different BLOCK_K.
 
 ## NVFP4 LoRA path and the CUDA requant (SM100)
 

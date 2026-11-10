@@ -38,7 +38,12 @@ ENV = {
         "MONO_EP_SM100_FORWARD_DIAG_ABLATE",
     ),
 }
-NATIVE = {"bwd": "bf16_mono_ep_backward", "fwd": "bf16_mono_ep"}
+NATIVE = {
+    "bwd": "bf16_mono_ep_backward",
+    "fwd": "bf16_mono_ep",
+    # In-kernel dW entry (MONO_EP_SM100_INKERNEL_DW=1), timed as the native backward
+    "bwd_dw": "bf16_mono_ep_backward_dw",
+}
 
 
 def _median(values):
@@ -340,7 +345,7 @@ def run(args):
         d: torch.zeros(
             sms * (STRIDE[d] + DIST_STRIDE), device="cuda", dtype=torch.int64
         )
-        for d in NATIVE
+        for d in ENV
     }
     traced = [
         v

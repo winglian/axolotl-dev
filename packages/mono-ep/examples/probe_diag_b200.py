@@ -16,7 +16,11 @@ import statistics
 import torch
 import torch.distributed as dist
 
-TOKENS, HIDDEN, INNER, EXPERTS, TOPK = 16384, 2048, 768, 16, 8
+TOKENS, HIDDEN, INNER, EXPERTS, TOPK = (
+    # ``tokens x hidden x inner x experts x topk`` override (default: the Qwen3-30B-A3B per-GPU shape)
+    int(v)
+    for v in os.environ.get("MONO_EP_PROBE_SHAPE", "16384x2048x768x16x8").split("x")
+)
 ENV = {
     "bwd": ("MONO_EP_SM100_PHASE_TRACE", "MONO_EP_SM100_DIAG_ABLATE"),
     "fwd": (
@@ -37,9 +41,14 @@ VARIANT_ENV = {
     "fpull": "MONO_EP_SM100_FORWARD_PULL_BYTES",
     "fopt": "MONO_EP_SM100_FORWARD_OPTIONS",
     "wcf": "MONO_EP_WEIGHT_CACHE_FUSED",
+    "idw": "MONO_EP_SM100_INKERNEL_DW",
+    "idwpb": "MONO_EP_SM100_INKERNEL_DW_PER_BLOCK",
+    "idww": "MONO_EP_SM100_INKERNEL_DW_WIDE",
 }
 STRIDE = {"bwd": 96 + 64 * 8, "fwd": 96}
 NATIVE = {"bwd": "bf16_mono_ep_backward", "fwd": "bf16_mono_ep"}
+# The in-kernel dW entry (MONO_EP_SM100_INKERNEL_DW=1) is timed and traced as the backward too
+NATIVE_DW = "bf16_mono_ep_backward_dw"
 
 
 def _median(values):
@@ -307,8 +316,24 @@ def summarize_trace(direction, trace):
             mma[f"mma_kloop_{n}"] = ms(h[:, 34 + i])
             mma[f"mma_tmem_empty_wait_{n}"] = ms(h[:, 38 + i])
             mma[f"mma_kblocks_{n}"] = h[:, 64 + i]
-        kblocks = h[:, 64:68].sum(1)
-        kloop = h[:, 34:38].sum(1)
+        # In-kernel dW (zero without it): tiles, epilogue busy/wait, MMA k-loop, full waits, k-blocks, and the
+        # epilogue clock at the end of the last main task and of the last dW tile
+        per_cta.update(
+            {
+                "epi_busy_dw": ms(h[:, 69]),
+                "epi_tmem_full_wait_dw": ms(h[:, 70]),
+                "epi_last_main_task_end_after_kernel_start": ms(h[:, 74] - h[:, 1]),
+                "epi_last_dw_end_after_kernel_start": ms(h[:, 75] - h[:, 1]),
+                "epi_dw_tail_after_last_main_task": ms(
+                    (h[:, 75] - h[:, 74]).clamp_min(0)
+                ),
+            }
+        )
+        mma["mma_kloop_dw"] = ms(h[:, 71])
+        mma["mma_full_wait_dw"] = ms(h[:, 72])
+        mma["mma_kblocks_dw"] = h[:, 73]
+        kblocks = h[:, 64:68].sum(1) + h[:, 73]
+        kloop = h[:, 34:38].sum(1) + h[:, 71]
     else:
         names = ("l1", "l2")
         per_cta.update(
@@ -339,7 +364,9 @@ def summarize_trace(direction, trace):
     mma["fraction_wall_ideal_tensor_busy"] = ms(ideal_cycles) / (wall_ns / 1e6)
     counts = {"rows_dispatched_per_cta": h[:, 58]}
     if direction == "bwd":
-        counts.update(tasks_per_cta=h[:, 23], mblocks_per_cta=h[:, 24])
+        counts.update(
+            tasks_per_cta=h[:, 23], mblocks_per_cta=h[:, 24], dw_tiles_per_cta=h[:, 68]
+        )
     else:
         counts.update(l1_tasks_per_cta=h[:, 18], l2_tasks_per_cta=h[:, 19])
     summary = {
@@ -384,6 +411,7 @@ def run_entry(args):
         for d in ("bwd", "fwd")
     }
     originals = {d: getattr(deep_gemm._C, NATIVE[d]) for d in ("bwd", "fwd")}
+    originals["bwd_dw"] = getattr(deep_gemm._C, NATIVE_DW, None)
     managed = {e for pair in ENV.values() for e in pair} | set(VARIANT_ENV.values())
     variants = []
     for spec in args.variants.split(","):
@@ -408,8 +436,8 @@ def run_entry(args):
 
     intervals, raw = [], []
 
-    def wrap(direction):
-        original = originals[direction]
+    def wrap(direction, original=None):
+        original = original or originals[direction]
         trace_env = ENV[direction][0]
 
         def timed(*call_args, **call_kwargs):
@@ -442,6 +470,8 @@ def run_entry(args):
     references = {}
     for d in ("bwd", "fwd"):
         setattr(deep_gemm._C, NATIVE[d], wrap(d))
+    if originals["bwd_dw"] is not None:
+        setattr(deep_gemm._C, NATIVE_DW, wrap("bwd", originals["bwd_dw"]))
     try:
         for round_idx in range(args.rounds):
             ordered = variants if round_idx % 2 == 0 else variants[::-1]
@@ -506,6 +536,8 @@ def run_entry(args):
     finally:
         for d in ("bwd", "fwd"):
             setattr(deep_gemm._C, NATIVE[d], originals[d])
+        if originals["bwd_dw"] is not None:
+            setattr(deep_gemm._C, NATIVE_DW, originals["bwd_dw"])
         for key in managed:
             os.environ.pop(key, None)
     for value in results.values():

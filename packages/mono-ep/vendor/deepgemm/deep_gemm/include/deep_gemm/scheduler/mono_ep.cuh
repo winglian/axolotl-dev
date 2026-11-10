@@ -90,7 +90,9 @@ enum class BlockPhase : uint32_t {
     BackwardDh = 5,
     BackwardRecomputeLow = 6,
     BackwardRecomputeHigh = 7,
-    BackwardDx = 8
+    BackwardDx = 8,
+    BackwardDw1 = 9,
+    BackwardDw2 = 10
 };
 
 template <bool kHasSharedExperts>
@@ -593,6 +595,97 @@ struct MonoEPScheduler {
         }
         if constexpr (kTailMode & 1u)
             steal_tail_dx_tiles<kNumL2Clusters>(tail_begin, lane_idx);
+        task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+        publish_task(task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0), lane_idx);
+    }
+
+    // In-kernel dW (SM100 backward option 512): per local expert, (2I / 256) x (H / kDwBlockN) dW1 = dz^T x tiles,
+    // then (H / 256) x (I / kDwBlockN) dW2 = dy^T h tiles, each reducing over all of the expert's padded pool rows.
+    static constexpr uint32_t kNumDwTileM = BLOCK_N * kNumCTAsPerCluster;
+    template <uint32_t kDwBlockN>
+    struct DwTiles {
+        static constexpr uint32_t kNumDw1TilesN = L1_SHAPE_K / kDwBlockN;
+        static constexpr uint32_t kNumDw2TilesN = L1_SHAPE_N / 2 / kDwBlockN;
+        static constexpr uint32_t kNumDw1Tiles = (L1_SHAPE_N / kNumDwTileM) * kNumDw1TilesN;
+        static constexpr uint32_t kNumTiles = kNumDw1Tiles + (L1_SHAPE_K / kNumDwTileM) * kNumDw2TilesN;
+        DG_STATIC_ASSERT(L1_SHAPE_K % kDwBlockN == 0 and (L1_SHAPE_N / 2) % kDwBlockN == 0, "Invalid dW tile N");
+    };
+
+    // Claim one dW tile of an expert whose h/dz rows are final: `ready[e]` counts finished (M block, CTA) halves,
+    // so the target is 2 x its M blocks (0 for an expert without rows). The relaxed reads only select; the dW
+    // TMA loaders acquire `ready[e]` themselves. `any_pending`: some expert still has unclaimed tiles.
+    template <uint32_t kDwBlockN>
+    CUTLASS_DEVICE bool publish_ready_dw_tile(const uint32_t* ready, const uint32_t* claims,
+                                              const uint32_t& lane_idx, bool& any_pending) {
+        using Tiles = DwTiles<kDwBlockN>;
+        constexpr uint32_t kNumDwTiles = Tiles::kNumTiles, kNumDw1Tiles = Tiles::kNumDw1Tiles;
+        DG_STATIC_ASSERT(kNumExpertsPerLane == 1 and kNumCTAsPerCluster == 2, "In-kernel dW keeps one expert per lane");
+        const bool is_expert = lane_idx < kNumExpertsPerRank;
+        const uint32_t num_blocks = is_expert ? math::ceil_div(stored_num_tokens_per_expert[0], BLOCK_M) : 0;
+        const bool pending = is_expert and ptx::ld_volatile(claims + lane_idx) < kNumDwTiles;
+        const bool is_ready = pending and ptx::ld_volatile(ready + lane_idx) >= 2 * num_blocks;
+        any_pending = __any_sync(0xffffffff, pending);
+        for (uint32_t mask = __ballot_sync(0xffffffff, is_ready); mask; mask &= mask - 1) {
+            const uint32_t expert = __ffs(mask) - 1;
+            const uint32_t tile = get_next_local_task_idx(claims, expert);
+            if (tile >= kNumDwTiles)
+                continue;
+            const bool is_dw1 = tile < kNumDw1Tiles;
+            const uint32_t local = is_dw1 ? tile : tile - kNumDw1Tiles;
+            const uint32_t tiles_n = is_dw1 ? Tiles::kNumDw1TilesN : Tiles::kNumDw2TilesN;
+            const uint32_t padded_rows = ptx::exchange(num_blocks, expert) * BLOCK_M;
+            publish_task(task_info_t(is_dw1 ? BlockPhase::BackwardDw1 : BlockPhase::BackwardDw2, expert,
+                                     local / tiles_n, local % tiles_n, get_pool_block_offset(expert),
+                                     get_num_tokens(expert), 0, padded_rows), lane_idx);
+            return true;
+        }
+        return false;
+    }
+
+    // `mainloop_owned<true>` plus dW tiles: up to `per_block` ready tiles after each M block's tasks (they fill
+    // the tensor pipe while the next block's rows are still being pulled), then the remaining tiles as their
+    // experts finish.
+    template <uint32_t kDwBlockN>
+    CUTLASS_DEVICE void mainloop_owned_backward_dw(const uint32_t* ready, const uint32_t* claims, const uint32_t& per_block) {
+        DG_STATIC_ASSERT(not kHasShared, "Owned blocks currently require routed experts only");
+        constexpr uint32_t kInner = L1_SHAPE_N / 2;
+        DG_STATIC_ASSERT(kInner % (BLOCK_N * kNumCTAsPerCluster) == 0, "Backward dH tiles must cover whole CTA clusters");
+        const auto lane_idx = ptx::get_lane_idx();
+        fetch_expert_recv_count();
+        bool any_pending = true;
+        while (true) {
+            task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+            const auto m_block_idx = get_next_local_task_idx(workspace.get_l1_task_count_ptr(), 0);
+            if (m_block_idx >= num_total_m_blocks) break;
+            auto emit = [&](BlockPhase phase, uint32_t n, uint32_t shape_n, uint32_t shape_k) {
+                task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+                publish_task(create_task(phase, m_block_idx, n, shape_n, shape_k), lane_idx);
+            };
+            for (uint32_t n = 0; n < kInner / (BLOCK_N * kNumCTAsPerCluster); ++n) {
+                emit(BlockPhase::BackwardDh, n, kInner, L1_SHAPE_K);
+                emit(BlockPhase::BackwardRecomputeLow, n, L1_SHAPE_N, L1_SHAPE_K);
+                emit(BlockPhase::BackwardRecomputeHigh, n, L1_SHAPE_N, L1_SHAPE_K);
+            }
+            for (uint32_t n = 0; n < kNumL2Clusters; ++n)
+                emit(BlockPhase::BackwardDx, n, L2_SHAPE_N, L1_SHAPE_N);
+            for (uint32_t i = 0; i < per_block and any_pending; ++i) {
+                task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+                if (not publish_ready_dw_tile<kDwBlockN>(ready, claims, lane_idx, any_pending))
+                    break;
+            }
+        }
+        uint32_t backoff_ns = 64;
+        while (true) {
+            task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+            if (publish_ready_dw_tile<kDwBlockN>(ready, claims, lane_idx, any_pending)) {
+                backoff_ns = 64;
+                continue;
+            }
+            if (not any_pending)
+                break;
+            __nanosleep(backoff_ns);
+            backoff_ns = cute::min(backoff_ns * 2, 1024u);
+        }
         task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
         publish_task(task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0), lane_idx);
     }
