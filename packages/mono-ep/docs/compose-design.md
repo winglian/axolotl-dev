@@ -232,6 +232,11 @@ the `world` routing views in `collect_routing()`.
 - Compact receive rows via an optional host count (trade one sync per layer for a smaller local
   kernel input, like the torch backend).
 - Fuse `collect()` and `collect_routing()` into one Triton pass before EP8 timings (see 3.6).
+- Bandwidth-shaped peer pull/push for the dispatch mode: the reused `pack_peer_rows` /
+  `return_peer_rows` issue one remote load per 256-column tile from 1024 programs and are
+  NVLink latency-bound at EP8 (section 5.1); give each program a contiguous row range, 16 B
+  vector loads and several rows in flight, or stage through NCCL `all_to_all_single` for the
+  bulk rows and keep the symmetric path for routing.
 - FP8 transport for `recv_x` when the local kernel accepts it.
 - Overlap: issue the gather of layer `l+1` under layer `l`'s local kernel (needs a second buffer
   set).
@@ -260,3 +265,41 @@ the `world` routing views in `collect_routing()`.
   compile (the py3.14 forkserver / async-compile issue already known from the kernel lanes),
   so SonicMoE ran on the surviving configs; both backends share the kernel, so the comparison
   holds but the absolute SonicMoE numbers are pessimistic.
+
+### 5.1 Fused-benchmark contract: one Qwen3-30B-A3B layer at EP8
+
+`examples/dispatch_sonicmoe_contract.py` (driver `modal_dispatch_sonicmoe_contract.py`) runs the
+fused line's contract: 16384 tokens per rank, H 2048, I 768, 128 experts top-8 (16 local),
+balanced and skewed routing from the same generators, forward / backward / checkpointed 2F+B,
+5 warmups + 15 samples, medians of the max rank, all variants interleaved in one allocation.
+Expert weights are **BF16** (SonicMoE's native dtype); the fused numbers quoted for comparison
+come from different allocations with FP32 masters quantized per call (FP8 compute on H100,
+BF16 on B200). SonicMoE runs with the kernels plugin's quack policy (`install_quack_key_policy`,
+pow2 buckets, in-process compile): 8 autotuners covered, 0 failed candidates on every rank.
+
+8 x H100 (Modal `ap-gonVugQZPGReBJVajH1kkx`, 0.65 GPU-h), median max-rank ms:
+
+| variant | F bal | B bal | 2F+B bal | F skew | B skew | 2F+B skew | peak GiB |
+|---|---|---|---|---|---|---|---|
+| torch all-to-all + SonicMoE (control) | 6.76 | 8.23 | 21.24 | 7.41 | 9.61 | 23.63 | 11.6 |
+| mono_ep dispatch + SonicMoE | 13.82 | 16.20 | 43.54 | 13.88 | 16.42 | 43.57 | 21.5 |
+| mono_ep dispatch + grouped_mm | 56.68 | 91.23 | 204.26 | 56.67 | 91.38 | 204.09 | 43.4 |
+| torch all-to-all + grouped_mm | 35.68 | 58.60 | 128.91 | 41.03 | 67.71 | 148.83 | 29.6 |
+| fused mono_ep r3 (FP8, other allocation) | 3.26 | 7.53 | 13.48 | | | 16.60 | |
+
+Parity on H100 (first measured iteration, max over ranks): `dgate_up` and `ddown` bitwise for
+both pairs; `y` and `dx` differ by rel-L2 3.4e-3 (the torch backend sums up to eight partial
+rows per token with a BF16 `index_add_`, the peer combine sums them in FP32 and rounds once);
+`dscore` bitwise for grouped_mm, rel 1.3e-5 for SonicMoE. Receive side per rank: 131072 rows,
+`recv_x` 512 MB BF16, symmetric buffers 64 MB `x` + 512 MB `y` + 6 MB routing.
+
+Reading: at EP8 the dispatch mode is about 2x slower than torch all-to-all with the same local
+kernel and far from the fused kernels. The transfer kernels it reuses (`pack_peer_rows` pull,
+`return_peer_rows` push) were sized for the fused runtime's per-expert row pulls: 1024 programs
+walk 131072 rows x 8 column tiles with one remote load per tile, so each direction is NVLink
+latency-bound (~6-7 ms for 512 MB that NCCL moves in ~1-2 ms), and the fixed layout makes
+grouped_mm do 1.5x the rows (131072 vs ~86k routed) while SonicMoE pads to the same power of
+two either way. Memory doubles for the same reasons. The EP2 numbers in 5 are the regime where
+the layout is small and the latency is hidden. Before any EP8 use the pull/push need a
+bandwidth-shaped kernel (wide per-program row ranges, vectorized 16 B loads, several rows in
+flight) and the compact-rows follow-up; both are in section 4.
