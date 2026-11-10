@@ -42,20 +42,4 @@ if [ -n "${CODECOV_TOKEN:-}" ] && [ -f e2e-blackwell-coverage.xml ]; then
     -F "e2e,blackwell,pytorch-${PYTORCH_VERSION}" || true
 fi
 
-bash cicd/install_mono_ep.sh
-uv pip install --python "$(command -v python)" "./packages/mono-ep[sonic,sonic-fp8-experimental]"
-python -m pytest -q packages/mono-ep/tests/test_sonic_fp8.py \
-  packages/mono-ep/tests/test_sonic_hub.py \
-  packages/mono-ep/tests/test_grouped_scatter.py \
-  packages/mono-ep/tests/test_column_quantization.py \
-  packages/mono-ep/tests/test_wgrad_quantization.py \
-  packages/mono-ep/tests/test_swiglu_epilogue.py \
-  packages/mono-ep/tests/test_fp8_swiglu_epilogue.py \
-  packages/mono-ep/tests/test_recompute_epilogue.py \
-  packages/mono-ep/tests/test_backward_schedule.py packages/mono-ep/tests/test_owned_backward.py \
-  packages/mono-ep/tests/test_peer_packing.py packages/mono-ep/tests/test_peer_scatter.py \
-  packages/mono-ep/tests/test_peer_dispatch_gpu.py \
-  packages/mono-ep/tests/test_ready_bf16.py packages/mono-ep/tests/test_nvfp4_requant_cuda.py \
-  --junitxml=blackwell-sonic-fp8-junit.xml || status=$?
-
 exit "$status"

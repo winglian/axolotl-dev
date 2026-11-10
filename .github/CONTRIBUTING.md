@@ -91,7 +91,9 @@ A single-GPU test that cannot run on the L40S lanes (SM90+, e.g. NVFP4 GEMMs or
 SonicMoE) gets `gpu_blackwell`, which implies `gpu`. It is applied automatically when
 a `skipif` reason names only Blackwell archs (`sm100`, `sm>=100`, `Blackwell`);
 otherwise add `@pytest.mark.gpu_blackwell` yourself. These tests run only in
-`cicd/cicd_blackwell.sh` on a B200 and are excluded from the L40S lanes. Multi-GPU
+`cicd/cicd_blackwell.sh` on a B200 and are excluded from the L40S lanes (the
+mono-ep package's `gpu_blackwell` tests run in their own B200 job,
+`cicd/cicd_mono_ep_blackwell.sh`). Multi-GPU
 NVFP4 tests keep the `nvfp4` marker and run in `cicd/nvfp4.sh` instead.
 Both single-GPU lanes resume interrupted cache downloads with a shared 15-minute
 download budget, then extract the completed archive without clearing the shared
@@ -111,6 +113,7 @@ can run on CPU or older CUDA GPUs; only tests invoking kernels that need SM90+
 | One CUDA GPU, supported on L40S | `gpu`; model smoke tests in `tests/e2e/`, plugin tests in `tests/integrations/<plugin>/` | `cicd/cicd.sh` |
 | One CUDA GPU, kernel correctness/parity | `gpu`; use `tests/e2e/kernels/` or `tests/integrations/kernels/` | `cicd/cicd_cuda_kernels.sh` |
 | One SM90+ GPU (Hopper or Blackwell) | `gpu_blackwell` (implies `gpu`), plus the precise capability guard | `cicd/cicd_blackwell.sh` on B200 |
+| mono-ep package kernels (`packages/mono-ep/tests`) | `gpu` for L40S-capable tests, `gpu_blackwell` for SM90+ ones | `cicd/cicd_cuda_kernels.sh` (`-m gpu`); `cicd/cicd_mono_ep_blackwell.sh` on B200 (`-m "gpu_blackwell and not slow"`) |
 | Multiple CUDA GPUs | `gpu`, a device-count guard, and normally `tests/e2e/multigpu/` | `cicd/multigpu.sh` |
 | Multiple GPUs for NVFP4 | `nvfp4` and `gpu`, with capability and device-count guards | `cicd/nvfp4.sh` |
 
