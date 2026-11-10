@@ -418,9 +418,7 @@ class _MonoEPBackend:
         num_local_experts,
     ):
         w1, w2 = _local_expert_weights(experts)
-        return get_mono_ep_runtime().forward(
-            hidden_states, topk_idx, topk_w, w1, w2
-        )
+        return get_mono_ep_runtime().forward(hidden_states, topk_idx, topk_w, w1, w2)
 
 
 # duck-typed: ``fused`` backends expose ``forward``, the others ``dispatch``/``combine``

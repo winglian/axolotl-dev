@@ -20,10 +20,10 @@ TOKENS = 17
 
 
 def training_checks():
+    from mono_ep import DEFAULT_RESERVED_SMS, check_nccl_env, nccl_env
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
     from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
-    from mono_ep import DEFAULT_RESERVED_SMS, check_nccl_env, nccl_env
 
     from axolotl.integrations.expert_parallel import experts_fn, torch_dispatch
     from axolotl.integrations.expert_parallel.plugin import ExpertParallelPlugin
@@ -142,9 +142,7 @@ def training_checks():
     result = {}
     for checkpointing, compiled in ((False, False), (True, False), (False, True)):
         torch._dynamo.reset()
-        history, weights, _ = run(
-            "mono_ep", checkpointing, compiled, starting_weights
-        )
+        history, weights, _ = run("mono_ep", checkpointing, compiled, starting_weights)
         worst = 0.0
         for grads, expected in zip(history, reference, strict=True):
             for name, grad in grads.items():
