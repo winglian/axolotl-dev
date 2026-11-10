@@ -16,16 +16,18 @@ OWNED_BLOCK_M = 128
 
 
 def owned_backward_ring_tokens(
-    num_sms, env="MONO_EP_BACKWARD_RING_WAVES", default_waves=0
+    num_sms, env="MONO_EP_BACKWARD_RING_WAVES", default_waves=1
 ):
-    """Ring floor for the owned backward schedule, in waves of CTA pairs: each pair
-    holds one pool block live through all four phases, and the forward's
-    interleaved-schedule sizing leaves wide-expert shapes with fewer ring blocks
-    than pairs. 0 keeps that sizing; it is only ever raised."""
+    """Ring floor for the owned backward schedule, in waves of CTA clusters (pairs
+    on SM100, single CTAs on SM90): each cluster holds one pool block live through
+    all four phases, and the forward's interleaved-schedule sizing leaves
+    wide-expert shapes with fewer ring blocks than clusters. ``env`` overrides the
+    wave count; 0 keeps that sizing. The floor only ever raises the ring."""
     waves = int(os.environ.get(env, str(default_waves)))
     if waves < 0:
         raise ValueError(f"{env} must be >= 0")
-    return waves * (num_sms // 2) * OWNED_BLOCK_M
+    ctas_per_cluster = 1 if torch.cuda.get_device_capability()[0] == 9 else 2
+    return waves * (num_sms // ctas_per_cluster) * OWNED_BLOCK_M
 
 
 class NativePersistentBackward:

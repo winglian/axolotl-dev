@@ -244,8 +244,10 @@ kernel waiting on ring slots. `Nvfp4PersistentBackward` passes a floor of
 `waves * (sms / 2) * 128` tokens to `get_symm_buffer_for_mono_ep`
 (`num_min_ring_tokens`), default one wave; the floor only raises the ring, so
 shapes whose forward sizing is already larger (the Qwen3-30B contract) are
-unchanged. The BF16 / FP8 persistent backward takes the same floor opt-in
-(`MONO_EP_BACKWARD_RING_WAVES`, default 0) so its defaults stay byte-identical.
+unchanged. The BF16 / FP8 persistent backward (`NativePersistentBackward`)
+takes the same floor by default (`MONO_EP_BACKWARD_RING_WAVES`, default 1,
+0 = forward sizing), counted in owning clusters: CTA pairs on SM100, single
+CTAs on SM90, whose persistent backward runs 1-CTA clusters.
 
 Dispatch pull. Whole `x + dy` rows per warp (`hidden * 4` bytes) are the
 default; at hidden 5120 that leaves 3 pipeline stages instead of 5. A chunked,

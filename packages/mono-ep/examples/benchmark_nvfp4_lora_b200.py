@@ -282,8 +282,8 @@ def main():
         fuse_activation=True,
         backward_backend="native",
     )
-    # Same BF16 path with the owned-backward ring floor (opt-in for BF16, default on for nvfp4_lora)
-    os.environ["MONO_EP_BACKWARD_RING_WAVES"] = "1"
+    # Same BF16 path without the owned-backward ring floor (the forward's ring sizing)
+    os.environ["MONO_EP_BACKWARD_RING_WAVES"] = "0"
     runtime_bf_ring = PersistentMoE(
         dist.group.WORLD,
         experts,
@@ -304,7 +304,7 @@ def main():
             x, ids, s, *adapters, runtime_nv, layer, cache
         ),
         "bf16_persistent": lambda x, ids, s: runtime_bf(x, ids, s, w1_bf, w2_bf),
-        "bf16_persistent_ring1": lambda x, ids, s: runtime_bf_ring(
+        "bf16_persistent_ring0": lambda x, ids, s: runtime_bf_ring(
             x, ids, s, w1_bf, w2_bf
         ),
         "fp4_cute_a2a": lambda x, ids, s: a2a(x, ids, s, *adapters),
@@ -414,7 +414,7 @@ def main():
         backward_ring_tokens=dict(
             nvfp4_lora=runtime_nv._nvfp4_backward.buffer.l1_acts.shape[0],
             bf16_persistent=runtime_bf._peer_backward.buffer.l1_acts.shape[0],
-            bf16_persistent_ring1=runtime_bf_ring._peer_backward.buffer.l1_acts.shape[
+            bf16_persistent_ring0=runtime_bf_ring._peer_backward.buffer.l1_acts.shape[
                 0
             ],
         ),

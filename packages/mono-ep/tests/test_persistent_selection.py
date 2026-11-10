@@ -153,3 +153,20 @@ def test_fp8_format_rejected_on_wrong_architecture(monkeypatch, dtype, arch, mes
             compute_dtype=dtype,
             backward_backend="native" if dtype == "blockwise" else "nccl",
         )
+
+
+@pytest.mark.parametrize(
+    "arch,num_sms,wave", [(9, 132, 132 * 128), (10, 148, 74 * 128)]
+)
+def test_owned_backward_ring_floor_counts_clusters(monkeypatch, arch, num_sms, wave):
+    from mono_ep.persistent_backward import owned_backward_ring_tokens
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (arch, 0))
+    monkeypatch.delenv("MONO_EP_BACKWARD_RING_WAVES", raising=False)
+    assert owned_backward_ring_tokens(num_sms) == wave
+    assert owned_backward_ring_tokens(num_sms, default_waves=2) == 2 * wave
+    monkeypatch.setenv("MONO_EP_BACKWARD_RING_WAVES", "0")
+    assert owned_backward_ring_tokens(num_sms, default_waves=2) == 0
+    monkeypatch.setenv("MONO_EP_BACKWARD_RING_WAVES", "-1")
+    with pytest.raises(ValueError, match=">= 0"):
+        owned_backward_ring_tokens(num_sms)
