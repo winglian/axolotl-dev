@@ -25,17 +25,29 @@ class ExpertParallelArgs(BaseModel):
 
     expert_parallel_backend: Literal["auto", "deep_ep", "torch", "mono_ep"] = "auto"
     """Token dispatch backend. ``deep_ep``: DeepEP fused kernels (NVLink/RDMA). ``torch``: plain
-    ``all_to_all_single`` over the EP process group (any NCCL/gloo setup). ``mono_ep``: one
-    persistent kernel per direction fusing dispatch, SwiGLU experts and combine (Hopper/Blackwell,
-    single NVLink node; the local experts implementation is not used). ``auto``: ``deep_ep`` when
-    importable, else ``torch``; it never selects ``mono_ep``."""
+    ``all_to_all_single`` over the EP process group (any NCCL/gloo setup). ``mono_ep``: the
+    mono-ep package over NVLink symmetric memory on one node, in the mode
+    ``expert_parallel_mono_ep_mode`` picks (fused persistent kernels, or peer dispatch/combine
+    around the configured local experts kernel). ``auto``: ``deep_ep`` when importable, else
+    ``torch``; it never selects ``mono_ep``."""
+
+    expert_parallel_mono_ep_mode: Literal["auto", "fused", "dispatch"] = "auto"
+    """How the ``mono_ep`` backend runs. ``fused``: one persistent kernel per direction fusing
+    dispatch, SwiGLU experts and combine (Hopper/Blackwell, full fine-tuning of plain SwiGLU
+    experts only; the local experts implementation is not used). ``dispatch``: mono-ep's peer
+    dispatch and combine feed whichever local experts kernel the config names
+    (``use_sonicmoe``, ``use_scattermoe``, ``experts_implementation``), so LoRA, quantized
+    experts, biases, other activations and clamped SwiGLU all work. ``auto``: ``fused`` when the
+    config and model support it, otherwise ``dispatch``, otherwise
+    ``expert_parallel_fallback_on_unsupported``."""
 
     expert_parallel_mono_ep_precision: Literal[
         "auto", "bf16", "mxfp8", "fp8", "fp8_bwd"
     ] = "auto"
-    """Compute precision of the ``mono_ep`` backend. ``auto``: ``bf16`` on SM90, ``mxfp8`` on
-    SM100. ``fp8`` is blockwise E4M3 forward and backward (SM90); ``fp8_bwd`` is BF16 forward with
-    blockwise FP8 backward. Master weights stay in their own dtype."""
+    """Compute precision of the ``mono_ep`` backend's fused mode. ``auto``: ``bf16`` on SM90,
+    ``mxfp8`` on SM100. ``fp8`` is blockwise E4M3 forward and backward (SM90); ``fp8_bwd`` is
+    BF16 forward with blockwise FP8 backward. Master weights stay in their own dtype. The
+    dispatch mode moves BF16 rows and leaves compute precision to the local kernel."""
 
     expert_parallel_num_nvl_bytes: int = 256 << 20
 

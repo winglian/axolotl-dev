@@ -1,4 +1,4 @@
-"""CPU tests for the fused ``mono_ep`` expert-parallel backend seam."""
+"""CPU tests for the ``mono_ep`` expert-parallel backend seam (fused and dispatch modes)."""
 
 import importlib.machinery
 import importlib.util
@@ -43,6 +43,7 @@ def _cfg(**kw):
     defaults = dict(
         expert_parallel_size=2,
         expert_parallel_backend="mono_ep",
+        expert_parallel_mono_ep_mode="auto",
         expert_parallel_mono_ep_precision="auto",
         expert_parallel_fallback_on_unsupported=True,
         expert_parallel_save_dispatch=False,
@@ -85,6 +86,44 @@ class _FakeRuntime:
         self.destroyed = True
 
 
+class _FakeDispatchRuntime:
+    """Single-rank stand-in for ``MonoEPDispatchRuntime``: the fixed-capacity DeepEP
+    layout of one rank (``capacity`` rows, sentinel rows past the batch), plain torch so
+    the seam can be compiled around it."""
+
+    dispatch_op = "mono_ep::peer_dispatch"
+    combine_op = "mono_ep::peer_combine"
+    instances: list["_FakeDispatchRuntime"] = []
+
+    def __init__(self, capacity=8, **kwargs):
+        self.kwargs = kwargs
+        self.capacity = kwargs.get("max_tokens_per_rank", capacity)
+        self.max_tokens_per_rank = self.capacity
+        self.receive_rows = self.capacity
+        self.calls = []
+        self.destroyed = False
+        _FakeDispatchRuntime.instances.append(self)
+
+    def dispatch(self, x, topk_idx, topk_weights, num_local_experts):
+        self.calls.append(("dispatch", x, topk_idx, topk_weights, num_local_experts))
+        pad = self.capacity - x.shape[0]
+        # rank 0 of the layout: experts [0, E_local) are local, the rest are remote (-1)
+        local = torch.where(
+            topk_idx < num_local_experts, topk_idx, torch.full_like(topk_idx, -1)
+        )
+        recv_idx = torch.nn.functional.pad(local, (0, 0, 0, pad), value=-1)
+        recv_w = torch.nn.functional.pad(topk_weights, (0, 0, 0, pad))
+        recv_w = recv_w.masked_fill(recv_idx < 0, 0)
+        return torch.nn.functional.pad(x, (0, 0, 0, pad)), recv_idx, recv_w
+
+    def combine(self, local_out, recv_idx, topk_idx, num_local_experts):
+        self.calls.append(("combine", local_out, recv_idx, topk_idx, num_local_experts))
+        return local_out[: topk_idx.shape[0]]
+
+    def destroy(self):
+        self.destroyed = True
+
+
 @pytest.fixture
 def mono_ep_package(monkeypatch):
     """The real package API (pure Python) with a fake runtime class, installed as
@@ -98,15 +137,19 @@ def mono_ep_package(monkeypatch):
     module.__spec__ = importlib.machinery.ModuleSpec("mono_ep", None)
     for name in (
         "DEFAULT_RESERVED_SMS",
+        "MODES",
         "check_nccl_env",
+        "dispatch_unsupported_reason",
         "nccl_env",
         "resolve_precision",
         "unsupported_reason",
     ):
         setattr(module, name, getattr(api, name))
     module.MonoEPRuntime = _FakeRuntime
+    module.MonoEPDispatchRuntime = _FakeDispatchRuntime
     monkeypatch.setitem(sys.modules, "mono_ep", module)
     _FakeRuntime.instances = []
+    _FakeDispatchRuntime.instances = []
     return module
 
 
@@ -134,23 +177,29 @@ def _restore_ep_state():
     experts_fn.set_backend(None)
     experts_fn.set_local_implementation("grouped_mm")
     experts_fn.set_mono_ep_runtime(None)
+    experts_fn.set_mono_ep_mode("fused")
     experts_fn.set_valid_token_mask(None)
     experts_fn.set_token_capacity(None)
     set_ep_group(None)
     clear_registered_saves()
 
 
+def _sharded_experts():
+    experts = _qwen3_model(num_experts=4).mlp.experts
+    experts.num_experts_global = 4
+    experts.num_local_experts = 2
+    return experts
+
+
 class TestFusedForward:
     @staticmethod
     def _experts():
-        experts = _qwen3_model(num_experts=4).mlp.experts
-        experts.num_experts_global = 4
-        experts.num_local_experts = 2
-        return experts
+        return _sharded_experts()
 
     def test_bypasses_local_implementation(self, monkeypatch):
         runtime = _FakeRuntime()
         experts_fn.set_mono_ep_runtime(runtime)
+        experts_fn.set_mono_ep_mode("fused")
 
         def forbidden(*args, **kwargs):
             raise AssertionError("the fused backend must not run the local path")
@@ -206,6 +255,124 @@ class TestFusedForward:
         experts_fn.set_backend("mono_ep")
         assert experts_fn.get_backend() == "mono_ep"
 
+    def test_mode_override_and_validation(self):
+        experts_fn.set_mono_ep_mode("dispatch")
+        assert experts_fn.get_mono_ep_mode() == "dispatch"
+        with pytest.raises(ValueError, match="unknown mono_ep mode"):
+            experts_fn.set_mono_ep_mode("auto")
+        assert experts_fn._MonoEPBackend.resolve() is experts_fn._MonoEPDispatchBackend
+        assert (
+            experts_fn._MonoEPBackend.resolve("fused") is experts_fn._MonoEPFusedBackend
+        )
+
+
+class TestDispatchForward:
+    """The dispatch mode is a regular dispatch/combine backend around ``_run_local``."""
+
+    @staticmethod
+    def _inputs(tokens=3):
+        x = torch.randn(tokens, 512)
+        ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32)[:tokens]
+        weights = torch.rand(tokens, 2, dtype=torch.bfloat16)
+        return x, ids, weights
+
+    def test_runs_the_configured_local_kernel(self, monkeypatch):
+        runtime = _FakeDispatchRuntime(capacity=8)
+        experts_fn.set_mono_ep_runtime(runtime)
+        experts_fn.set_mono_ep_mode("dispatch")
+        seen = {}
+
+        def local(experts, recv_x, recv_idx, recv_w):
+            seen.update(x=recv_x, idx=recv_idx, w=recv_w)
+            return recv_x * 3
+
+        monkeypatch.setattr(
+            experts_fn, "resolve_local_implementation", lambda name=None: local
+        )
+        experts = _sharded_experts()
+        x, ids, weights = self._inputs()
+        y = experts_fn._ep_forward(experts, x, ids, weights, backend="mono_ep")
+
+        assert runtime.calls[0][0] == "dispatch" and runtime.calls[1][0] == "combine"
+        _, rx, ridx, rw, e_local = runtime.calls[0]
+        assert rx.dtype == torch.bfloat16 and ridx.dtype == torch.int64
+        assert rw.dtype == torch.float32 and e_local == 2
+        # the local kernel sees the fixed-capacity rows plus the per-expert pad rows,
+        # with the dispatch's -1 slots rewritten to E_local / weight 0
+        assert seen["x"].shape == (8 + 2, 512)
+        assert seen["idx"][3:8].eq(2).all() and seen["w"][3:8].eq(0).all()
+        assert seen["idx"][:3].tolist() == [[0, 1], [1, 2], [2, 2]]
+        assert seen["w"][2].eq(0).all() and seen["w"][1, 1] == 0
+        assert seen["w"][0].gt(0).all() and seen["w"][1, 0] > 0
+        _, local_out, recv_idx, topk_idx, _ = runtime.calls[1]
+        assert local_out.shape == (8, 512) and recv_idx.shape == (8, 2)
+        assert topk_idx.tolist() == ids.tolist()
+        assert y.dtype == torch.float32
+        torch.testing.assert_close(y, (x.bfloat16() * 3).float())
+
+    def test_padding_sentinel_and_capacity_apply_first(self, monkeypatch):
+        runtime = _FakeDispatchRuntime(capacity=8)
+        experts_fn.set_mono_ep_runtime(runtime)
+        experts_fn.set_mono_ep_mode("dispatch")
+        monkeypatch.setattr(
+            experts_fn,
+            "resolve_local_implementation",
+            lambda name=None: lambda experts, rx, ri, rw: rx,
+        )
+        experts_fn.set_valid_token_mask(torch.tensor([True, False, True, True]))
+        experts_fn.set_token_capacity(2)
+        ids = torch.tensor([[0, 1], [0, 1], [0, 2], [0, 3]])
+        weights = torch.tensor([[0.6, 0.4], [0.9, 0.1], [0.7, 0.3], [0.5, 0.5]])
+        experts_fn._ep_forward(
+            _sharded_experts(),
+            torch.randn(4, 512, dtype=torch.bfloat16),
+            ids,
+            weights,
+            backend="mono_ep",
+        )
+        _, _, ridx, rw, _ = runtime.calls[0]
+        assert ridx[1].tolist() == [-1, -1]
+        assert ridx[:, 0].tolist() == [0, -1, 0, -1]
+        torch.testing.assert_close(rw[3], torch.tensor([0.0, 1.0]))
+
+    def test_fused_mode_bypasses_local_kernel(self, monkeypatch):
+        experts_fn.set_mono_ep_runtime(_FakeRuntime())
+        experts_fn.set_mono_ep_mode("dispatch")
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("fused mode must not run the local path")
+
+        monkeypatch.setattr(experts_fn, "_run_local", forbidden)
+        x, ids, weights = self._inputs()
+        y = experts_fn._ep_forward(
+            _sharded_experts(), x, ids, weights, backend="mono_ep", mono_ep_mode="fused"
+        )
+        torch.testing.assert_close(y, (x.bfloat16() * 2).float())
+
+    def test_compiles_fullgraph(self, monkeypatch):
+        from transformers.integrations.moe import grouped_mm_experts_forward
+
+        runtime = _FakeDispatchRuntime(capacity=8)
+        experts_fn.set_mono_ep_runtime(runtime)
+        experts_fn.set_mono_ep_mode("dispatch")
+        monkeypatch.setattr(
+            experts_fn,
+            "resolve_local_implementation",
+            lambda name=None: grouped_mm_experts_forward,
+        )
+        experts = _sharded_experts().bfloat16()
+        x, ids, weights = self._inputs()
+        x = x.bfloat16().requires_grad_(True)
+        weights = weights.float().requires_grad_(True)
+        eager = experts_fn._ep_forward(experts, x, ids, weights, backend="mono_ep")
+        torch._dynamo.reset()
+        compiled = torch.compile(experts_fn._ep_forward, fullgraph=True)
+        y = compiled(experts, x, ids, weights, backend="mono_ep")
+        torch.testing.assert_close(y, eager)
+        y.float().sum().backward()
+        assert x.grad is not None and weights.grad is not None
+        assert experts.gate_up_proj.grad is not None
+
 
 class TestArgs:
     def test_backend_and_precision_keys(self):
@@ -218,6 +385,16 @@ class TestArgs:
         assert ExpertParallelArgs().expert_parallel_mono_ep_precision == "auto"
         with pytest.raises(ValueError):
             ExpertParallelArgs(expert_parallel_mono_ep_precision="fp4")
+
+    @pytest.mark.parametrize("mode", ["auto", "fused", "dispatch"])
+    def test_mode_key(self, mode):
+        args = ExpertParallelArgs(
+            expert_parallel_backend="mono_ep", expert_parallel_mono_ep_mode=mode
+        )
+        assert args.expert_parallel_mono_ep_mode == mode
+        assert ExpertParallelArgs().expert_parallel_mono_ep_mode == "auto"
+        with pytest.raises(ValueError):
+            ExpertParallelArgs(expert_parallel_mono_ep_mode="peer")
 
 
 class TestBackendResolution:
@@ -259,14 +436,33 @@ class TestBackendResolution:
             ({"model_quantization_config": "Mxfp4Config"}, "model_quantization_config"),
         ],
     )
-    def test_config_reasons(self, mono_ep_package, extra, match):
-        cfg = _cfg(**extra)
+    def test_config_reasons_force_fused_to_fall_back(
+        self, mono_ep_package, extra, match
+    ):
+        cfg = _cfg(expert_parallel_mono_ep_mode="fused", **extra)
         assert ExpertParallelPlugin._resolve_backend(cfg) == "torch"
-        cfg = _cfg(expert_parallel_fallback_on_unsupported=False, **extra)
+        cfg = _cfg(
+            expert_parallel_mono_ep_mode="fused",
+            expert_parallel_fallback_on_unsupported=False,
+            **extra,
+        )
         with pytest.raises(ValueError, match=match):
             ExpertParallelPlugin._resolve_backend(cfg)
 
-    def test_lora_with_sonicmoe_lands_on_torch_sonicmoe(
+    @pytest.mark.parametrize("mode", ["auto", "dispatch"])
+    @pytest.mark.parametrize("extra", [{"adapter": "lora"}, {"load_in_8bit": True}])
+    def test_config_reasons_keep_mono_ep_in_other_modes(
+        self, mono_ep_package, mode, extra
+    ):
+        cfg = _cfg(
+            expert_parallel_mono_ep_mode=mode,
+            expert_parallel_fallback_on_unsupported=False,
+            **extra,
+        )
+        assert ExpertParallelPlugin._resolve_backend(cfg) == "mono_ep"
+        assert not ExpertParallelPlugin._mono_ep_fused_possible(cfg)
+
+    def test_forced_fused_lora_with_sonicmoe_lands_on_torch_sonicmoe(
         self, monkeypatch, mono_ep_package
     ):
         registered = []
@@ -274,12 +470,36 @@ class TestBackendResolution:
             "axolotl.integrations.kernels.libs.sonicmoe.experts.register_sonicmoe_experts",
             lambda: registered.append("sonicmoe"),
         )
-        cfg = _cfg(adapter="lora", use_sonicmoe=True)
+        cfg = _cfg(
+            adapter="lora", use_sonicmoe=True, expert_parallel_mono_ep_mode="fused"
+        )
         ExpertParallelPlugin().pre_model_load(cfg)
         assert cfg.expert_parallel_backend == "torch"
         assert experts_fn.get_backend() == "torch"
         assert experts_fn.get_local_implementation() == "sonicmoe"
         assert registered == ["sonicmoe"]
+
+    def test_auto_lora_with_sonicmoe_picks_dispatch_mode(
+        self, monkeypatch, mono_ep_package, cuda_capability
+    ):
+        monkeypatch.setattr(
+            "axolotl.integrations.kernels.libs.sonicmoe.experts.register_sonicmoe_experts",
+            lambda: None,
+        )
+        monkeypatch.delenv("NCCL_MAX_CTAS", raising=False)
+        cfg = _cfg(adapter="lora", use_sonicmoe=True)
+        plugin = ExpertParallelPlugin()
+        plugin.pre_model_load(cfg)  # no NCCL_MAX_CTAS needed: fused is already out
+        assert cfg.expert_parallel_backend == "mono_ep"
+        assert experts_fn.get_mono_ep_mode() == "dispatch"
+        assert experts_fn.get_local_implementation() == "sonicmoe"
+        plugin.post_model_build(cfg, _qwen3_model())
+        assert cfg.expert_parallel_backend == "mono_ep"
+        assert cfg.expert_parallel_mono_ep_mode == "dispatch"
+        assert experts_fn.get_backend() == "mono_ep"
+        assert plugin._mono_ep_dispatch_geometry == plugin_mod.MonoEPDispatchGeometry(
+            hidden=512, top_k=2
+        )
 
 
 class TestModelFallback:
@@ -297,13 +517,13 @@ class TestModelFallback:
             ({}, lambda e: setattr(e, "has_post_expert_norm", True), "post-expert"),
         ],
     )
-    def test_unsupported_model_falls_back_to_torch(
+    def test_unsupported_model_falls_back_to_torch_in_fused_mode(
         self, mono_ep_package, cuda_capability, caplog, build, mutate, match
     ):
         model = _qwen3_model(**build)
         if mutate is not None:
             mutate(model.mlp.experts)
-        cfg = _cfg()
+        cfg = _cfg(expert_parallel_mono_ep_mode="fused")
         with caplog.at_level("WARNING"):
             ExpertParallelPlugin().post_model_build(cfg, model)
         assert match in caplog.text
@@ -315,8 +535,83 @@ class TestModelFallback:
             mutate(model.mlp.experts)
         with pytest.raises(ValueError, match=match):
             ExpertParallelPlugin().post_model_build(
-                _cfg(expert_parallel_fallback_on_unsupported=False), model
+                _cfg(
+                    expert_parallel_mono_ep_mode="fused",
+                    expert_parallel_fallback_on_unsupported=False,
+                ),
+                model,
             )
+
+    @pytest.mark.parametrize(
+        "build,mutate,match",
+        [
+            ({"hidden": 384}, None, "multiple of 256"),
+            ({"hidden_act": "gelu"}, None, "SwiGLU"),
+            ({}, lambda e: setattr(e, "has_bias", True), "biases"),
+            ({}, lambda e: setattr(e, "limit", 7.0), "clamped"),
+            ({}, lambda e: setattr(e, "has_gate", False), "not gated"),
+        ],
+    )
+    def test_unsupported_model_uses_dispatch_mode_in_auto(
+        self, mono_ep_package, cuda_capability, caplog, build, mutate, match
+    ):
+        model = _qwen3_model(**build)
+        if mutate is not None:
+            mutate(model.mlp.experts)
+        cfg = _cfg(expert_parallel_fallback_on_unsupported=False)
+        plugin = ExpertParallelPlugin()
+        with caplog.at_level("INFO"):
+            plugin.post_model_build(cfg, model)
+        assert match in caplog.text and "peer dispatch mode" in caplog.text
+        assert cfg.expert_parallel_backend == "mono_ep"
+        assert cfg.expert_parallel_mono_ep_mode == "dispatch"
+        assert experts_fn.get_backend() == "mono_ep"
+        assert experts_fn.get_mono_ep_mode() == "dispatch"
+        assert plugin._mono_ep_geometry is None
+        assert plugin._mono_ep_dispatch_geometry.top_k == 2
+
+    def test_forced_dispatch_skips_fused_checks(
+        self, mono_ep_package, cuda_capability, caplog
+    ):
+        model = _qwen3_model(hidden_act="gelu")
+        cfg = _cfg(
+            expert_parallel_mono_ep_mode="dispatch",
+            expert_parallel_fallback_on_unsupported=False,
+        )
+        with caplog.at_level("INFO"):
+            ExpertParallelPlugin().post_model_build(cfg, model)
+        assert "SwiGLU" not in caplog.text
+        assert cfg.expert_parallel_mono_ep_mode == "dispatch"
+        assert experts_fn.get_mono_ep_mode() == "dispatch"
+
+    @pytest.mark.parametrize(
+        "capability,match",
+        [(None, "CUDA is unavailable"), ((7, 0), "sm_70")],
+    )
+    def test_dispatch_unsupported_falls_back_to_torch(
+        self, mono_ep_package, cuda_capability, caplog, capability, match
+    ):
+        cuda_capability(capability)
+        cfg = _cfg()
+        with caplog.at_level("WARNING"):
+            ExpertParallelPlugin().post_model_build(cfg, _qwen3_model())
+        assert "peer dispatch" in caplog.text and match in caplog.text
+        assert cfg.expert_parallel_backend == "torch"
+        assert experts_fn.get_backend() == "torch"
+        with pytest.raises(ValueError, match=match):
+            ExpertParallelPlugin().post_model_build(
+                _cfg(expert_parallel_fallback_on_unsupported=False), _qwen3_model()
+            )
+
+    @pytest.mark.parametrize("capability", [(8, 0), (12, 0)])
+    def test_auto_dispatch_on_hardware_without_fused_kernels(
+        self, mono_ep_package, cuda_capability, capability
+    ):
+        cuda_capability(capability)
+        cfg = _cfg(expert_parallel_fallback_on_unsupported=False)
+        ExpertParallelPlugin().post_model_build(cfg, _qwen3_model())
+        assert cfg.expert_parallel_backend == "mono_ep"
+        assert cfg.expert_parallel_mono_ep_mode == "dispatch"
 
     @pytest.mark.parametrize(
         "capability,precision,match",
@@ -372,7 +667,7 @@ class TestModelFallback:
         experts.__class__ = type(
             "GeluGateExperts", (type(experts),), {"_apply_gate": _apply_gate}
         )
-        cfg = _cfg()
+        cfg = _cfg(expert_parallel_mono_ep_mode="fused")
         with caplog.at_level("WARNING"):
             ExpertParallelPlugin().post_model_build(cfg, model)
         assert "custom gated activation" in caplog.text
@@ -389,7 +684,9 @@ class TestModelFallback:
         plugin = ExpertParallelPlugin()
         plugin.post_model_build(cfg, _qwen3_model())
         assert cfg.expert_parallel_backend == "mono_ep"
+        assert cfg.expert_parallel_mono_ep_mode == "fused"
         assert experts_fn.get_backend() == "mono_ep"
+        assert experts_fn.get_mono_ep_mode() == "fused"
         assert plugin._mono_ep_geometry == plugin_mod.MonoEPGeometry(
             num_experts=4, hidden=512, intermediate=1024, top_k=2, activation_clamp=None
         )
@@ -455,6 +752,48 @@ class TestRuntimeLifecycle:
     def test_torch_fallback_builds_nothing(self, monkeypatch, mono_ep_package):
         self._built(_cfg(expert_parallel_backend="torch"), monkeypatch)
         assert _FakeRuntime.instances == []
+        assert _FakeDispatchRuntime.instances == []
+
+    @pytest.mark.parametrize("save_dispatch", [False, True])
+    def test_dispatch_runtime_lifecycle(
+        self, monkeypatch, mono_ep_package, save_dispatch
+    ):
+        from torch.utils.checkpoint import CheckpointPolicy
+
+        from axolotl.monkeypatch.selective_checkpointing import registered_save_policy
+
+        group = object()
+        monkeypatch.setattr(
+            ExpertParallelPlugin, "_resolve_ep_group", staticmethod(lambda cfg: group)
+        )
+        cfg = _cfg(
+            expert_parallel_mono_ep_mode="dispatch",
+            expert_parallel_save_dispatch=save_dispatch,
+            activation_checkpointing={"enabled": False},
+        )
+        plugin = ExpertParallelPlugin()
+        plugin._mono_ep_dispatch_geometry = plugin_mod.MonoEPDispatchGeometry(512, 2)
+        plugin.post_model_load(cfg, torch.nn.Linear(2, 2))
+        assert _FakeRuntime.instances == []
+        (runtime,) = _FakeDispatchRuntime.instances
+        assert runtime.kwargs == {
+            "group": group,
+            "max_tokens_per_rank": 2000,  # no kernel token alignment in dispatch mode
+            "top_k": 2,
+            "hidden": 512,
+        }
+        assert experts_fn.get_mono_ep_runtime() is runtime
+        for name in ("mono_ep::peer_dispatch", "mono_ep::peer_combine"):
+            policy = registered_save_policy(SimpleNamespace(name=lambda n=name: n), {})
+            # unregistered ops follow the layer policy, i.e. the transfers are replayed
+            assert policy == (CheckpointPolicy.PREFER_SAVE if save_dispatch else None)
+
+        plugin.post_model_load(cfg, torch.nn.Linear(2, 2))
+        assert len(_FakeDispatchRuntime.instances) == 1
+        plugin.post_train_unload(cfg)
+        assert runtime.destroyed
+        with pytest.raises(RuntimeError, match="no runtime built"):
+            experts_fn.get_mono_ep_runtime()
 
 
 class TestDistributedEnv:
@@ -473,10 +812,19 @@ class TestDistributedEnv:
             {"expert_parallel_backend": "auto"},
             {"expert_parallel_size": 1},
             {"adapter": "lora"},
+            {"load_in_4bit": True, "expert_parallel_mono_ep_mode": "auto"},
+            {"expert_parallel_mono_ep_mode": "dispatch"},
         ],
     )
     def test_other_backends_export_nothing(self, mono_ep_package, extra):
         assert ExpertParallelPlugin().get_distributed_env(_cfg(**extra)) == {}
+
+    def test_dispatch_mode_needs_no_nccl_max_ctas(self, monkeypatch, mono_ep_package):
+        monkeypatch.delenv("NCCL_MAX_CTAS", raising=False)
+        cfg = _cfg(expert_parallel_mono_ep_mode="dispatch")
+        ExpertParallelPlugin().pre_model_load(cfg)
+        assert experts_fn.get_backend() == "mono_ep"
+        assert experts_fn.get_mono_ep_mode() == "dispatch"
 
     def test_missing_package_exports_nothing(self, no_package):
         assert ExpertParallelPlugin().get_distributed_env(_cfg()) == {}

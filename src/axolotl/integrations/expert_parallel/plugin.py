@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Expert-Parallel plugin for axolotl (DeepEP, torch all-to-all or fused mono_ep)."""
+"""Expert-Parallel plugin for axolotl (DeepEP, torch all-to-all or mono_ep)."""
 
 from __future__ import annotations
 
@@ -54,6 +54,11 @@ class MonoEPGeometry(NamedTuple):
     intermediate: int
     top_k: int
     activation_clamp: float | None
+
+
+class MonoEPDispatchGeometry(NamedTuple):
+    hidden: int
+    top_k: int
 
 
 def expert_fsdp_mesh(mesh):
@@ -151,15 +156,13 @@ class ExpertParallelPlugin(BasePlugin):
         return "axolotl.integrations.expert_parallel.ExpertParallelArgs"
 
     _mono_ep_geometry: MonoEPGeometry | None = None
+    _mono_ep_dispatch_geometry: MonoEPDispatchGeometry | None = None
 
     def get_distributed_env(self, cfg) -> dict[str, str]:
         """``NCCL_MAX_CTAS`` sized to the SMs ``mono_ep`` leaves free, so FSDP collectives
-        cannot deadlock behind the persistent kernels. Pure: no CUDA or process group."""
-        if (
-            not self._is_ep_enabled(cfg)
-            or getattr(cfg, "expert_parallel_backend", None) != MONO_EP
-            or self._mono_ep_config_reason(cfg) is not None
-        ):
+        cannot deadlock behind the persistent kernels. Pure: no CUDA or process group.
+        Nothing is exported once the config alone rules the fused mode out."""
+        if not self._is_ep_enabled(cfg) or not self._mono_ep_fused_possible(cfg):
             return {}
         from mono_ep import DEFAULT_RESERVED_SMS, nccl_env
 
@@ -190,30 +193,41 @@ class ExpertParallelPlugin(BasePlugin):
 
         register_all()
 
-        # mono_ep ignores the local implementation, but a later model-level fallback
-        # to torch runs it, so it is validated and registered all the same
+        # mono_ep's fused mode ignores the local implementation, but its dispatch mode
+        # and a later model-level fallback to torch run it, so it is validated and
+        # registered all the same
         local = self._infer_local_implementation(cfg)
         self._check_local_implementation(local)
         self._register_kernel_implementation(local)
         set_backend(backend)
         set_local_implementation(local)
+        mode = None
         if backend == MONO_EP:
-            from mono_ep import DEFAULT_RESERVED_SMS, check_nccl_env
+            from .experts_fn import set_mono_ep_mode
 
-            check_nccl_env(
-                reserved_sms=DEFAULT_RESERVED_SMS,
-                dp_replicate=getattr(cfg, "dp_replicate_size", None) or 1,
-            )
+            mode = self._mono_ep_mode(cfg)
+            fused_possible = self._mono_ep_fused_possible(cfg)
+            set_mono_ep_mode("fused" if fused_possible else "dispatch")
+            if fused_possible:
+                from mono_ep import DEFAULT_RESERVED_SMS, check_nccl_env
+
+                check_nccl_env(
+                    reserved_sms=DEFAULT_RESERVED_SMS,
+                    dp_replicate=getattr(cfg, "dp_replicate_size", None) or 1,
+                )
         previous = getattr(cfg, "experts_implementation", None)
         cfg.experts_implementation = EXPERT_PARALLEL
+        if backend != MONO_EP:
+            detail = f"wrapping {local!r}"
+        elif mode == "fused":
+            detail = f"(fused; {local!r} only on fallback)"
+        elif mode == "dispatch":
+            detail = f"(peer dispatch wrapping {local!r})"
+        else:
+            detail = f"(mode auto: fused, else peer dispatch wrapping {local!r})"
         LOG.info(
             f"expert_parallel: backend={backend!r}, experts_implementation "
-            f"{previous!r} -> {EXPERT_PARALLEL!r} "
-            + (
-                f"(fused; {local!r} only on fallback)"
-                if backend == MONO_EP
-                else f"wrapping {local!r}"
-            )
+            f"{previous!r} -> {EXPERT_PARALLEL!r} {detail}"
         )
 
     def post_model_build(self, cfg, model):
@@ -306,7 +320,10 @@ class ExpertParallelPlugin(BasePlugin):
 
         self._register_padding_dispatch_hook(model)
         if getattr(cfg, "expert_parallel_backend", None) == MONO_EP:
-            self._build_mono_ep_runtime(cfg)
+            if self._mono_ep_mode(cfg) == "dispatch":
+                self._build_mono_ep_dispatch_runtime(cfg)
+            else:
+                self._build_mono_ep_runtime(cfg)
         if self._uses_torch_backend(cfg):
             self._install_required_checkpoint_policy(cfg, model)
 
@@ -502,10 +519,32 @@ class ExpertParallelPlugin(BasePlugin):
             runtime.destroy()
 
     @staticmethod
-    def _mono_ep_config_reason(cfg) -> str | None:
-        """Config-only reasons ``mono_ep`` cannot run (pure: no CUDA)."""
+    def _mono_ep_mode(cfg) -> str:
+        return getattr(cfg, "expert_parallel_mono_ep_mode", None) or "auto"
+
+    @classmethod
+    def _mono_ep_config_reason(cls, cfg) -> str | None:
+        """Config-only reasons ``mono_ep`` cannot run at all (pure: no CUDA). In the forced
+        ``fused`` mode the fused mode's own config reasons count too."""
         if find_spec("mono_ep") is None:
             return "the mono_ep package is not installed (packages/mono-ep)"
+        if cls._mono_ep_mode(cfg) == "fused":
+            return cls._mono_ep_fused_config_reason(cfg)
+        return None
+
+    @classmethod
+    def _mono_ep_fused_possible(cls, cfg) -> bool:
+        """Whether the config still allows the fused mode (so the SM reservation applies)."""
+        return (
+            getattr(cfg, "expert_parallel_backend", None) == MONO_EP
+            and cls._mono_ep_mode(cfg) != "dispatch"
+            and cls._mono_ep_config_reason(cfg) is None
+            and cls._mono_ep_fused_config_reason(cfg) is None
+        )
+
+    @staticmethod
+    def _mono_ep_fused_config_reason(cfg) -> str | None:
+        """Config-only reasons the fused mode cannot run (the dispatch mode can)."""
         if getattr(cfg, "adapter", None):
             return (
                 f"adapter {cfg.adapter!r} is configured; the fused kernels train full "
@@ -644,16 +683,119 @@ class ExpertParallelPlugin(BasePlugin):
             )
         return geometries.pop(), None
 
-    def _resolve_mono_ep_model(self, cfg, model) -> str:
-        geometry, reason = self._mono_ep_model_reason(cfg, model)
-        if reason is not None:
-            from .experts_fn import set_backend
+    @classmethod
+    def _mono_ep_dispatch_reason(
+        cls, cfg, model
+    ) -> tuple[MonoEPDispatchGeometry | None, str | None]:
+        """The dispatch mode's geometry, or why the peer dispatch cannot run here. The
+        single-host requirement is checked by the runtime on the resolved EP group."""
+        if not torch.cuda.is_available():
+            return None, "CUDA is unavailable"
+        from mono_ep import dispatch_unsupported_reason
 
-            backend = self._mono_ep_fallback(cfg, reason)
+        reason = dispatch_unsupported_reason(
+            capability=torch.cuda.get_device_capability()
+        )
+        if reason is not None:
+            return None, reason
+        config = getattr(model, "config", None)
+        get_text_config = getattr(config, "get_text_config", None)
+        text_config = get_text_config() if callable(get_text_config) else config
+        hidden = getattr(text_config, "hidden_size", None)
+        top_k = next(
+            (
+                getattr(text_config, key)
+                for key in _TOP_K_KEYS
+                if isinstance(getattr(text_config, key, None), int)
+            ),
+            None,
+        )
+        if not isinstance(hidden, int) or top_k is None:
+            return (
+                None,
+                "the model config does not name its hidden size and router top-k",
+            )
+        return MonoEPDispatchGeometry(hidden, top_k), None
+
+    def _resolve_mono_ep_model(self, cfg, model) -> str:
+        """Settle ``expert_parallel_mono_ep_mode`` against the model: ``fused`` when it is
+        allowed and supported, else ``dispatch``, else the backend fallback."""
+        from .experts_fn import set_backend, set_mono_ep_mode
+
+        mode = self._mono_ep_mode(cfg)
+        fused_reason = None
+        if mode != "dispatch":
+            fused_reason = self._mono_ep_fused_config_reason(cfg)
+            if fused_reason is None:
+                geometry, fused_reason = self._mono_ep_model_reason(cfg, model)
+            if fused_reason is None:
+                self._mono_ep_geometry = geometry
+                cfg.expert_parallel_mono_ep_mode = "fused"
+                set_mono_ep_mode("fused")
+                return MONO_EP
+            if mode == "fused":
+                backend = self._mono_ep_fallback(cfg, fused_reason)
+                set_backend(backend)
+                return backend
+            LOG.info(
+                f"expert_parallel: mono_ep fused mode is unsupported here ({fused_reason}); "
+                "using the peer dispatch mode with the configured local experts kernel."
+            )
+        dispatch_geometry, reason = self._mono_ep_dispatch_reason(cfg, model)
+        if reason is not None:
+            backend = self._mono_ep_fallback(cfg, f"peer dispatch: {reason}")
             set_backend(backend)
             return backend
-        self._mono_ep_geometry = geometry
+        self._mono_ep_dispatch_geometry = dispatch_geometry
+        cfg.expert_parallel_mono_ep_mode = "dispatch"
+        set_mono_ep_mode("dispatch")
         return MONO_EP
+
+    def _build_mono_ep_dispatch_runtime(self, cfg) -> None:
+        """One peer dispatch/combine runtime per process, shared by every MoE layer."""
+        from mono_ep import MonoEPDispatchRuntime
+
+        from axolotl.monkeypatch.selective_checkpointing import register_preferred_save
+
+        from .experts_fn import set_mono_ep_runtime
+
+        geometry = self._mono_ep_dispatch_geometry
+        if geometry is None:
+            raise RuntimeError(
+                "expert_parallel: mono_ep dispatch geometry was not resolved in "
+                "post_model_build"
+            )
+        if self.__dict__.get("_mono_ep_runtime") is not None:
+            return
+        runtime = MonoEPDispatchRuntime(
+            group=self._resolve_ep_group(cfg),
+            max_tokens_per_rank=self._mono_ep_tokens_per_rank(cfg),
+            top_k=geometry.top_k,
+            hidden=geometry.hidden,
+        )
+        self._mono_ep_runtime = runtime
+        set_mono_ep_runtime(runtime)
+        if getattr(cfg, "expert_parallel_save_dispatch", False):
+            # same trade as the torch all-to-all saves: hold the received rows so the
+            # recompute does not re-run the peer transfers
+            register_preferred_save(ops={runtime.dispatch_op, runtime.combine_op})
+        LOG.info(
+            f"expert_parallel: mono_ep peer dispatch runtime, "
+            f"{runtime.max_tokens_per_rank} tokens/rank, {runtime.receive_rows} receive "
+            f"rows, top-{geometry.top_k}, hidden {geometry.hidden}"
+        )
+
+    @staticmethod
+    def _mono_ep_tokens_per_rank(cfg) -> int:
+        batch = max(
+            getattr(cfg, "micro_batch_size", None) or 1,
+            getattr(cfg, "eval_batch_size", None) or 1,
+        )
+        return math.ceil(
+            cfg.sequence_len
+            * batch
+            / (getattr(cfg, "context_parallel_size", None) or 1)
+        )
 
     def _build_mono_ep_runtime(self, cfg) -> None:
         """One runtime (and symmetric buffer) per process, shared by every MoE layer."""
@@ -670,15 +812,7 @@ class ExpertParallelPlugin(BasePlugin):
             )
         if self.__dict__.get("_mono_ep_runtime") is not None:
             return
-        batch = max(
-            getattr(cfg, "micro_batch_size", None) or 1,
-            getattr(cfg, "eval_batch_size", None) or 1,
-        )
-        tokens = math.ceil(
-            cfg.sequence_len
-            * batch
-            / (getattr(cfg, "context_parallel_size", None) or 1)
-        )
+        tokens = self._mono_ep_tokens_per_rank(cfg)
         alignment = MonoEPRuntime.token_alignment()
         tokens = -(-tokens // alignment) * alignment
         runtime = MonoEPRuntime(

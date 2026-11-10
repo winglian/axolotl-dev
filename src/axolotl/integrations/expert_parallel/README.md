@@ -8,10 +8,10 @@ Replaces the MoE dispatch/combine path with token-parallel expert dispatch, on o
 |----------------------------|----------|-------|
 | `deep_ep`                  | DeepEP's fused NVSHMEM kernels | NVLink (intranode) or RDMA (internode); the `deep_ep` build — see [Installation](#installation) |
 | `torch`                     | Plain `all_to_all_single` over the EP process group | Any NCCL or gloo fabric — no extra build, works over PCIe |
-| `mono_ep`               | Fused: dispatch, SwiGLU experts and combine in one persistent kernel per direction | Hopper or Blackwell, one NVLink node, the `mono_ep` package — see [Fused `mono_ep` backend](#fused-mono_ep-backend) |
+| `mono_ep`               | The `mono_ep` package over NVLink symmetric memory: `fused` mode runs dispatch, SwiGLU experts and combine in one persistent kernel per direction; `dispatch` mode runs mono-ep's peer dispatch/combine around the configured local-experts kernel | One NVLink node and the `mono_ep` package; `fused` needs Hopper or Blackwell, `dispatch` SM80+ — see [`mono_ep` backend](#mono_ep-backend) |
 | `auto` (default)            | `deep_ep` if importable, else `torch` (never `mono_ep`) | — |
 
-`deep_ep` and `torch` compose with the same local-experts kernel (ScatterMoE, SonicMoE, grouped_mm, eager), the same FSDP mesh, and the same sharding/save-load path — only the token dispatch/combine collective differs. Set explicitly to pin one:
+`deep_ep`, `torch` and `mono_ep` in `dispatch` mode compose with the same local-experts kernel (ScatterMoE, SonicMoE, grouped_mm, eager), the same FSDP mesh, and the same sharding/save-load path — only the token dispatch/combine collective differs. Set explicitly to pin one:
 
 ```yaml
 expert_parallel_backend: torch  # or deep_ep; omit for auto
@@ -35,22 +35,31 @@ The dispatched/combined rows are recomputed by default. `expert_parallel_save_di
 
 Overlap is not a speedup guarantee: each chunk adds its own collectives and kernel launches, and that per-chunk overhead can exceed what the overlap hides. On 2x PCIe GPUs (16k tokens, hidden 4096), `N: 2` was 12-18% faster when expert compute dominated and ~5% slower when communication-bound; `N: 4` helped only in the most compute-heavy case, and `N: 8` was never faster and up to 3x slower. Benchmark your model's forward before raising `N`, and start from `2`.
 
-### Fused `mono_ep` backend
+### `mono_ep` backend
 
-`mono_ep` (from `packages/mono-ep`) replaces dispatch, the local experts kernel and combine with one persistent kernel per direction that moves tokens over NVLink symmetric memory. The local-kernel axis does not apply: `use_sonicmoe`, `use_scattermoe` and `experts_implementation` are ignored (config validation warns) and are used only if the backend falls back to `torch`.
+`mono_ep` (from `packages/mono-ep`) moves tokens over NVLink symmetric memory in one of two modes, chosen by `expert_parallel_mono_ep_mode`:
+
+| `expert_parallel_mono_ep_mode` | Dispatch / combine | Local experts kernel |
+|--------------------------------|--------------------|----------------------|
+| `fused`   | one persistent kernel per direction fusing dispatch, SwiGLU experts and combine | not used: `use_sonicmoe`, `use_scattermoe` and `experts_implementation` are ignored (config validation warns) and apply only if the backend falls back to `torch` |
+| `dispatch` | mono-ep's peer dispatch and combine (`mono_ep::peer_dispatch` / `peer_combine`): every rank pulls the rows routed to its experts straight out of the peers' buffers and pushes the expert outputs back into per-token slots | whichever the config names, exactly as under `deep_ep` / `torch`, so LoRA, quantized experts, biases, non-SiLU gates, clamped SwiGLU and shared experts all work |
+| `auto` (default) | `fused` when the config and model pass the fused checks below, otherwise `dispatch` when the hardware supports it, otherwise the `expert_parallel_fallback_on_unsupported` behaviour | |
 
 ```yaml
 plugins:
   - axolotl.integrations.expert_parallel.ExpertParallelPlugin
 expert_parallel_size: 8
 expert_parallel_backend: mono_ep
-expert_parallel_mono_ep_precision: auto  # bf16 | mxfp8 | fp8 | fp8_bwd
+expert_parallel_mono_ep_mode: auto       # fused | dispatch
+expert_parallel_mono_ep_precision: auto  # fused mode: bf16 | mxfp8 | fp8 | fp8_bwd
 fsdp_version: 2
 fsdp_config:
   state_dict_type: FULL_STATE_DICT
 ```
 
-Install the package and its pinned DeepGEMM build with `bash cicd/install_mono_ep.sh` (builds `packages/mono-ep/vendor/deepgemm`, then installs `packages/mono-ep`).
+Install the package and its pinned DeepGEMM build with `bash cicd/install_mono_ep.sh` (builds `packages/mono-ep/vendor/deepgemm`, then installs `packages/mono-ep`). The `dispatch` mode needs only the package itself (Triton kernels and torch symmetric memory, no DeepGEMM).
+
+#### Fused mode
 
 | Precision | SM90 (Hopper) | SM100 (Blackwell) |
 |-----------|---------------|-------------------|
@@ -62,20 +71,28 @@ Install the package and its pinned DeepGEMM build with `bash cicd/install_mono_e
 
 Master weights keep their own dtype (BF16 or FP32) and weight gradients come back in it. SM120 (RTX PRO 6000, RTX 50-series) and older GPUs are unsupported and fall back.
 
-**Fallback matrix.** When `mono_ep` cannot run, `expert_parallel_fallback_on_unsupported: true` (the default) logs the reason and degrades to `expert_parallel_backend: torch` with whichever local kernel the config names (so LoRA with `use_sonicmoe: true` lands on `torch` + SonicMoE); with `false` it raises with the reason.
+**Fallback matrix.** The fused checks below decide between the modes; the dispatch mode has its own, much shorter list. Under `expert_parallel_fallback_on_unsupported: true` (the default) a `mono_ep` that cannot run in the requested mode logs the reason and degrades; with `false` it raises with the reason.
 
-| Condition | Checked |
-|-----------|---------|
-| `mono_ep` package not installed | config load |
-| an adapter (`adapter: lora`, `qlora`, ...) is configured | config load |
-| quantized loading (`load_in_4bit`, `load_in_8bit`, `gptq`, `model_quantization_config`) | config load |
-| no CUDA, or compute capability other than SM90/SM100 | after model build |
-| `hidden_size % 256 != 0` or expert intermediate size `% 128 != 0` | after model build |
-| expert biases, a non-SiLU gate, a custom `_apply_gate` (e.g. `alpha`), or a clamped SwiGLU (`limit`/`swiglu_limit`; the fused backward has no clamp yet) | after model build |
-| experts not in HF `gate_up_proj [E, 2I, H]` / `down_proj [E, H, I]` layout (non-gated, transposed, interleaved, post-expert norm), or MoE layers with different shapes | after model build |
-| the precision does not match the architecture (table above) | after model build |
+| Condition | Checked | `fused` (forced) | `auto` | `dispatch` (forced) |
+|-----------|---------|------------------|--------|---------------------|
+| `mono_ep` package not installed | config load | `torch` | `torch` | `torch` |
+| an adapter (`adapter: lora`, `qlora`, ...) is configured | config load | `torch` | `dispatch` | `dispatch` |
+| quantized loading (`load_in_4bit`, `load_in_8bit`, `gptq`, `model_quantization_config`) | config load | `torch` | `dispatch` | `dispatch` |
+| compute capability other than SM90/SM100 (SM80, SM120, ...) | after model build | `torch` | `dispatch` | `dispatch` |
+| `hidden_size % 256 != 0` or expert intermediate size `% 128 != 0` | after model build | `torch` | `dispatch` | `dispatch` |
+| expert biases, a non-SiLU gate, a custom `_apply_gate` (e.g. `alpha`), or a clamped SwiGLU (`limit`/`swiglu_limit`; the fused backward has no clamp yet) | after model build | `torch` | `dispatch` | `dispatch` |
+| experts not in HF `gate_up_proj [E, 2I, H]` / `down_proj [E, H, I]` layout (non-gated, transposed, interleaved, post-expert norm), or MoE layers with different shapes | after model build | `torch` | `dispatch` | `dispatch` |
+| the precision does not match the architecture (table above) | after model build | `torch` | `dispatch` | `dispatch` |
+| no CUDA, or compute capability below SM80 | after model build | `torch` | `torch` | `torch` |
+| the EP group spans more than one host (symmetric memory is node-local) | runtime build | error | error | error |
 
-There is no `model_type` gate: any HF MoE whose experts match the layout above is accepted.
+"`torch`" means `expert_parallel_backend: torch` with whichever local kernel the config names (so a forced `fused` with LoRA and `use_sonicmoe: true` lands on `torch` + SonicMoE; the default `auto` lands on `dispatch` + SonicMoE). There is no `model_type` gate: any HF MoE whose experts match the layout above is accepted by the fused mode, and any HF MoE the local kernel accepts by the dispatch mode.
+
+#### Dispatch mode
+
+Every rank publishes its tokens, routing and weights into its own symmetric buffers; after a barrier each rank pulls exactly the rows routed to its experts (`mono_ep::pack_peer_rows` over NVLink) into a fixed layout of `expert_parallel_size * capacity` rows (row `s * capacity + t` is token `t` of rank `s`, or a zero row with all `-1` ids), runs the configured local kernel on them through the same `_run_local` path as `deep_ep` / `torch`, and pushes the expert outputs back into per-token slots of the source ranks, which sum them in FP32. Backward is the same two transfers with the payloads swapped, so routing-weight gradients flow like the torch backend's. Rows travel as BF16; the local kernel sets the compute precision (`expert_parallel_mono_ep_precision` does not apply).
+
+The layout is a pure function of the routing: there is no host-side count, no sort and no `.item()`, so the layer stays `torch.compile`-clean; the price is that the local kernel sees the fixed `expert_parallel_size * capacity` rows (sentinel rows are zero-compute in grouped_mm, SonicMoE and ScatterMoE). The capacity is sized like the fused runtime (`sequence_len * max(micro_batch_size, eval_batch_size) / context_parallel_size`). Selective checkpointing replays the transfers on recompute by default; `expert_parallel_save_dispatch: true` keeps the dispatch/combine outputs instead, as it keeps the torch all-to-all outputs. `expert_parallel_dispatch_chunks` does not apply. `NCCL_MAX_CTAS` is exported (and checked) only while the fused mode is still possible for the config; a forced `dispatch` mode, an adapter or quantized loading skip it.
 
 **Runtime.** The plugin builds one runtime per process in `post_model_load` on the resolved EP group, sized for `sequence_len * max(micro_batch_size, eval_batch_size) / context_parallel_size` tokens per rank (rounded up to the kernel's token alignment), with one symmetric buffer shared by every MoE layer. It is destroyed in `post_train_unload`. Under FSDP2 the expert weights are read with `.to_local()` and keep the usual expert grad scaling. The forward and backward are `torch.library` custom ops (`mono_ep::persistent_forward` / `persistent_backward`) with fake implementations and no host syncs in the seam, so the EP layer is meant to compile under `torch_compile: true` without graph breaks (the four-GPU compile parity test has not been run yet); nothing from the forward is retained (backward restages the inputs and recomputes). Selective checkpointing always saves the fused op's output and the router `topk`, and reentrant checkpointing is rejected as for `torch`.
 

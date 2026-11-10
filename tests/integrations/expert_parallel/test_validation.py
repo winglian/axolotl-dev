@@ -149,3 +149,52 @@ class TestTopologyHelper:
             ),
         )
         validate_expert_parallel_topology(cfg)
+
+
+@pytest.mark.usefixtures("ep_plugin")
+class TestMonoEPModeValidation:
+    """Config warnings follow the resolved ``expert_parallel_mono_ep_mode``."""
+
+    @staticmethod
+    def _validate(min_base_cfg, caplog, **kw):
+        with caplog.at_level("WARNING"):
+            cfg = _validate(
+                min_base_cfg, expert_parallel_backend="mono_ep", **FULL_FSDP, **kw
+            )
+        return cfg, caplog.text
+
+    def test_fused_mode_warns_about_ignored_local_kernel(self, min_base_cfg, caplog):
+        cfg, text = self._validate(
+            min_base_cfg,
+            caplog,
+            expert_parallel_mono_ep_mode="fused",
+            experts_implementation="batched_mm",
+        )
+        assert cfg.expert_parallel_mono_ep_mode == "fused"
+        assert "(experts_implementation: batched_mm) is ignored" in text
+
+    @pytest.mark.parametrize("mode", ["auto", "dispatch"])
+    def test_other_modes_keep_quiet_about_local_kernel(
+        self, min_base_cfg, caplog, mode
+    ):
+        cfg, text = self._validate(
+            min_base_cfg,
+            caplog,
+            expert_parallel_mono_ep_mode=mode,
+            experts_implementation="batched_mm",
+        )
+        assert cfg.expert_parallel_mono_ep_mode == mode
+        assert "is ignored" not in text
+
+    def test_dispatch_mode_warns_about_precision(self, min_base_cfg, caplog):
+        _, text = self._validate(
+            min_base_cfg,
+            caplog,
+            expert_parallel_mono_ep_mode="dispatch",
+            expert_parallel_mono_ep_precision="mxfp8",
+        )
+        assert "expert_parallel_mono_ep_precision only applies" in text
+
+    def test_default_mode_is_auto(self, min_base_cfg, caplog):
+        cfg, _ = self._validate(min_base_cfg, caplog)
+        assert cfg.expert_parallel_mono_ep_mode == "auto"

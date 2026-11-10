@@ -2325,6 +2325,7 @@ class ModelCompatibilityValidationMixin:
                     "expert_parallel_backend: mono_ep; ignored."
                 )
             return self
+        mode = getattr(self, "expert_parallel_mono_ep_mode", None) or "auto"
         ignored = [
             key
             for key in ("use_sonicmoe", "use_scattermoe")
@@ -2336,16 +2337,29 @@ class ModelCompatibilityValidationMixin:
             "expert_parallel",
         ):
             ignored.append(f"experts_implementation: {self.experts_implementation}")
-        if ignored:
+        if ignored and mode == "fused":
             LOG.warning(
-                f"expert_parallel_backend: mono_ep fuses dispatch, experts and combine, "
+                f"expert_parallel_mono_ep_mode: fused fuses dispatch, experts and combine, "
                 f"so the local experts kernel ({', '.join(ignored)}) is ignored; it is used "
-                "only if mono_ep falls back to the torch backend."
+                "only if mono_ep falls back to the torch backend. Set "
+                "expert_parallel_mono_ep_mode: dispatch (or auto) to run it on mono_ep's "
+                "peer dispatch."
+            )
+        if (
+            mode == "dispatch"
+            and (getattr(self, "expert_parallel_mono_ep_precision", None) or "auto")
+            != "auto"
+        ):
+            LOG.warning(
+                "expert_parallel_mono_ep_precision only applies to "
+                "expert_parallel_mono_ep_mode: fused; the dispatch mode moves BF16 rows "
+                "and the local experts kernel sets the compute precision. Ignored."
             )
         if (getattr(self, "expert_parallel_dispatch_chunks", None) or 1) > 1:
             LOG.warning(
                 "expert_parallel_dispatch_chunks is ignored by expert_parallel_backend: "
-                "mono_ep (communication overlaps inside the fused kernels)."
+                "mono_ep (the fused mode overlaps communication inside its kernels; the "
+                "dispatch mode moves the whole batch per layer)."
             )
         return self
 

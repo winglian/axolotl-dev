@@ -11,8 +11,10 @@
 Dispatches tokens to the ranks owning their experts (DeepEP or torch all-to-all), runs
 whichever experts implementation the user configured on the received rows, and combines
 the results back. Slots owned by another rank reach the local implementation as expert id
-``num_experts`` with weight 0. The fused ``mono_ep`` backend replaces all three stages
-with one persistent kernel per direction, so the local implementation does not apply.
+``num_experts`` with weight 0. The ``mono_ep`` backend has two modes: ``fused`` replaces
+all three stages with one persistent kernel per direction, so the local implementation
+does not apply; ``dispatch`` moves the rows over NVLink symmetric memory and runs the
+local implementation like the other backends.
 """
 
 from __future__ import annotations
@@ -134,9 +136,15 @@ def get_local_implementation() -> str:
     return _LOCAL_IMPLEMENTATION
 
 
-# The process-wide fused runtime (``mono_ep.MonoEPRuntime`` or a test double), built
-# by the EP plugin in ``post_model_load`` and shared by every MoE layer.
+# The process-wide ``mono_ep`` runtime (``mono_ep.MonoEPRuntime`` in fused mode,
+# ``mono_ep.MonoEPDispatchRuntime`` in dispatch mode, or a test double), built by the EP
+# plugin in ``post_model_load`` and shared by every MoE layer.
 _MONO_EP_RUNTIME = None
+
+MONO_EP_MODES = ("fused", "dispatch")
+# Resolved ``expert_parallel_mono_ep_mode`` (``auto`` is settled by the plugin before the
+# runtime is built).
+_MONO_EP_MODE: str = "fused"
 
 
 def set_mono_ep_runtime(runtime) -> None:
@@ -152,6 +160,19 @@ def get_mono_ep_runtime():
             "experts_fn.set_mono_ep_runtime)."
         )
     return _MONO_EP_RUNTIME
+
+
+def set_mono_ep_mode(mode: str) -> None:
+    global _MONO_EP_MODE
+    if mode not in MONO_EP_MODES:
+        raise ValueError(
+            f"unknown mono_ep mode {mode!r}; expected one of {MONO_EP_MODES}"
+        )
+    _MONO_EP_MODE = mode
+
+
+def get_mono_ep_mode() -> str:
+    return _MONO_EP_MODE
 
 
 def _eager_local(experts, recv_x, recv_topk_idx, recv_topk_weights):
@@ -403,7 +424,7 @@ def _local_expert_weights(experts):
     return weights
 
 
-class _MonoEPBackend:
+class _MonoEPFusedBackend:
     cast_bf16 = True
     fused = True  # dispatch, local experts and combine run inside the runtime's kernels
 
@@ -419,6 +440,50 @@ class _MonoEPBackend:
     ):
         w1, w2 = _local_expert_weights(experts)
         return get_mono_ep_runtime().forward(hidden_states, topk_idx, topk_w, w1, w2)
+
+
+class _MonoEPDispatchBackend:
+    """mono-ep's peer-memory dispatch/combine around the configured local kernel.
+
+    The runtime returns the DeepEP row layout over a fixed ``world * capacity`` rows (zero
+    rows with all ``-1`` ids where nothing routes here), so ``_run_local`` and the local
+    kernels run unchanged; combine sums the partial rows onto the source tokens without
+    touching the routing weights, exactly as the torch backend does.
+    """
+
+    cast_bf16 = True
+    fused = False
+
+    @staticmethod
+    def dispatch(
+        hidden_states, topk_idx, topk_w, *, num_experts_global, num_local_experts
+    ):
+        recv_x, recv_idx, recv_w = get_mono_ep_runtime().dispatch(
+            hidden_states, topk_idx, topk_w, num_local_experts
+        )
+        return recv_x, recv_idx, recv_w, (recv_idx, topk_idx, num_local_experts)
+
+    @staticmethod
+    def combine(local_out, handle):
+        recv_idx, topk_idx, num_local_experts = handle
+        return get_mono_ep_runtime().combine(
+            local_out, recv_idx, topk_idx, num_local_experts
+        )
+
+
+class _MonoEPBackend:
+    """``mono_ep`` resolved to the configured mode at call time."""
+
+    cast_bf16 = True
+
+    @staticmethod
+    def resolve(mode: str | None = None):
+        mode = mode or _MONO_EP_MODE
+        if mode not in MONO_EP_MODES:
+            raise ValueError(
+                f"unknown mono_ep mode {mode!r}; expected one of {MONO_EP_MODES}"
+            )
+        return _MonoEPFusedBackend if mode == "fused" else _MonoEPDispatchBackend
 
 
 # duck-typed: ``fused`` backends expose ``forward``, the others ``dispatch``/``combine``
@@ -437,6 +502,7 @@ def _ep_forward(
     *,
     local: str | None = None,
     backend: str | None = None,
+    mono_ep_mode: str | None = None,
 ):
     """Dispatch -> local experts implementation -> combine.
 
@@ -445,7 +511,7 @@ def _ep_forward(
     local expert ids in `[0, E_local)` with `-1` for slots routed to remote experts;
     `_run_local` rewrites those to `E_local` / weight 0 before the local implementation
     (``local``, default: the configured one) sees them. ``backend`` defaults to the one
-    the plugin set.
+    the plugin set, ``mono_ep_mode`` to the resolved mode.
     """
     backend = backend or _BACKEND
     if backend is None:
@@ -454,6 +520,8 @@ def _ep_forward(
             "in pre_model_load (or call experts_fn.set_backend)."
         )
     ep_backend = _BACKENDS[backend]
+    if ep_backend is _MonoEPBackend:
+        ep_backend = _MonoEPBackend.resolve(mono_ep_mode)
     _maybe_install_decorator_attrs(self)
     self._is_expert_parallel = True
     original_dtype = None
