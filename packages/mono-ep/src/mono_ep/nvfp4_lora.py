@@ -22,6 +22,8 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.autograd.function import once_differentiable
 
+from .persistent_backward import owned_backward_ring_tokens
+
 POOL_BLOCK = 128
 
 
@@ -262,6 +264,9 @@ class Nvfp4PersistentBackward:
             runtime.hidden,
             runtime.intermediate,
             mma_type="bf16xbf16",
+            num_min_ring_tokens=owned_backward_ring_tokens(
+                runtime.num_sms, "MONO_EP_NVFP4_BACKWARD_RING_WAVES", default_waves=1
+            ),
         )
         self.handles = []
         capacity = self.buffer.num_max_tokens_per_rank

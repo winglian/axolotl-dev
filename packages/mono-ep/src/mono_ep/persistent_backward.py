@@ -12,6 +12,21 @@ import torch.distributed._symmetric_memory as symm_mem
 
 from .ops import weight_grad_bf16, weight_grad_bf16_gpu_offsets
 
+OWNED_BLOCK_M = 128
+
+
+def owned_backward_ring_tokens(
+    num_sms, env="MONO_EP_BACKWARD_RING_WAVES", default_waves=0
+):
+    """Ring floor for the owned backward schedule, in waves of CTA pairs: each pair
+    holds one pool block live through all four phases, and the forward's
+    interleaved-schedule sizing leaves wide-expert shapes with fewer ring blocks
+    than pairs. 0 keeps that sizing; it is only ever raised."""
+    waves = int(os.environ.get(env, str(default_waves)))
+    if waves < 0:
+        raise ValueError(f"{env} must be >= 0")
+    return waves * (num_sms // 2) * OWNED_BLOCK_M
+
 
 class NativePersistentBackward:
     ready_gather = False
@@ -81,6 +96,7 @@ class NativePersistentBackward:
                 if self.fp8_transport
                 else "bf16xbf16"
             ),
+            num_min_ring_tokens=owned_backward_ring_tokens(runtime.num_sms),
         )
         self.handles = []
         capacity = self.buffer.num_max_tokens_per_rank

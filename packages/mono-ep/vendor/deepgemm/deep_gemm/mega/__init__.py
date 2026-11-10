@@ -23,7 +23,8 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
-                 base: Optional['SymmBuffer'] = None):
+                 base: Optional['SymmBuffer'] = None,
+                 num_min_ring_tokens: int = 0):
         # Align token count
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mono_ep())
 
@@ -46,7 +47,7 @@ class SymmBuffer:
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
             mma_type, activation,
-            num_shared_experts
+            num_shared_experts, num_min_ring_tokens
         )
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
@@ -95,7 +96,8 @@ def get_symm_buffer_for_mono_ep(group: dist.ProcessGroup,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 num_min_ring_tokens: int = 0) -> SymmBuffer:
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -109,7 +111,8 @@ def get_symm_buffer_for_mono_ep(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation,
+        num_min_ring_tokens=num_min_ring_tokens
     )
 
 
