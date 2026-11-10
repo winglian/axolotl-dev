@@ -17,8 +17,10 @@ BASE_IMAGE = os.environ.get(
     "MONO_EP_BASE_IMAGE",
     "axolotlai/axolotl-cloud-uv:main-py3.14-cu130-2.14.1-blackwell",
 )
+# cuDNN frontend OSS grouped block-scaled GEMM, the GEMM-floor reference (job `cudnn` only)
+CUDNN_FRONTEND = "nvidia-cudnn-frontend[cutedsl]==1.32.2"
 app = modal.App("axolotl-mono-ep-nvfp4-lora")
-image = (
+base_image = (
     modal.Image.from_registry(BASE_IMAGE)
     .run_commands(
         'uv pip install --python "$(command -v python)" setuptools wheel packaging ninja',
@@ -43,12 +45,27 @@ image = (
         "cd /opt/mono-ep/vendor/deepgemm && DG_USE_LOCAL_VERSION=0 DG_FORCE_BUILD=1 "
         'CC=gcc-13 CXX=g++-13 MAX_JOBS=4 uv pip install --python "$(command -v python)" --no-build-isolation --no-deps .',
     )
-    .add_local_dir(ROOT / "src", "/probe/src")
-    .add_local_dir(
-        AXOLOTL_SRC / "axolotl/integrations/kernels/libs/sonicmoe", "/probe/sonicmoe"
+)
+
+
+def _with_sources(img):
+    return (
+        img.add_local_dir(ROOT / "src", "/probe/src")
+        .add_local_dir(
+            AXOLOTL_SRC / "axolotl/integrations/kernels/libs/sonicmoe",
+            "/probe/sonicmoe",
+        )
+        .add_local_dir(ROOT / "examples", "/probe/examples")
+        .add_local_dir(ROOT / "vendor/deepgemm/deep_gemm/include", "/probe/include")
     )
-    .add_local_dir(ROOT / "examples", "/probe/examples")
-    .add_local_dir(ROOT / "vendor/deepgemm/deep_gemm/include", "/probe/include")
+
+
+image = _with_sources(base_image)
+# A separate image so the frontend's dependency resolution cannot move the other jobs' packages
+cudnn_image = _with_sources(
+    base_image.run_commands(
+        f'uv pip install --python "$(command -v python)" "{CUDNN_FRONTEND}"'
+    )
 )
 ENV = {
     "PYTHONPATH": "/probe/src",
@@ -145,6 +162,12 @@ def profile(cases: str = "", requant: str = ""):
     return _run("profile_nvfp4_lora_b200.py", 1, env, 7000)
 
 
+@app.function(image=cudnn_image, gpu="B200", cpu=8, memory=131072, timeout=7200)
+def cudnn(cases: str = ""):
+    env = {"NVFP4_CASES": cases} if cases else {}
+    return _run("benchmark_cudnn_grouped_gemm_b200.py", 1, env, 7000)
+
+
 @app.local_entrypoint()
 def main(job: str = "forward", out: str = "", cases: str = "", requant: str = ""):
     if job == "forward":
@@ -157,6 +180,8 @@ def main(job: str = "forward", out: str = "", cases: str = "", requant: str = ""
         result = timing.remote(cases, requant)
     elif job == "profile":
         result = profile.remote(cases, requant)
+    elif job == "cudnn":
+        result = cudnn.remote(cases)
     else:
         raise ValueError(job)
     result["modal_app_id"] = app.app_id
