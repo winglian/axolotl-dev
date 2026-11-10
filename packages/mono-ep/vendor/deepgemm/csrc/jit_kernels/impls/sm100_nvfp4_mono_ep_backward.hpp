@@ -15,7 +15,7 @@
 namespace deep_gemm {
 
 // Kernel variant bitmask for the SM100 NVFP4 persistent backward: 1 staged h/dz pool stores, 2 TMEM release
-// before the recompute/dH math. The dispatch always pulls whole x and dy rows with lookahead.
+// before the recompute/dH math. The dispatch pulls whole x and dy rows with lookahead unless a chunked pull is selected.
 static constexpr uint32_t kDefaultNvfp4BackwardOptions = 3;
 
 // Persistent NVFP4 LoRA backward: BF16 x/dy rows are pulled, stored to the BF16 pools and quantized into packed
@@ -129,14 +129,21 @@ static void nvfp4_mono_ep_backward(
 
     const int sms = get_num_sms_for_mono_ep();
     DG_HOST_ASSERT(sms % 2 == 0);
-    // Whole x and dy rows per pull (two BF16 rows per dispatch warp)
-    const int pull = hidden * 4;
+    // Dispatch pull per warp: whole x and dy rows (two BF16 rows, default). The chunked pull (two slots of one x
+    // chunk and one dy chunk, dy quantized from the pool) frees stages at wide hidden but measured no faster
+    const int whole_row_pull = hidden * 4;
+    const auto valid_pull = [&](const int& p) {
+        if (p == whole_row_pull) return true;
+        const int chunk = p / 4;
+        return p % 4 == 0 and chunk % 128 == 0 and chunk <= 4096 and chunk < hidden * 2 and (hidden * 2) % chunk == 0;
+    };
     const char* options_selector = std::getenv("MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS");
     const uint32_t options = options_selector == nullptr ? kDefaultNvfp4BackwardOptions :
         static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10));
     DG_HOST_ASSERT((options & ~3u) == 0);
     // Exact `SharedStorage` size of the kernel for `n` TMA/UMMA stages (asserted by the kernel at run time)
-    const auto exact_smem_for = [&](const int& n) {
+    const auto exact_smem_for_pull = [&](const int& n, const int& pull) {
+        const int pull_slots = pull == whole_row_pull ? 1 : 2;
         int offset = math::align(experts * world * 4, 1024) + 4 * pull;   // token counts, 4 dispatch pull buffers
         offset = math::align(offset, 1024) + 16384;                        // epilogue C/D staging
         offset = math::align(offset, 128) + 128 * 128 * 2 + 128 * 4;       // dH tile, dscore
@@ -144,11 +151,22 @@ static void nvfp4_mono_ep_backward(
         offset = math::align(offset, 1024) + n * 128 * kBlockK / 2;        // B stages (packed FP4)
         offset += n * 4 * (128 + 128) * 4;                                 // SFA + SFB words
         offset = math::align(offset, 16) + 2 * 32;                         // task infos
-        offset += (4 + 2 * n + 2 * 2 + 16 + 4) * 8 + 4;                    // barriers, TMEM pointer
+        offset += (4 * pull_slots + 2 * n + 2 * 2 + 16 + 4) * 8 + 4;       // barriers, TMEM pointer
         return math::align(offset, 1024);
     };
-    int max_stages = 2;
-    while (max_stages < 8 and exact_smem_for(max_stages + 1) <= SM100ArchSpec::smem_capacity) ++ max_stages;
+    const auto max_stages_for = [&](const int& pull) {
+        int n = 2;
+        while (n < 8 and exact_smem_for_pull(n + 1, pull) <= SM100ArchSpec::smem_capacity) ++ n;
+        return n;
+    };
+    int pull = whole_row_pull;
+    const char* pull_selector = std::getenv("MONO_EP_SM100_NVFP4_BACKWARD_PULL_BYTES");
+    if (pull_selector != nullptr) {
+        pull = std::atoi(pull_selector);
+        DG_HOST_ASSERT(valid_pull(pull));
+    }
+    const auto exact_smem_for = [&](const int& n) { return exact_smem_for_pull(n, pull); };
+    const int max_stages = max_stages_for(pull);
     const char* stages_selector = std::getenv("MONO_EP_SM100_NVFP4_BACKWARD_STAGES");
     const int stages = stages_selector == nullptr ? max_stages : std::atoi(stages_selector);
     DG_HOST_ASSERT(stages >= 2 and stages <= max_stages);
@@ -158,8 +176,8 @@ static void nvfp4_mono_ep_backward(
     const char* phase_trace_selector = std::getenv("MONO_EP_SM100_PHASE_TRACE");
     const uint64_t phase_trace_ptr = phase_trace_selector == nullptr ? 0 :
         std::strtoull(phase_trace_selector, nullptr, 10);
-    const std::string name = std::format("sm100_nvfp4_mono_ep_backward_stages{}_opt{}{}", stages, options,
-        phase_trace_ptr != 0 ? "_trace" : "");
+    const std::string name = std::format("sm100_nvfp4_mono_ep_backward_stages{}_opt{}{}{}", stages, options,
+        pull != whole_row_pull ? std::format("_pull{}", pull) : std::string(), phase_trace_ptr != 0 ? "_trace" : "");
     const auto kernel = jit->compile(name, std::format(R"(
 #include <deep_gemm/impls/sm100_nvfp4_mono_ep_backward.cuh>
 static void instantiate() {{

@@ -192,6 +192,19 @@ sm100_nvfp4_mono_ep_backward_impl(void* y,
         cute::TMA::CacheHintSm100::EVICT_NORMAL : cute::TMA::CacheHintSm100::EVICT_FIRST;
     DG_STATIC_ASSERT(not kEvictFirstHStores or kStagedPoolStores, "Evict-first h stores need the staged stores");
 
+    // Dispatch pull geometry: whole x and dy rows in one buffer per warp, or (opt-in, frees pipeline stages at wide
+    // hidden) two slots of one x chunk and one dy chunk each, double-buffered. Every chunk holds whole 64-element groups.
+    constexpr uint32_t kPullRowBytes = kHidden * sizeof(nv_bfloat16);
+    constexpr bool kWholeRowPull = kNumBytesPerPull == 2 * kPullRowBytes;
+    constexpr uint32_t kNumPullSlots = kWholeRowPull ? 1 : 2;
+    constexpr uint32_t kPullChunkBytes = kWholeRowPull ? kPullRowBytes : kNumBytesPerPull / (2 * kNumPullSlots);
+    constexpr uint32_t kNumPullChunks = kPullRowBytes / kPullChunkBytes;
+    constexpr uint32_t kNumPullChunkGroups = kPullChunkBytes / 128;
+    DG_STATIC_ASSERT(kWholeRowPull or (kNumBytesPerPull % (2 * kNumPullSlots) == 0 and kPullChunkBytes % 128 == 0 and
+                                       kPullRowBytes % kPullChunkBytes == 0 and kNumPullChunks >= 2),
+                     "Chunked pulls need 128-byte chunks that tile the row");
+    DG_STATIC_ASSERT(kNumPullChunkGroups <= 32 or kWholeRowPull, "One chunk is at most one 64-element group per lane");
+
     // Epilogue configs
     constexpr uint32_t kNumEpilogueStages = (kOptions & 4u) ? 4 : 2;
     constexpr uint32_t kNumTMAStoreStages = 2;
@@ -233,7 +246,7 @@ sm100_nvfp4_mono_ep_backward_impl(void* y,
         uint32_t smem_sfa[kNumStages][(BLOCK_K / UMMA_BLOCK_K) * SF_BLOCK_M];
         uint32_t smem_sfb[kNumStages][(BLOCK_K / UMMA_BLOCK_K) * SF_BLOCK_N];
         task_info_t task_infos[kNumScheduleStages];
-        Barrier dispatch_barriers[kNumDispatchWarps];
+        Barrier dispatch_barriers[kNumDispatchWarps * kNumPullSlots];
         Barrier full_barriers[kNumStages];
         Barrier empty_barriers[kNumStages];
         Barrier tmem_full_barriers[kNumEpilogueStages];
@@ -276,7 +289,7 @@ sm100_nvfp4_mono_ep_backward_impl(void* y,
     } else if (warp_idx == 1) {
         // Init m-barriers for dispatch
         #pragma unroll
-        for (uint32_t i = lane_idx; i < kNumDispatchWarps; i += 32)
+        for (uint32_t i = lane_idx; i < kNumDispatchWarps * kNumPullSlots; i += 32)
             shared_storage.dispatch_barriers[i].init(1);
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
@@ -531,7 +544,7 @@ sm100_nvfp4_mono_ep_backward_impl(void* y,
         constexpr uint32_t kRowBytes = kHidden * sizeof(nv_bfloat16);
         constexpr uint32_t kNumRowGroups = kHidden / 64;
         constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-        DG_STATIC_ASSERT(kNumBytesPerPull == 2 * kRowBytes, "The NVFP4 backward pulls whole x and dy rows together");
+        DG_STATIC_ASSERT(kRowBytes == kPullRowBytes, "Pull geometry mismatch");
         struct PullRow {
             const void* src_x;
             const void* src_dy;
@@ -686,84 +699,265 @@ sm100_nvfp4_mono_ep_backward_impl(void* y,
             }
         };
 
-        // The next row's routing is resolved and its load issued while this row is stored, quantized and published
-        uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
-        PullRow cur, next;
-        bool has_cur = resolve(token_idx, cur);
-        if (has_cur)
-            issue(cur);
-        while (has_cur) {
-            token_idx += kNumGlobalWarps;
-            const bool has_next = resolve(token_idx, next);
+        if constexpr (kWholeRowPull) {
+            // The next row's routing is resolved and its load issued while this row is stored, quantized and published
+            uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
+            PullRow cur, next;
+            bool has_cur = resolve(token_idx, cur);
+            if (has_cur)
+                issue(cur);
+            while (has_cur) {
+                token_idx += kNumGlobalWarps;
+                const bool has_next = resolve(token_idx, next);
 
-            // Ring slot wait for this row only (no other row of this warp is unpublished)
-            const uint32_t pool_block_idx = cur.pool_token_idx / BLOCK_M;
-            const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
-            const uint64_t trace_ring0 = trace_clock();
-            if (l1_empty_count_target > 0) {
-                const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
-                while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
-            }
-            const uint64_t trace_copy0 = trace_clock();
-            trace_ring_wait += trace_copy0 - trace_ring0;
-            ++ trace_rows;
-
-            // BF16 rows to the pools (async proxy) while the lanes quantize the same shared memory
-            ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
-            if (cute::elect_one_sync()) {
-                ptx::tma_store_1d(backward.x_pool + static_cast<uint64_t>(cur.pool_token_idx) * kHidden, smem_x, kRowBytes);
-                ptx::tma_store_1d(backward.dy_pool + static_cast<uint64_t>(cur.pool_token_idx) * kHidden, smem_dy, kRowBytes);
-                cute::tma_store_arrive();
-            }
-            __syncwarp();
-            load_input_scales(cur.local_expert_idx);
-            const uint32_t sf_row_idx = transform_sf_token_idx(cur.pool_token_idx);
-            quantize_row(static_cast<const uint4*>(smem_x),
-                         backward.qx_pool + static_cast<uint64_t>(cur.pool_token_idx) * (kHidden / 2),
-                         backward.nv_sx, sf_row_idx, sf_scale_x, inv_pts_x);
-            float sf_scale_dy, inv_pts_dy;
-            const float pts_dy = nvfp4_row_scale(row_amax(static_cast<const uint4*>(smem_dy)), sf_scale_dy, inv_pts_dy);
-            quantize_row(static_cast<const uint4*>(smem_dy),
-                         backward.qdy_pool + static_cast<uint64_t>(cur.pool_token_idx) * (kHidden / 2),
-                         backward.nv_sdy, sf_row_idx, sf_scale_dy, inv_pts_dy);
-            if (lane_idx == 0)
-                backward.nv_rdy[cur.pool_token_idx] = pts_dy;
-            // Generic reads of the pull buffer and the bulk stores must complete before the next load overwrites it
-            cutlass::arch::fence_view_async_shared();
-            __syncwarp();
-            if (cute::elect_one_sync())
-                cute::tma_store_wait<0>();
-            __syncwarp();
-            if (has_next)
-                issue(next);
-
-            // Publish the row: weight and source metadata, then the full count (release) after the FP4/SF
-            // stores are made visible to the TMA loads of the consumer
-            if (cute::elect_one_sync()) {
-                *buffer.l1_topk_weights_buffer.get_data_buffer(cur.pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = cur.weight;
-                *workspace.get_token_src_metadata_ptr(cur.pool_token_idx) = {cur.rank, cur.src_token_idx, cur.src_topk_idx};
-            }
-            nvfp4_fence_proxy_async_global();
-            __syncwarp();
-            if (cute::elect_one_sync()) {
-                ptx::red_add_rel(
-                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
-                    cur.is_last_token ? BLOCK_M - (cur.pool_token_idx % BLOCK_M) : 1u);
-            }
-            __syncwarp();
-            const uint64_t trace_row_copy = trace_clock() - trace_copy0;
-            trace_copy += trace_row_copy;
-            if constexpr (kDistTrace) {
-                if (lane_idx == 0) {
-                    const uint64_t arrival = trace_globaltimer();
-                    dist_add(8 + cur.rank, 1);
-                    dist_max(16 + cur.rank, ~arrival);
-                    dist_max(24 + cur.rank, arrival);
-                    dist_add(32 + cur.rank, trace_row_copy);
+                // Ring slot wait for this row only (no other row of this warp is unpublished)
+                const uint32_t pool_block_idx = cur.pool_token_idx / BLOCK_M;
+                const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
+                const uint64_t trace_ring0 = trace_clock();
+                if (l1_empty_count_target > 0) {
+                    const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
                 }
+                const uint64_t trace_copy0 = trace_clock();
+                trace_ring_wait += trace_copy0 - trace_ring0;
+                ++ trace_rows;
+
+                // BF16 rows to the pools (async proxy) while the lanes quantize the same shared memory
+                ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+                if (cute::elect_one_sync()) {
+                    ptx::tma_store_1d(backward.x_pool + static_cast<uint64_t>(cur.pool_token_idx) * kHidden, smem_x, kRowBytes);
+                    ptx::tma_store_1d(backward.dy_pool + static_cast<uint64_t>(cur.pool_token_idx) * kHidden, smem_dy, kRowBytes);
+                    cute::tma_store_arrive();
+                }
+                __syncwarp();
+                load_input_scales(cur.local_expert_idx);
+                const uint32_t sf_row_idx = transform_sf_token_idx(cur.pool_token_idx);
+                quantize_row(static_cast<const uint4*>(smem_x),
+                             backward.qx_pool + static_cast<uint64_t>(cur.pool_token_idx) * (kHidden / 2),
+                             backward.nv_sx, sf_row_idx, sf_scale_x, inv_pts_x);
+                float sf_scale_dy, inv_pts_dy;
+                const float pts_dy = nvfp4_row_scale(row_amax(static_cast<const uint4*>(smem_dy)), sf_scale_dy, inv_pts_dy);
+                quantize_row(static_cast<const uint4*>(smem_dy),
+                             backward.qdy_pool + static_cast<uint64_t>(cur.pool_token_idx) * (kHidden / 2),
+                             backward.nv_sdy, sf_row_idx, sf_scale_dy, inv_pts_dy);
+                if (lane_idx == 0)
+                    backward.nv_rdy[cur.pool_token_idx] = pts_dy;
+                // Generic reads of the pull buffer and the bulk stores must complete before the next load overwrites it
+                cutlass::arch::fence_view_async_shared();
+                __syncwarp();
+                if (cute::elect_one_sync())
+                    cute::tma_store_wait<0>();
+                __syncwarp();
+                if (has_next)
+                    issue(next);
+
+                // Publish the row: weight and source metadata, then the full count (release) after the FP4/SF
+                // stores are made visible to the TMA loads of the consumer
+                if (cute::elect_one_sync()) {
+                    *buffer.l1_topk_weights_buffer.get_data_buffer(cur.pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = cur.weight;
+                    *workspace.get_token_src_metadata_ptr(cur.pool_token_idx) = {cur.rank, cur.src_token_idx, cur.src_topk_idx};
+                }
+                nvfp4_fence_proxy_async_global();
+                __syncwarp();
+                if (cute::elect_one_sync()) {
+                    ptx::red_add_rel(
+                        workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
+                        cur.is_last_token ? BLOCK_M - (cur.pool_token_idx % BLOCK_M) : 1u);
+                }
+                __syncwarp();
+                const uint64_t trace_row_copy = trace_clock() - trace_copy0;
+                trace_copy += trace_row_copy;
+                if constexpr (kDistTrace) {
+                    if (lane_idx == 0) {
+                        const uint64_t arrival = trace_globaltimer();
+                        dist_add(8 + cur.rank, 1);
+                        dist_max(16 + cur.rank, ~arrival);
+                        dist_max(24 + cur.rank, arrival);
+                        dist_add(32 + cur.rank, trace_row_copy);
+                    }
+                }
+                cur = next;
+                has_cur = has_next;
             }
-            cur = next;
-            has_cur = has_next;
+        } else {
+            // Chunked pull: chunk k+1 (or the next row's first chunk) is in flight in the other slot while chunk k is
+            // stored to the BF16 pools and quantized. x takes the expert's static scale per chunk; dy needs the row
+            // amax, so its BF16 chunks go to the pool first and the row is quantized from the pool (L2-resident)
+            // once its last chunk has landed.
+            const auto slot_x = [&](const uint32_t& s) {
+                return math::advance_ptr(pull_buffer.get_base_ptr(), s * 2 * kPullChunkBytes);
+            };
+            const auto slot_dy = [&](const uint32_t& s) {
+                return math::advance_ptr(pull_buffer.get_base_ptr(), s * 2 * kPullChunkBytes + kPullChunkBytes);
+            };
+            uint32_t slot_phase_0 = 0, slot_phase_1 = 0;
+            const auto wait_slot = [&](const uint32_t& s) {
+                if (s == 0)
+                    ptx::mbarrier_wait_and_flip_phase(&shared_storage.dispatch_barriers[warp_idx * 2], slot_phase_0);
+                else
+                    ptx::mbarrier_wait_and_flip_phase(&shared_storage.dispatch_barriers[warp_idx * 2 + 1], slot_phase_1);
+            };
+            const auto issue_chunk = [&](const PullRow& row, const uint32_t& chunk_idx, const uint32_t& s) {
+                if (cute::elect_one_sync()) {
+                    const auto mbarrier = &shared_storage.dispatch_barriers[warp_idx * 2 + s];
+                    ptx::tma_load_1d(slot_x(s), static_cast<const uint8_t*>(row.src_x) + chunk_idx * kPullChunkBytes,
+                                     mbarrier, kPullChunkBytes, kDispatchLoadHint);
+                    ptx::tma_load_1d(slot_dy(s), static_cast<const uint8_t*>(row.src_dy) + chunk_idx * kPullChunkBytes,
+                                     mbarrier, kPullChunkBytes, kDispatchLoadHint);
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier, 2 * kPullChunkBytes);
+                }
+                __syncwarp();
+            };
+            // One 64-element group per lane: quantize this x chunk with the static expert scale
+            const auto quantize_x_chunk = [&](const uint4* src, uint8_t* dst_row, const uint32_t& chunk_idx,
+                                              const uint32_t& sf_row_idx) {
+                const uint32_t g = lane_idx;
+                if (kNumPullChunkGroups == 32 or g < kNumPullChunkGroups) {
+                    uint32_t sf_word = 0, words[8];
+                    #pragma unroll
+                    for (uint32_t b = 0; b < 4; ++ b) {
+                        const auto lo = ptx::ld_shared(src + g * 8 + b * 2);
+                        const auto hi = ptx::ld_shared(src + g * 8 + b * 2 + 1);
+                        sf_word |= nvfp4_quantize_bf16_block(lo, hi, sf_scale_x, inv_pts_x, words[b * 2], words[b * 2 + 1]) << (b * 8);
+                    }
+                    const uint32_t group_idx = chunk_idx * kNumPullChunkGroups + g;
+                    const auto dst = reinterpret_cast<uint4*>(dst_row + group_idx * 32);
+                    dst[0] = make_uint4(words[0], words[1], words[2], words[3]);
+                    dst[1] = make_uint4(words[4], words[5], words[6], words[7]);
+                    backward.nv_sx[group_idx * backward.nv_pool_rows + sf_row_idx] = sf_word;
+                }
+            };
+            const auto chunk_amax = [&](const uint4* src, nv_bfloat162& amax2) {
+                const uint32_t g = lane_idx;
+                if (kNumPullChunkGroups == 32 or g < kNumPullChunkGroups) {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 8; ++ j) {
+                        const uint4 v = ptx::ld_shared(src + g * 8 + j);
+                        const auto p = reinterpret_cast<const nv_bfloat162*>(&v);
+                        amax2 = __hmax2(amax2, __hmax2(__hmax2(__habs2(p[0]), __habs2(p[1])),
+                                                       __hmax2(__habs2(p[2]), __habs2(p[3]))));
+                    }
+                }
+            };
+            // Quantize a BF16 pool row (written by this warp's bulk stores, read back through L2) with a row scale
+            const auto quantize_row_from_pool = [&](const __nv_bfloat16* pool_row, uint8_t* dst_row, uint32_t* sf_pool,
+                                                    const uint32_t& sf_row_idx, const float& sf_scale, const float& inv_pts) {
+                const auto src = reinterpret_cast<const uint4*>(pool_row);
+                #pragma unroll
+                for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumRowGroups, 32u); ++ i) {
+                    const uint32_t g = i * 32 + lane_idx;
+                    if (kNumRowGroups % 32 == 0 or g < kNumRowGroups) {
+                        uint32_t sf_word = 0, words[8];
+                        #pragma unroll
+                        for (uint32_t b = 0; b < 4; ++ b) {
+                            const auto lo = __ldcg(src + g * 8 + b * 2);
+                            const auto hi = __ldcg(src + g * 8 + b * 2 + 1);
+                            sf_word |= nvfp4_quantize_bf16_block(lo, hi, sf_scale, inv_pts, words[b * 2], words[b * 2 + 1]) << (b * 8);
+                        }
+                        const auto dst = reinterpret_cast<uint4*>(dst_row + g * 32);
+                        dst[0] = make_uint4(words[0], words[1], words[2], words[3]);
+                        dst[1] = make_uint4(words[4], words[5], words[6], words[7]);
+                        sf_pool[g * backward.nv_pool_rows + sf_row_idx] = sf_word;
+                    }
+                }
+            };
+
+            uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
+            PullRow cur, next;
+            bool has_cur = resolve(token_idx, cur);
+            uint32_t slot = 0;
+            if (has_cur)
+                issue_chunk(cur, 0, slot);
+            while (has_cur) {
+                token_idx += kNumGlobalWarps;
+                const bool has_next = resolve(token_idx, next);
+
+                const uint32_t pool_block_idx = cur.pool_token_idx / BLOCK_M;
+                const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
+                const uint64_t trace_ring0 = trace_clock();
+                if (l1_empty_count_target > 0) {
+                    const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                }
+                const uint64_t trace_copy0 = trace_clock();
+                trace_ring_wait += trace_copy0 - trace_ring0;
+                ++ trace_rows;
+
+                load_input_scales(cur.local_expert_idx);
+                const uint32_t sf_row_idx = transform_sf_token_idx(cur.pool_token_idx);
+                auto* x_row = backward.x_pool + static_cast<uint64_t>(cur.pool_token_idx) * kHidden;
+                auto* dy_row = backward.dy_pool + static_cast<uint64_t>(cur.pool_token_idx) * kHidden;
+                auto* qx_row = backward.qx_pool + static_cast<uint64_t>(cur.pool_token_idx) * (kHidden / 2);
+                auto* qdy_row = backward.qdy_pool + static_cast<uint64_t>(cur.pool_token_idx) * (kHidden / 2);
+                nv_bfloat162 amax2 = __floats2bfloat162_rn(0.0f, 0.0f);
+                #pragma unroll 1
+                for (uint32_t chunk_idx = 0; chunk_idx < kNumPullChunks; ++ chunk_idx) {
+                    // The other slot's previous chunk finished its shared-memory reads at the end of its iteration
+                    const uint32_t other = slot ^ 1;
+                    if (chunk_idx + 1 < kNumPullChunks)
+                        issue_chunk(cur, chunk_idx + 1, other);
+                    else if (has_next)
+                        issue_chunk(next, 0, other);
+                    wait_slot(slot);
+                    if (cute::elect_one_sync()) {
+                        ptx::tma_store_1d(math::advance_ptr(x_row, chunk_idx * kPullChunkBytes), slot_x(slot), kPullChunkBytes);
+                        ptx::tma_store_1d(math::advance_ptr(dy_row, chunk_idx * kPullChunkBytes), slot_dy(slot), kPullChunkBytes);
+                        cute::tma_store_arrive();
+                    }
+                    __syncwarp();
+                    quantize_x_chunk(static_cast<const uint4*>(slot_x(slot)), qx_row, chunk_idx, sf_row_idx);
+                    chunk_amax(static_cast<const uint4*>(slot_dy(slot)), amax2);
+                    // Generic reads and the bulk stores' reads of this slot must complete before it is reloaded
+                    cutlass::arch::fence_view_async_shared();
+                    __syncwarp();
+                    if (cute::elect_one_sync())
+                        cute::tma_store_wait<0>();
+                    __syncwarp();
+                    slot = other;
+                }
+                float amax = fmaxf(__low2float(amax2), __high2float(amax2));
+                #pragma unroll
+                for (uint32_t delta = 16; delta > 0; delta /= 2)
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+                float sf_scale_dy, inv_pts_dy;
+                const float pts_dy = nvfp4_row_scale(amax, sf_scale_dy, inv_pts_dy);
+                // The row's BF16 bulk stores must be complete (not just read) and visible to the generic proxy
+                if (cute::elect_one_sync()) {
+                    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                    nvfp4_fence_proxy_async_global();
+                }
+                __syncwarp();
+                nvfp4_fence_proxy_async_global();
+                quantize_row_from_pool(dy_row, qdy_row, backward.nv_sdy, sf_row_idx, sf_scale_dy, inv_pts_dy);
+                if (lane_idx == 0)
+                    backward.nv_rdy[cur.pool_token_idx] = pts_dy;
+
+                if (cute::elect_one_sync()) {
+                    *buffer.l1_topk_weights_buffer.get_data_buffer(cur.pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = cur.weight;
+                    *workspace.get_token_src_metadata_ptr(cur.pool_token_idx) = {cur.rank, cur.src_token_idx, cur.src_topk_idx};
+                }
+                nvfp4_fence_proxy_async_global();
+                __syncwarp();
+                if (cute::elect_one_sync()) {
+                    ptx::red_add_rel(
+                        workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
+                        cur.is_last_token ? BLOCK_M - (cur.pool_token_idx % BLOCK_M) : 1u);
+                }
+                __syncwarp();
+                const uint64_t trace_row_copy = trace_clock() - trace_copy0;
+                trace_copy += trace_row_copy;
+                if constexpr (kDistTrace) {
+                    if (lane_idx == 0) {
+                        const uint64_t arrival = trace_globaltimer();
+                        dist_add(8 + cur.rank, 1);
+                        dist_max(16 + cur.rank, ~arrival);
+                        dist_max(24 + cur.rank, arrival);
+                        dist_add(32 + cur.rank, trace_row_copy);
+                    }
+                }
+                cur = next;
+                has_cur = has_next;
+            }
         }
 
         if constexpr (kPhaseTrace) {
