@@ -50,8 +50,32 @@ TREES = {
 }
 
 
+@app.function(image=image, gpu="H100!", cpu=16, memory=65536, timeout=7200)
+def ab_many(configs, warmup, iters, rounds):
+    """Several (direction, routing, variants) A/Bs in one container, one after another."""
+    import torch
+
+    name = torch.cuda.get_device_name()
+    out = []
+    for direction, routing, variants in configs:
+        result = _ab(direction, routing, variants, warmup, iters, rounds)
+        out.append(dict(direction=direction, routing=routing, **result))
+        if result["returncode"]:
+            break
+    return dict(
+        returncode=max(r["returncode"] for r in out),
+        device=name,
+        configs=out,
+        modal_task_id=os.environ.get("MODAL_TASK_ID"),
+    )
+
+
 @app.function(image=image, gpu="H100!", cpu=16, memory=65536, timeout=5400)
 def ab(direction, routing, variants, warmup, iters, rounds):
+    return _ab(direction, routing, variants, warmup, iters, rounds)
+
+
+def _ab(direction, routing, variants, warmup, iters, rounds):
     import torch
 
     name = torch.cuda.get_device_name()
@@ -135,6 +159,25 @@ def _median(values):
     )
 
 
+def _summarize(result):
+    summary: dict[str, dict] = {}
+    for run in result.get("runs", []):
+        if not run["diag"]:
+            continue
+        for variant, value in run["diag"]["results"].items():
+            entry = summary.setdefault(
+                f"{run['tree']}/{variant}", dict(samples_ms=[], parity_vs_ref=[])
+            )
+            entry["samples_ms"].extend(value["samples_ms"])
+            entry["parity_vs_ref"].append(
+                dict(round=run["round"], parity=value.get("parity_vs_ref"))
+            )
+    for entry in summary.values():
+        entry["samples"] = len(entry["samples_ms"])
+        entry["median_ms"] = _median(entry["samples_ms"])
+    return summary
+
+
 @app.local_entrypoint()
 def main(
     out: str,
@@ -142,11 +185,68 @@ def main(
     routing: str = "balanced",
     base: str = "orig:",
     integrated: str = "default:",
+    forward_base: str = "",
+    forward_integrated: str = "",
     warmup: int = 5,
     iters: int = 5,
     rounds: int = 4,
 ):
-    """base/integrated: variant lists "name:ENV=V+ENV2=V2,..." for each tree ('' skips a tree)."""
+    """base/integrated: variant lists "name:ENV=V+ENV2=V2,..." for each tree ('' skips a tree).
+
+    direction and routing may be comma lists; more than one (direction, routing) pair runs them all in
+    one container (same GPU), forward pairs using forward_base/forward_integrated when given.
+    """
+    pairs = [(d, r) for d in direction.split(",") for r in routing.split(",")]
+    if len(pairs) > 1:
+        configs = [
+            (
+                d,
+                r,
+                dict(
+                    base=forward_base or base if d == "forward" else base,
+                    integrated=forward_integrated or integrated
+                    if d == "forward"
+                    else integrated,
+                ),
+            )
+            for d, r in pairs
+        ]
+        result = ab_many.remote(configs, warmup, iters, rounds)
+        for config in result["configs"]:
+            config["summary"] = _summarize(config)
+        result.update(
+            warmup_per_process=warmup,
+            iters_per_process=iters,
+            rounds=rounds,
+            interleaving="per (direction, routing): one probe process per tree per round, tree order "
+            "alternates per round, variants alternate within each process; all pairs in one container "
+            "and GPU, run one after another",
+            modal_app_id=os.environ.get("MODAL_APP_ID") or app.app_id,
+        )
+        Path(out).write_text(json.dumps(result, indent=1))
+        print(
+            json.dumps(
+                dict(
+                    returncode=result["returncode"],
+                    device=result.get("device"),
+                    modal_app_id=result["modal_app_id"],
+                    medians={
+                        f"{c['direction']}/{c['routing']}": {
+                            k: (v["median_ms"], v["samples"])
+                            for k, v in c["summary"].items()
+                        }
+                        for c in result["configs"]
+                    },
+                )
+            )
+        )
+        if result["returncode"]:
+            for config in result["configs"]:
+                for run in config.get("runs", []):
+                    if run["stderr"]:
+                        print(run["stderr"][-4000:])
+            raise RuntimeError("integrated A/B failed")
+        return
     result = ab.remote(
         direction,
         routing,

@@ -19,6 +19,7 @@
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
+#include <deep_gemm/impls/mono_ep_activations.cuh>
 
 namespace deep_gemm {
 
@@ -76,6 +77,8 @@ template <
     uint32_t kMainloopMode = 0,
     bool kRelaxedSpins = false,
     bool kDistTrace = false,
+    uint32_t kActivation = 0,
+    uint32_t kActivationAlphaBits = mono_ep_act::kDefaultAlphaBits,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -113,6 +116,11 @@ sm90_fp8_mono_ep_forward_impl(void* y,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     DG_STATIC_ASSERT(not kHasShared, "FP8 persistent shared experts are not implemented");
     const float kActivationClamp = __uint_as_float(kActivationClampBits);
+    const float kActivationAlpha = __uint_as_float(kActivationAlphaBits);
+    // kFastMath selects the ex2.approx + rcp.approx sigmoid of the SwiGLU default.
+    constexpr auto kGatedActivation = kFastMath and kActivation == 0
+        ? mono_ep_act::Activation::SwiGLUFast : static_cast<mono_ep_act::Activation>(kActivation);
+    DG_STATIC_ASSERT(kActivation < mono_ep_act::kNumActivations, "Invalid activation");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     constexpr uint32_t kNumLocalityDomains = 1;
@@ -1411,9 +1419,8 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                             const float up = static_cast<float>(ups[j]);
                             const float clamped_gate = fminf(gate, kActivationClamp);
                             const float clamped_up = fmaxf(fminf(up, kActivationClamp), -kActivationClamp);
-                            const float sigmoid = kFastMath ? math::fast_rcp(1.0f + __expf(-clamped_gate)) :
-                                                             1.0f / (1.0f + expf(-clamped_gate));
-                            outs[j] = d_dtype_t(clamped_gate * sigmoid * clamped_up * score);
+                            outs[j] = d_dtype_t(mono_ep_act::Gated<kGatedActivation>::forward(
+                                clamped_gate, clamped_up, kActivationAlpha, kActivationClamp) * score);
                             z_gates[j] = __float2bfloat16(clamped_gate);
                             z_ups[j] = __float2bfloat16(clamped_up);
                         }
@@ -1439,12 +1446,11 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                     const float up = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + up_col]);
                     const float clamped_gate = fminf(gate, kActivationClamp);
                     const float clamped_up = fmaxf(fminf(up, kActivationClamp), -kActivationClamp);
-                    const float sigmoid = kFastMath ? math::fast_rcp(1.0f + __expf(-clamped_gate)) :
-                                                     1.0f / (1.0f + expf(-clamped_gate));
                     const float score = task_info.is_shared() ? 1.0f :
                         *buffer.l1_topk_weights_buffer.get_data_buffer(ring_m_idx + row).template get_base_ptr<float>();
                     output.get_data_buffer(m_idx + row).template get_base_ptr<d_dtype_t>()[out_n_idx + p] =
-                        d_dtype_t(clamped_gate * sigmoid * clamped_up * score);
+                        d_dtype_t(mono_ep_act::Gated<kGatedActivation>::forward(
+                            clamped_gate, clamped_up, kActivationAlpha, kActivationClamp) * score);
                     if (saved_z != nullptr and not task_info.is_shared()) {
                         const auto src = *workspace.get_token_src_metadata_ptr(pool_m_idx + row);
                         const uint64_t offset = ((static_cast<uint64_t>(src.rank_idx) * kNumMaxTokensPerRank + src.token_idx) *

@@ -30,6 +30,26 @@ def _select_kernel_layouts(forward_layout, backward_layout):
             os.environ.pop(name, None)
 
 
+def _parse_variants(spec):
+    """'name:ENV=V+ENV2=V2,name2:' -> [(name, {ENV: V, ...}), ...]."""
+    variants = []
+    for item in filter(None, spec.split(",")):
+        name, _, env = item.partition(":")
+        variants.append((name, dict(e.split("=", 1) for e in env.split("+") if e)))
+    return variants
+
+
+def _skewed_routing(tokens, experts, topk, rank):
+    """Exponentially decaying expert popularity in expert order (benchmark_ep8_trace.py)."""
+    generator = torch.Generator(device="cuda").manual_seed(812 + rank)
+    logits = -torch.arange(experts, device="cuda", dtype=torch.float32) / (
+        1.5 * experts
+    )
+    uniform = torch.rand(tokens, experts, device="cuda", generator=generator)
+    gumbel = -torch.log(-torch.log(uniform.clamp_min(1e-20)))
+    return (logits + gumbel).topk(topk, dim=-1).indices.contiguous()
+
+
 def run(
     profile=False,
     compute_dtype="bf16",
@@ -44,7 +64,12 @@ def run(
     compiled=False,
     compare_forward_layouts=False,
     compare_kernel_layouts=False,
+    variants="",
+    routing="balanced",
 ):
+    variant_envs = _parse_variants(variants)
+    if variant_envs and (not compare_native or compare_kernel_layouts or profile):
+        raise ValueError("Variant lists apply to native timing only")
     if compare_forward_layouts and compare_kernel_layouts:
         raise ValueError(
             "Forward-layout and kernel-layout comparisons are separate runs"
@@ -80,6 +105,8 @@ def run(
         tokens, hidden, device="cuda", dtype=torch.bfloat16
     ).requires_grad_()
     ids = torch.rand(tokens, experts, device="cuda").argsort(-1)[:, :topk].contiguous()
+    if routing == "skewed":
+        ids = _skewed_routing(tokens, experts, topk, rank)
     scores = torch.rand(tokens, topk, device="cuda")
     scores = (scores / scores.sum(-1, keepdim=True)).requires_grad_()
     w1 = (
@@ -191,6 +218,23 @@ def run(
         for forward_layout, backward_layout in kernel_layouts
         if not (compute_dtype == "blockwise" and use_peer and not native)
     ]
+    # Variant lists: every native case runs once per variant (env set before each step); the NCCL
+    # control keeps the default environment.
+    case_env = {}
+    if variant_envs:
+        expanded = []
+        for case in cases:
+            if case[6]:
+                for variant_name, env in variant_envs:
+                    label = f"{case[9]}/{variant_name}"
+                    case_env[label] = env
+                    expanded.append(case[:9] + (label,))
+            else:
+                expanded.append(case)
+        cases = expanded
+    managed_env = {key for _, env in variant_envs for key in env}
+    captured = {}
+    variant_parity = {}
     times = {label: [] for _, _, _, _, _, _, _, _, _, label in cases}
     mean_rank_times = {label: [] for label in times}
     rank_times = {label: [] for label in times}
@@ -245,6 +289,9 @@ def run(
             label,
         ) in cases if iteration % 2 == 0 else cases[::-1]:
             _select_kernel_layouts(forward_layout, backward_layout)
+            for key in managed_env:
+                os.environ.pop(key, None)
+            os.environ.update(case_env.get(label, {}))
             runtime.fuse_activation = fused
             runtime._peer_backward = (
                 native_backend if native else peer_backend if use_peer else None
@@ -289,11 +336,54 @@ def run(
                 peak_memory[label][1] = max(
                     peak_memory[label][1], torch.cuda.max_memory_reserved()
                 )
+            if (
+                iteration == 5
+                and label in case_env
+                and scope in ("forward", "backward")
+            ):
+                captured[label] = (
+                    dict(y=y.detach().clone())
+                    if scope == "forward"
+                    else dict(
+                        dx=x.grad.clone(),
+                        dscore=scores.grad.clone(),
+                        dw1=w1.grad.clone(),
+                        dw2=w2.grad.clone(),
+                    )
+                )
             assert torch.isfinite(y).all()
             if scope != "forward":
                 for tensor in (x, scores, w1, w2):
                     assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
             del y
+    # Parity of every variant against the first one at the first measured iteration, all ranks.
+    for label, outputs in captured.items():
+        scope, _, variant_name = label.split("/", 2)
+        reference_label = f"{scope}/native/{variant_envs[0][0]}"
+        if label == reference_label:
+            continue
+        entry = {}
+        for key, a in outputs.items():
+            b = captured[reference_label][key]
+            diff = (a.float() - b.float()).abs()
+            stats = torch.tensor(
+                [
+                    float(not torch.equal(a, b)),
+                    float(diff.max()),
+                    float(diff.norm() / b.float().norm().clamp_min(1e-12)),
+                ],
+                device="cuda",
+            )
+            dist.all_reduce(stats, op=dist.ReduceOp.MAX)
+            entry[key] = dict(
+                bitwise_equal_all_ranks=stats[0].item() == 0.0,
+                max_abs_diff_max_rank=stats[1].item(),
+                rel_norm_max_rank=stats[2].item(),
+            )
+        variant_parity[f"{variant_name}_vs_{variant_envs[0][0]}/{scope}"] = entry
+    captured.clear()
+    for key in managed_env:
+        os.environ.pop(key, None)
     if not profile:
         memory_tensor = torch.tensor(
             list(peak_memory.values()), device="cuda", dtype=torch.int64
@@ -308,6 +398,9 @@ def run(
                     device=torch.cuda.get_device_name(),
                     torch_version=torch.__version__,
                     world_size=world,
+                    routing=routing,
+                    variants={name: env for name, env in variant_envs},
+                    variant_parity_first_measured_iteration=variant_parity,
                     timeout_handler=(
                         "trap_only"
                         if os.getenv("MONO_EP_SM90_FP8_TRAP_TIMEOUTS") == "1"
@@ -556,6 +649,10 @@ if __name__ == "__main__":
     parser.add_argument("--compare-native", action="store_true")
     parser.add_argument("--compare-forward-layouts", action="store_true")
     parser.add_argument("--compare-kernel-layouts", action="store_true")
+    parser.add_argument(
+        "--variants", default="", help="native env variants 'name:ENV=V+ENV2=V2,...'"
+    )
+    parser.add_argument("--routing", choices=("balanced", "skewed"), default="balanced")
     args = parser.parse_args()
     if args.compiled and not args.recompute:
         parser.error("Compiled timing requires recomputation")
@@ -626,4 +723,6 @@ if __name__ == "__main__":
         args.compiled,
         args.compare_forward_layouts,
         args.compare_kernel_layouts,
+        args.variants,
+        args.routing,
     )

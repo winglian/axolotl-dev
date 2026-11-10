@@ -13,6 +13,7 @@
 #include "../heuristics/mono_ep.hpp"
 #include "../heuristics/sm90.hpp"
 #include "runtime_utils.hpp"
+#include "mono_ep_activation_selector.hpp"
 
 namespace deep_gemm {
 
@@ -146,6 +147,13 @@ static void fp8_mono_ep_forward_sm90(
     const char* dist_trace_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_DIST_TRACE");
     const bool dist_trace = dist_trace_selector != nullptr and std::string_view(dist_trace_selector) == "1";
     DG_HOST_ASSERT(not dist_trace or (phase_trace_ptr != 0 and world <= 8));
+    const auto activation = select_mono_ep_activation(not compact_non_math);
+    // Trailing template arguments after kDistTrace; the default SwiGLU appends nothing, so the instantiation
+    // text is unchanged.
+    const std::string trailing_args = dist_trace or activation.kind != 0 ?
+        std::string(dist_trace ? ", true" : ", false") +
+            (activation.kind != 0 ? std::format(", {}u, 0x{:08x}u", activation.kind, activation.alpha_bits)
+                                  : std::string()) : std::string();
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
     const int block_threads = compact_non_math ? 384 : 512;
@@ -167,21 +175,22 @@ static void fp8_mono_ep_forward_sm90(
                 (vector_swiglu ? "_vecswiglu" : "") + (vector_hquant ? "_vechquant" : "") +
                 (swizzle_accum ? "_swizzleacc" : "") + (relaxed_spins ? "_relaxedspins" : "") +
                 (mainloop_mode != 0 ? std::format("_mainloop{}", mainloop_mode) : std::string()) +
-                (role_registers_mode == 2 ? "_rolereg_split" : role_registers_mode == 1 ? "_rolereg" : "")),
+                (role_registers_mode == 2 ? "_rolereg_split" : role_registers_mode == 1 ? "_rolereg" : "") +
+                activation.tag()),
         std::format(R"({}{}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_forward.cuh>
 static void instantiate() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm90_fp8_mono_ep_forward_impl<
-        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, {}, {}, {}, {}, 256, {}, {}, 0x7f7fffffu, false, {}, {}{}>);
+        {}, {}, {}, {}, 0, {}, 128, 128, 128, 32, {}, {}, {}, {}, {}, 256, {}, {}, 0x{:08x}u, false, {}, {}{}>);
 }}
 )", trap_timeouts ? "#define DG_TRAP_ONLY_TIMEOUTS 1" : "",
             role_registers_mode == 2 ? "\n#define DG_MonoEP_FORWARD_ROLE_REGISTERS 1\n"
                 "#define DG_MonoEP_FORWARD_SPLIT_COMBINE_REGISTERS 160" :
             role_registers_mode == 1 ? "\n#define DG_MonoEP_FORWARD_ROLE_REGISTERS 1" : "",
             max_tokens, hidden, inner, experts * world, topk, ring_tokens, num_stages, pull,
-            dispatch_threads, non_epilogue_threads, sms, world,
+            dispatch_threads, non_epilogue_threads, sms, world, activation.limit_bits,
             compact_non_math ? "true" : "false", original_w1_layout ? "true" : "false",
-            diag_suffix + (dist_trace ? ", true" : "")));
+            diag_suffix + trailing_args));
     jit->launch(kernel, {.num_smem_bytes = SM90ArchSpec::smem_capacity, .grid_dim = dim3(sms),
         .block_dim = dim3(block_threads), .cluster_dim = dim3(1, 1, 1)},
         y.data_ptr(), reinterpret_cast<int*>(phase_trace_ptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),

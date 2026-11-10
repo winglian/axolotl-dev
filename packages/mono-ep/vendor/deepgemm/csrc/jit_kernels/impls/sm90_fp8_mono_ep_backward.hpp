@@ -15,6 +15,7 @@
 #include "../heuristics/mono_ep.hpp"
 #include "../heuristics/sm90.hpp"
 #include "runtime_utils.hpp"
+#include "mono_ep_activation_selector.hpp"
 
 namespace deep_gemm {
 
@@ -174,8 +175,9 @@ static void fp8_mono_ep_backward_sm90(
         return mode;
     };
     // 1 = the dispatch warps pack the x/dy columns from the cached FP8 row pools (replaces the math-warp pack).
-    const bool dispatch_xdy_pack = env_mode("MONO_EP_SM90_FP8_DISPATCH_XDY_PACK",
-        transport_fp8 and cached and packed_wgrad and not compact_non_math ? 1 : 0, 1) != 0;
+    // Off by default: 0.40 ms faster single-rank but 0.32 ms slower checkpointed 2F+B at EP8 (NVLink pulls share
+    // the dispatch warps), and it spills with the epilogue overlap.
+    const bool dispatch_xdy_pack = env_mode("MONO_EP_SM90_FP8_DISPATCH_XDY_PACK", 0, 1) != 0;
     DG_HOST_ASSERT(not dispatch_xdy_pack or (transport_fp8 and cached and packed_wgrad and not compact_non_math));
     const bool xdy_vector_pack = not dispatch_xdy_pack and
         env_mode("MONO_EP_SM90_FP8_XDY_VECTOR_PACK", transport_fp8 and cached ? 1 : 0, 1) != 0;
@@ -211,7 +213,8 @@ static void fp8_mono_ep_backward_sm90(
     const int num_stages = fp8_only_stages ? fp8_stages : 2;
     // Mainloop bits: 1 stages cached row scales in shared memory from the A loader, 2 loads a task's
     // weight scales once per lane.
-    // Off by default: mode 2 alone saves ~0.08 ms but costs ~0.1 ms on top of the dispatch-warp x/dy pack.
+    // Off by default: exclusive with the epilogue overlap; without the overlap and the pack, mode 2 saved
+    // 0.05 ms of checkpointed 2F+B at EP8, against 0.27 ms for the overlap with the activation loop.
     const int mainloop_mode = env_mode("MONO_EP_SM90_FP8_BACKWARD_MAINLOOP", 0, 3);
     const std::string diag_suffix = std::format(", {}, {}u, {}, {}u, {}u, {}u, {}u, {}, {}u, {}, {}",
         phase_trace_ptr != 0 ? "true" : "false", diag_ablate, xdy_vector_pack ? "true" : "false",
@@ -221,6 +224,40 @@ static void fp8_mono_ep_backward_sm90(
     const char* dist_trace_selector = std::getenv("MONO_EP_SM90_FP8_DIST_TRACE");
     const bool dist_trace = dist_trace_selector != nullptr and std::string_view(dist_trace_selector) == "1";
     DG_HOST_ASSERT(not dist_trace or (phase_trace_ptr != 0 and world <= 8));
+    const auto activation = select_mono_ep_activation(not compact_non_math);
+    const bool fast_pair = activation.kind == 1 and activation.limit_bits == 0x7f7fffffu;
+    // 0 = the original SwiGLU-backward loop; 1 = score held in a lane and shuffled per row, activation from
+    // mono_ep_activations.cuh, dead BF16 h stores skipped on the packed-wgrad path (dx and dscore bitwise
+    // equal to 0 for the default SwiGLU); 2 = 1 with two columns per lane (BF16x2 loads and stores; dscore
+    // summation order changes). 1 or 2 is required for any activation other than the default SwiGLU.
+    // Default on 512-thread launches: 2 for swiglu_fast, 1 otherwise; compact384 keeps 0 for the default SwiGLU.
+    const int activation_loop = env_mode("MONO_EP_SM90_FP8_ACTIVATION_LOOP",
+        compact_non_math ? (activation.is_default() ? 0 : 1) : (fast_pair ? 2 : 1), 2);
+    DG_HOST_ASSERT(activation_loop != 0 or activation.is_default());
+    // Rows per dscore reduction chunk in the new loop (0 = the build default, 8 with role registers).
+    const int activation_chunk = env_mode("MONO_EP_SM90_FP8_ACTIVATION_CHUNK",
+        activation_loop != 0 and not compact_non_math ? 16 : 0, 32);
+    DG_HOST_ASSERT(activation_chunk == 0 or activation_chunk == 2 or activation_chunk == 4 or
+                   activation_chunk == 8 or activation_chunk == 16 or activation_chunk == 32);
+    DG_HOST_ASSERT(activation_chunk == 0 or activation_loop != 0);
+    DG_HOST_ASSERT(activation_loop != 2 or activation_chunk <= 16);
+    // Issue the next task's k-blocks (same M block) from yield points inside the epilogues:
+    // 1 = the measured best site set (dZ quantize after its loads, dX scatter), N > 1 = raw site
+    // bitmask of the kernel's yield sites (diagnostic).
+    // Default 1 when the caches are on, without the dispatch-warp pack (spills) or a mainloop mode (exclusive).
+    const int overlap_mode = env_mode("MONO_EP_SM90_FP8_OVERLAP_EPILOGUE",
+        cached and cached_dz and not dispatch_xdy_pack and mainloop_mode == 0 and not compact_non_math ? 1 : 0, 255);
+    const int overlap_epilogue = overlap_mode == 1 ? 0x60 : overlap_mode;
+    DG_HOST_ASSERT(overlap_epilogue == 0 or (cached and cached_dz));
+    DG_HOST_ASSERT(overlap_epilogue == 0 or mainloop_mode == 0);
+    // Trailing template arguments after kDistTrace; with every selector off nothing is appended, so the
+    // instantiation text is unchanged.
+    const std::string activation_args = activation_loop == 0 and overlap_epilogue == 0 ? std::string() :
+        std::format(", {}u, 0x{:08x}u, 0x{:08x}u, {}u, {}u", activation.kind, activation.alpha_bits,
+                    activation.limit_bits, activation_loop, activation_chunk) +
+        (overlap_epilogue != 0 ? std::format(", {}u", overlap_epilogue) : std::string());
+    const std::string trailing_args = dist_trace or not activation_args.empty() ?
+        std::string(dist_trace ? ", true" : ", false") + activation_args : std::string();
     // 2 = role-scoped setmaxnreg plus a split math region before the combine (removes C7507 and the
     // epilogue spills); compact 384-thread launches keep the shared register budget.
     const int role_registers_mode = env_mode("MONO_EP_SM90_FP8_ROLE_REGISTERS", compact_non_math ? 0 : 2, 2);
@@ -254,7 +291,10 @@ static void fp8_mono_ep_backward_sm90(
                 (mainloop_mode != 0 ? std::format("_mainloop{}", mainloop_mode) : std::string()) +
                 (relaxed_spins ? "_relaxedspins" : "") + (dispatch_xdy_pack ? "_dispatchxdy" : "") +
                 (custom_pack_registers ? std::format("_reg{}_{}_{}", pack_registers[0], pack_registers[1],
-                    pack_registers[2]) : std::string()),
+                    pack_registers[2]) : std::string()) +
+                (activation_loop != 0 ? std::format("_actloop{}c{}", activation_loop, activation_chunk) +
+                    (activation.is_default() ? std::string("_act0") : activation.tag()) : std::string()) +
+                (overlap_epilogue != 0 ? std::format("_overlap{:x}", overlap_epilogue) : std::string()),
             split_combine_registers ? "_rolereg_split" : role_registers ? "_rolereg" : ""),
         std::format(R"({}{}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
@@ -272,7 +312,7 @@ static void instantiate() {{
             max_tokens, hidden, inner, experts * world, topk, ring_tokens, num_stages, pull,
             dispatch_threads, non_epilogue_threads, sms, world, cached, cached_dz,
             compact_non_math ? "true" : "false", transport_fp8 ? "true" : "false",
-            fp8_combine ? "true" : "false", diag_suffix + (dist_trace ? ", true" : "")));
+            fp8_combine ? "true" : "false", diag_suffix + trailing_args));
     layout::MoEBackwardBuffers buffers{
         layout::SymBuffer<>(dy_ptrs, rank), layout::SymBuffer<>(ds_ptrs, rank),
         reinterpret_cast<__nv_bfloat16*>(pools[0].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[1].data_ptr()),

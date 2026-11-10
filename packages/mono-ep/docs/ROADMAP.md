@@ -15,8 +15,9 @@ SonicMoE where appropriate; evaluate license-compatible UniEP transport behind a
 coherent interface. The package and import namespace are `mono-ep` and
 `mono_ep`.
 
-- After fusion and communication overlap stabilize, prioritize BF16 weights with
-  FP8 AMP and LoRA, then merge-aware NVFP4 LoRA, then NVFP4 full fine-tuning.
+- After fusion and communication overlap stabilize, prioritize merge-aware NVFP4
+  LoRA (frozen NVFP4 expert weights, adapters at full alpha), then NVFP4 full
+  fine-tuning, then BF16 weights with FP8 AMP and LoRA (reordered 2026-11-09).
 - Support BF16, Hopper blockwise FP8, and SM100 MXFP8; track master-weight dtype
   separately from compute dtype. Verify additional claimed formats before adding
   them to the support matrix.
@@ -222,16 +223,31 @@ but is not the default because it has not established a whole-layer speedup.
 
 - [ ] Integrate a multi-node transport behind the common runtime interface;
   evaluate UniEP/NVSHMEM/other applicable transports with license provenance.
+  - [ ] NVSHMEM multi-node EP (backlog, 2026-11-09): keep the single-node NVLink
+    symmetric-memory path as is and add an NVSHMEM transport for the dispatch
+    pulls, combine stores and readiness flags, so one kernel design spans a node
+    (NVLink) and IB/EFA across nodes (IBGDA). Driver: 256-expert models such as
+    Beam-1.0-501B on 2x8 B200 need EP beyond one node. Reference design:
+    FlashMoE (osayamenja/FlashMoE, arXiv 2506.04667, BSD-3) builds its global
+    address space on NVSHMEM with one-sided device-initiated puts plus signals;
+    it is forward-only and TF32/BF16 mma.sync, so only the transport and
+    signalling pattern carry over, not the kernels. Gates before starting:
+    license check for NVSHMEM linkage (TeraMoE's MIT grant excepts
+    NVSHMEM-related code), symmetric-heap sizing per rank, a CoreWeave IB
+    validation plan, and a full-step multi-node measurement rather than layer
+    timing.
 - [ ] Validate cross-node readiness, completion, buffer reuse, and backward overlap.
 - [ ] Port the relevant peer/fusion path to Hopper; implement an appropriate SM120
   path or explicit capability-based fallback.
 - [ ] Integrate the winning peer engine into Axolotl's common EP entry point.
 - [ ] Complete AC/SAC/offload coverage, including full HF/FSDP combinations.
-- [ ] Validate BF16 weights + FP8 AMP + LoRA first, including adapter/input
+- [ ] Validate merge-aware NVFP4 LoRA first (frozen NVFP4 expert weights
+  consumed by the fused kernels, in-smem dequant to the compute format where the
+  MMA kind needs it, adapters at full alpha; reference = the dense merge-aware
+  NVFP4 LoRA path), then NVFP4 full fine-tuning; scope other quantized adapters
+  explicitly rather than implying support from kernel dtype coverage.
+- [ ] Validate BF16 weights + FP8 AMP + LoRA after that, including adapter/input
   gradients, optimizer behavior, checkpoint/resume, memory, and throughput.
-- [ ] Validate merge-aware NVFP4 LoRA next, then NVFP4 full fine-tuning;
-  scope other quantized adapters explicitly rather than implying support from
-  kernel dtype coverage.
 
 ## Benchmark and release gates
 
@@ -1311,13 +1327,14 @@ unprofiled32112 before selecting the path for performance. Preserve staged basel
 
 ### User-ordered dtype/adapter rollout
 
-After fusion and communication overlap stabilize, the explicit priority order is:
-1. BF16 weights + FP8 AMP-style compute + LoRA.
-2. NVFP4 LoRA, including the previously requested merge-aware semantics.
-3. NVFP4 full fine-tuning.
+After fusion and communication overlap stabilize, the explicit priority order is
+(reordered by the user on 2026-11-09: NVFP4 + LoRA ahead of FP8 + LoRA):
+1. NVFP4 LoRA, including the previously requested merge-aware semantics.
+2. NVFP4 full fine-tuning.
+3. BF16 weights + FP8 AMP-style compute + LoRA.
 
-This ordering supersedes any earlier implied FFT-before-LoRA sequence for this
-rollout. Preserve FP32-master Prime comparisons and larger Qwen397B final shape
+This ordering supersedes the earlier FP8-LoRA-first order and any implied
+FFT-before-LoRA sequence for this rollout. Preserve FP32-master Prime comparisons and larger Qwen397B final shape
 validation, but do not let those displace this user-facing order. Validate actual
 parameter/gradient precision, adapter and input gradients, quantization/merge
 semantics, checkpoint replay, EP/FSDP and compile for each applicable stage.

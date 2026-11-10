@@ -17,6 +17,7 @@
 #include <deep_gemm/layout/moe_backward.cuh>
 #include <deep_gemm/mma/sm90.cuh>
 #include <deep_gemm/epilogue/sm100_moe_backward.cuh>
+#include <deep_gemm/impls/mono_ep_activations.cuh>
 #include <deep_gemm/scheduler/mono_ep.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 #include <deep_gemm/ptx/tma.cuh>
@@ -88,6 +89,12 @@ template <
     bool kRelaxedSpins = false,
     bool kDispatchXdyPack = false,
     bool kDistTrace = false,
+    uint32_t kActivation = 0,
+    uint32_t kActivationAlphaBits = mono_ep_act::kDefaultAlphaBits,
+    uint32_t kActivationLimitBits = mono_ep_act::kNoLimitBits,
+    uint32_t kActivationLoop = 0,
+    uint32_t kActivationChunk = 0,
+    uint32_t kOverlapEpilogue = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -133,6 +140,12 @@ sm90_fp8_mono_ep_backward_impl(void* y,
     DG_STATIC_ASSERT(not kFP8OnlyStages or kCacheDz, "FP8-only A stages require the dZ cache");
     DG_STATIC_ASSERT(not kDispatchXdyPack or (kTransportFP8 and kCacheActivations and not kVectorXdyPack and
                      not kCompactNonMath), "Dispatch-warp x/dy pack reads the cached FP8 pools on 4 dispatch warps");
+    // kOverlapEpilogue is a bitmask of epilogue yield sites that issue the next task's k-blocks (see the
+    // math role). The overlapped mainloop only issues cached FP8 A tiles (no in-CTA quantization).
+    DG_STATIC_ASSERT(kOverlapEpilogue < 256 and (kOverlapEpilogue == 0 or (kCacheActivations and kCacheDz)),
+                     "Epilogue overlap requires the activation and dZ caches");
+    DG_STATIC_ASSERT(kOverlapEpilogue == 0 or kMainloopMode == 0,
+                     "The overlapped mainloop reads scales the mode-0 way");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     constexpr uint32_t kNumLocalityDomains = 1;
 
@@ -1319,8 +1332,58 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             shared_storage.xdy_queue_full[slot].arrive();
             ++ xdy_pushed;
         };
-        while (scheduler.get_next_task(task_info)) {
-            scheduler.release_task_info();
+        // Epilogue overlap: while the epilogue of task i runs, yield points inside it issue the
+        // k-blocks of task i + 1 (same M block only) into ov_partial and promote them into ov_accum,
+        // so the tensor cores work during the epilogue. Promotion order and scales are unchanged.
+        // kOverlapEpilogue bits enable sites: 0 x/dy pack, 1 dH copy (n > 0), 2 SwiGLU, 3/4 h/dZ pack,
+        // 5/7 dZ quantize, 6 dX scatter. Sites 0 and 2-4 keep 128 extra registers live in
+        // register-heavy code and make ptxas spill or serialize the WGMMAs; sites 1 and 7 compile
+        // cleanly but measured slower. Phase trace slots: 39 overlapped k-blocks, 61-63 yield cycles
+        // (total, full-barrier wait, WGMMA wait).
+        struct OverlapParams {
+            const float* weight_scales;
+            const float* act_scales;
+            uint32_t scale_groups;
+            uint32_t num_k_blocks;
+        };
+        [[maybe_unused]] float ov_accum[WGMMA::kNumAccum];
+        [[maybe_unused]] float ov_partial[WGMMA::kNumAccum];
+        [[maybe_unused]] bool ov_has_task = false, ov_active = false, ov_inflight = false;
+        [[maybe_unused]] uint32_t ov_k = 0;
+        [[maybe_unused]] float ov_sa0 = 0.0f, ov_sa1 = 0.0f, ov_sb = 0.0f;
+        [[maybe_unused]] OverlapParams ov_next{};
+        [[maybe_unused]] task_info_t ov_next_task;
+        [[maybe_unused]] uint64_t trace_ov_kblocks = 0, trace_ov_cycles = 0, trace_ov_full = 0, trace_ov_mma = 0;
+        [[maybe_unused]] uint64_t trace_yield_full = 0, trace_yield_mma = 0;
+        [[maybe_unused]] const uint32_t ov_row0 = epilogue_wg_idx * WG_BLOCK_M + warp_idx_in_wg * 16 + lane_idx / 4;
+        [[maybe_unused]] const auto ov_params_of = [&](const task_info_t& t) {
+            const bool t_dh = t.block_phase == sched::BlockPhase::BackwardDh;
+            const bool t_dx = t.block_phase == sched::BlockPhase::BackwardDx;
+            const uint32_t t_weight_n = t_dh or t_dx ? t.n_cluster_idx :
+                2 * t.n_cluster_idx + (t.block_phase == sched::BlockPhase::BackwardRecomputeHigh);
+            const uint32_t t_num_k = t.shape_k / BLOCK_K;
+            const uint32_t t_num_n = t.shape_n / BLOCK_N;
+            const uint32_t t_groups = (t_dx ? 2 * kIntermediateHidden : kHidden) / 128;
+            OverlapParams p;
+            p.weight_scales = (t_dh ? w2t_scales : t_dx ? w1t_scales : w1_scales) +
+                (t.local_expert_idx * t_num_n + t_weight_n) * t_num_k;
+            p.act_scales = (t_dh ? backward.sdy_pool : t_dx ? backward.sdz_pool : backward.sx_pool) +
+                (static_cast<uint64_t>(t.pool_block_idx) * BLOCK_M + ov_row0) * t_groups;
+            p.scale_groups = t_groups;
+            p.num_k_blocks = t_num_k;
+            return p;
+        };
+        if constexpr (kOverlapEpilogue != 0) {
+            #pragma unroll
+            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                ov_accum[i] = 0.0f;
+            ov_has_task = scheduler.get_next_task(task_info);
+            if (ov_has_task)
+                scheduler.release_task_info();
+        }
+        while (kOverlapEpilogue != 0 ? ov_has_task : scheduler.get_next_task(task_info)) {
+            if constexpr (kOverlapEpilogue == 0)
+                scheduler.release_task_info();
             const uint64_t trace_got = trace_clock();
             uint64_t trace_full_first = 0, trace_full_rest = 0;
             if constexpr (kDistTrace) {
@@ -1351,6 +1414,101 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                              "Weight-scale prefetch holds one K-block per lane");
             const float lane_weight_scale = (kMainloopMode & 2u) and lane_idx < num_k_blocks ?
                 __ldg(weight_scales + (task_info.local_expert_idx * num_n_blocks + weight_n) * num_k_blocks + lane_idx) : 0.0f;
+            // Overlap helpers: issue one k-block into ov_partial (no wait), and retire it (wait, promote
+            // into ov_accum with the same scale products as the mainloop below, release the stage).
+            [[maybe_unused]] const auto ov_issue = [&](const OverlapParams& p, const uint32_t k_block_idx) {
+                const uint64_t trace_f0 = trace_clock();
+                shared_storage.full_barriers[stage_idx].wait(phase);
+                if constexpr (kPhaseTrace) trace_ov_full += trace_clock() - trace_f0;
+                // Scales are read after the full barrier: a new M block's scales are written by dispatch.
+                ov_sb = p.weight_scales[k_block_idx];
+                ov_sa0 = p.act_scales[k_block_idx];
+                ov_sa1 = p.act_scales[k_block_idx + 8 * p.scale_groups];
+                const uint32_t a_base = a_desc_lo + stage_idx * sizeof(shared_storage.smem_a[0]) / 16;
+                const uint32_t b_base = b_desc_lo + stage_idx * sizeof(shared_storage.smem_b[0]) / 16;
+                #pragma unroll
+                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i) {
+                    ov_partial[i] = 0.0f;
+                    ptx::warpgroup_fence_operand(ov_partial[i]);
+                }
+                ptx::warpgroup_arrive();
+                #pragma unroll
+                for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++k) {
+                    a_desc.reg32_[0] = mma::sm90::advance_gmma_desc_lo<
+                        cute::UMMA::Major::K, BLOCK_M, BLOCK_K, kSwizzleAMode, __nv_fp8_e4m3>(
+                            a_base, epilogue_wg_idx * WG_BLOCK_M, k * WGMMA::K, 0);
+                    b_desc.reg32_[0] = mma::sm90::advance_gmma_desc_lo<
+                        cute::UMMA::Major::K, BLOCK_N, BLOCK_K, kSwizzleBMode, __nv_fp8_e4m3>(
+                            b_base, 0, k * WGMMA::K, 0);
+                    WGMMA::wgmma(a_desc, b_desc, ov_partial, k != 0);
+                }
+                ptx::warpgroup_commit_batch();
+                #pragma unroll
+                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                    ptx::warpgroup_fence_operand(ov_partial[i]);
+            };
+            [[maybe_unused]] const auto ov_retire = [&]() {
+                const uint64_t trace_m0 = trace_clock();
+                ptx::warpgroup_wait<0>();
+                if constexpr (kPhaseTrace) trace_ov_mma += trace_clock() - trace_m0;
+                #pragma unroll
+                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                    ptx::warpgroup_fence_operand(ov_partial[i]);
+                const float scale0 = ov_sa0 * ov_sb;
+                const float scale1 = ov_sa1 * ov_sb;
+                #pragma unroll
+                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                    ov_accum[i] += ov_partial[i] * (i % 4 < 2 ? scale0 : scale1);
+                if (lane_idx == 0)
+                    shared_storage.empty_barriers[stage_idx].arrive();
+                stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
+                phase ^= stage_idx == 0;
+            };
+            // Must be reached by every thread of both math warpgroups at the same call site.
+            [[maybe_unused]] const auto overlap_yield = [&](const uint32_t site) {
+                if constexpr (kOverlapEpilogue != 0) {
+                    if ((kOverlapEpilogue >> site) & 1u and ov_active) {
+                        const uint64_t trace_y0 = trace_clock();
+                        const uint64_t trace_full0 = trace_ov_full, trace_mma0 = trace_ov_mma;
+                        if (ov_inflight) {
+                            ov_retire();
+                            ++ ov_k;
+                        }
+                        ov_inflight = ov_k < ov_next.num_k_blocks;
+                        if (ov_inflight) {
+                            ov_issue(ov_next, ov_k);
+                            if constexpr (kPhaseTrace) ++ trace_ov_kblocks;
+                        }
+                        if constexpr (kPhaseTrace) {
+                            trace_ov_cycles += trace_clock() - trace_y0;
+                            trace_yield_full += trace_ov_full - trace_full0;
+                            trace_yield_mma += trace_ov_mma - trace_mma0;
+                        }
+                    }
+                }
+            };
+            if constexpr (kOverlapEpilogue != 0) {
+                // Finish this task's mainloop: retire the k-block left in flight, then the rest serially.
+                const OverlapParams cur = ov_params_of(task_info);
+                if (ov_inflight) {
+                    ov_retire();
+                    ++ ov_k;
+                    ov_inflight = false;
+                }
+                for (; ov_k < cur.num_k_blocks; ++ ov_k) {
+                    if constexpr (kPhaseTrace) {
+                        const uint64_t trace_fw0 = trace_clock();
+                        shared_storage.full_barriers[stage_idx].wait(phase);
+                        const uint64_t trace_fw = trace_clock() - trace_fw0;
+                        if (ov_k == 0) trace_full_first = trace_fw; else trace_full_rest += trace_fw;
+                    }
+                    ov_issue(cur, ov_k);
+                    ov_retire();
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                    accum[i] = ov_accum[i];
+            } else
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 const uint64_t trace_fw0 = trace_clock();
                 shared_storage.full_barriers[stage_idx].wait(phase);
@@ -1460,6 +1618,23 @@ sm90_fp8_mono_ep_backward_impl(void* y,
             }
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             trace_mark[0] = trace_clock();
+            if constexpr (kOverlapEpilogue != 0) {
+                #pragma unroll
+                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                    ov_accum[i] = 0.0f;
+                ov_k = 0;
+                ov_inflight = false;
+                ov_has_task = scheduler.get_next_task(ov_next_task);
+                if (ov_has_task)
+                    scheduler.release_task_info();
+                // Only within one M block, and never into dX: its A tiles depend on this block's
+                // recompute epilogues (L2 k-block mask), so issuing them here would deadlock.
+                const bool next_dx = ov_next_task.block_phase == sched::BlockPhase::BackwardDx;
+                ov_active = ov_has_task and ov_next_task.pool_block_idx == task_info.pool_block_idx and
+                    (not next_dx or task_info.block_phase == sched::BlockPhase::BackwardDx);
+                if (ov_active)
+                    ov_next = ov_params_of(ov_next_task);
+            }
 
             const uint32_t valid_m = ptx::exchange(task_info.valid_m, 0);
             const uint32_t pool_block_idx = task_info.pool_block_idx;
@@ -1714,6 +1889,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                                 make_uint4(out[k][0], out[k][1], out[k][2], out[k][3]);
                         }
                     }
+                    overlap_yield(0);
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     if (chunk + 2 < kNumChunks)
                         issue(chunk + 2, stage);
@@ -1749,6 +1925,19 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     }
                     trace_mark[2] = trace_clock();
                 }
+                if (kOverlapEpilogue & 2u and task_info.n_cluster_idx != 0) {
+                    // Separate copy: the x/dy pack (register heavy) must not be CFG-reachable from a yield,
+                    // and the yield condition must be visibly uniform (ptxas C7518 otherwise).
+                    for (uint32_t i = 0; i < BLOCK_M * BLOCK_N / kNumEpilogueThreads; ++ i) {
+                        const uint32_t linear = epilogue_thread_idx + i * kNumEpilogueThreads;
+                        const uint32_t row = linear / BLOCK_N;
+                        shared_storage.backward_epilogue.dh[linear] = row < valid_m
+                            ? __float2bfloat16_rn(static_cast<float>(shared_storage.smem_d.raw[linear]))
+                            : __float2bfloat16_rn(0.0f);
+                        if (i % 16 == 15)
+                            overlap_yield(1);
+                    }
+                } else {
                 for (uint32_t linear = epilogue_thread_idx; linear < BLOCK_M * BLOCK_N;
                      linear += kNumEpilogueThreads) {
                     const uint32_t row = linear / BLOCK_N;
@@ -1761,6 +1950,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                         pack_cached_xdy_vectorized();
                         trace_mark[2] = trace_clock();
                     }
+                }
                 }
             } else if (not is_dx) {
                 // Reduce-scatter kChunk per-lane values across the warp: after log2(kChunk) halving
@@ -1789,51 +1979,198 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 constexpr uint32_t kDscoreChunk = DG_MonoEP_ROLE_SCOPED_REGISTERS ? 8 : 2;
                 DG_STATIC_ASSERT((BLOCK_N / 2) % 32 == 0 and kNumEpilogueThreads % (BLOCK_N / 2) == 0 and
                                  kElemIters % kDscoreChunk == 0, "dscore reduction needs row-uniform warps");
-                #pragma unroll 1
-                for (uint32_t chunk = 0; chunk < kElemIters; chunk += kDscoreChunk) {
-                    float contributions[kDscoreChunk];
-                    #pragma unroll
-                    for (uint32_t c = 0; c < kDscoreChunk; ++c) {
-                        const uint32_t linear = epilogue_thread_idx + (chunk + c) * kNumEpilogueThreads;
-                        const uint32_t row = linear / (BLOCK_N / 2);
-                        const uint32_t p = linear % (BLOCK_N / 2);
-                        const uint32_t gate_col = 16 * (p / 8) + p % 8;
-                        const float gate = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col]);
-                        const float up = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8]);
-                        const float dh = __bfloat162float(
-                            shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p]);
-                        const float score = row < valid_m
-                            ? buffer.l1_topk_weights_buffer.get_base_ptr<float>()[ring_m_idx + row] : 0.0f;
-                        const float sigmoid = 1.0f / (1.0f + expf(-gate));
-                        const float silu = gate * sigmoid;
-                        const float h = silu * up * score;
-                        const float dg = dh * score * up * (sigmoid + silu * (1.0f - sigmoid));
-                        const float du = dh * score * silu;
-                        const uint32_t n = n_block_idx * 64 + p;
-                        const uint32_t scratch_m_idx = backward.qh_col == nullptr ? pool_m_idx : ring_m_idx;
-                        const uint64_t scratch = static_cast<uint64_t>(scratch_m_idx + row);
-                        const bool valid = row < valid_m;
-                        backward.h_pool[scratch * kIntermediateHidden + n] = __float2bfloat16_rn(valid ? h : 0.0f);
-                        backward.dz_pool[scratch * (2 * kIntermediateHidden) + n] = __float2bfloat16_rn(valid ? dg : 0.0f);
-                        backward.dz_pool[scratch * (2 * kIntermediateHidden) + kIntermediateHidden + n] =
-                            __float2bfloat16_rn(valid ? du : 0.0f);
-                        contributions[c] = valid ? dh * silu * up : 0.0f;
-                        if (backward.qh_col != nullptr) {
-                            shared_storage.smem_d.raw[row * BLOCK_N + gate_col] =
-                                d_dtype_t(valid ? h : 0.0f);
-                            shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8] =
-                                d_dtype_t(valid ? dg : 0.0f);
-                            shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p] =
-                                __float2bfloat16_rn(valid ? du : 0.0f);
+                if constexpr (kActivationLoop == 2) {
+                    // Two adjacent columns per lane: BF16x2 shared loads/stores and 4-byte global stores, one
+                    // warp per row. Lanes 0-15 hold columns 0-31 and lanes 16-31 columns 32-63, the same
+                    // column split as the dscore slots of the scalar loop; only the summation order differs.
+                    constexpr uint32_t kPairIters = BLOCK_M * (BLOCK_N / 4) / kNumEpilogueThreads;
+                    constexpr uint32_t kChunk = kActivationChunk != 0 ? kActivationChunk : 8;
+                    constexpr uint32_t kRowStep = kNumEpilogueThreads / (BLOCK_N / 4);
+                    constexpr bool kClamp = kActivationLimitBits != mono_ep_act::kNoLimitBits;
+                    DG_STATIC_ASSERT(BLOCK_N / 4 == 32 and kPairIters <= 32 and kPairIters % kChunk == 0 and
+                                     kChunk <= 16, "Pair activation loop needs one warp per row");
+                    const float alpha = __uint_as_float(kActivationAlphaBits);
+                    const float limit = __uint_as_float(kActivationLimitBits);
+                    const uint32_t row_base = epilogue_warp_idx;
+                    const uint32_t q = lane_idx;
+                    const uint32_t gate_col = 16 * (q / 4) + 2 * (q % 4);
+                    const uint32_t dh_col = half * 64 + 2 * q;
+                    const uint32_t n = n_block_idx * 64 + 2 * q;
+                    const uint32_t lane_row = row_base + kRowStep * lane_idx;
+                    const float lane_score = lane_idx < kPairIters and lane_row < valid_m
+                        ? buffer.l1_topk_weights_buffer.get_base_ptr<float>()[ring_m_idx + lane_row] : 0.0f;
+                    const bool packed = backward.qh_col != nullptr;
+                    const uint32_t scratch_m_idx = packed ? ring_m_idx : pool_m_idx;
+                    // Halving reduce-scatter within each 16-lane half, then butterflies.
+                    const auto reduce_scatter_half = [&](auto& values) {
+                        constexpr uint32_t kN = sizeof(values) / sizeof(float);
+                        #pragma unroll
+                        for (uint32_t width = kN / 2, delta = 8; width > 0; width /= 2, delta /= 2) {
+                            const bool upper = lane_idx & delta;
+                            #pragma unroll
+                            for (uint32_t j = 0; j < width; ++j) {
+                                const float send = upper ? values[j] : values[j + width];
+                                const float keep = upper ? values[j + width] : values[j];
+                                values[j] = keep + __shfl_xor_sync(0xffffffff, send, delta);
+                            }
+                        }
+                        #pragma unroll
+                        for (uint32_t delta = 16 / kN / 2; delta > 0; delta /= 2)
+                            values[0] += __shfl_xor_sync(0xffffffff, values[0], delta);
+                        return values[0];
+                    };
+                    #pragma unroll 1
+                    for (uint32_t chunk = 0; chunk < kPairIters; chunk += kChunk) {
+                        float contributions[kChunk];
+                        #pragma unroll
+                        for (uint32_t c = 0; c < kChunk; ++c) {
+                            const uint32_t row = row_base + kRowStep * (chunk + c);
+                            const bool valid = row < valid_m;
+                            const float score = __shfl_sync(0xffffffff, lane_score, chunk + c);
+                            auto* gate_ptr = reinterpret_cast<__nv_bfloat162*>(
+                                shared_storage.smem_d.raw + row * BLOCK_N + gate_col);
+                            auto* up_ptr = reinterpret_cast<__nv_bfloat162*>(
+                                shared_storage.smem_d.raw + row * BLOCK_N + gate_col + 8);
+                            auto* dh_ptr = reinterpret_cast<__nv_bfloat162*>(
+                                shared_storage.backward_epilogue.dh + row * BLOCK_N + dh_col);
+                            const float2 gate = __bfloat1622float2(*gate_ptr);
+                            const float2 up = __bfloat1622float2(*up_ptr);
+                            const float2 dh = __bfloat1622float2(*dh_ptr);
+                            const auto g0 = mono_ep_act::backward<kActivation, kClamp>(
+                                gate.x, up.x, dh.x * score, alpha, limit);
+                            const auto g1 = mono_ep_act::backward<kActivation, kClamp>(
+                                gate.y, up.y, dh.y * score, alpha, limit);
+                            const auto pack = [&](const float a, const float b) {
+                                return valid ? __floats2bfloat162_rn(a, b) : __floats2bfloat162_rn(0.0f, 0.0f);
+                            };
+                            const auto h = pack(g0.out * score, g1.out * score);
+                            const auto dg = pack(g0.dx, g1.dx);
+                            const auto du = pack(g0.dy, g1.dy);
+                            const uint64_t scratch = static_cast<uint64_t>(scratch_m_idx + row);
+                            if (not packed)
+                                *reinterpret_cast<__nv_bfloat162*>(backward.h_pool + scratch * kIntermediateHidden + n) = h;
+                            *reinterpret_cast<__nv_bfloat162*>(backward.dz_pool + scratch * (2 * kIntermediateHidden) + n) = dg;
+                            *reinterpret_cast<__nv_bfloat162*>(
+                                backward.dz_pool + scratch * (2 * kIntermediateHidden) + kIntermediateHidden + n) = du;
+                            contributions[c] = valid ? dh.x * g0.f * g0.g + dh.y * g1.f * g1.g : 0.0f;
+                            if (packed) {
+                                *gate_ptr = h;
+                                *up_ptr = dg;
+                                *dh_ptr = du;
+                            }
+                        }
+                        const float sum = reduce_scatter_half(contributions);
+                        constexpr uint32_t kLanesPerEntry = 16 / kChunk;
+                        if ((lane_idx % 16) % kLanesPerEntry == 0 and not (kDiagAblate & 2u)) {
+                            const uint32_t row = row_base + (chunk + (lane_idx % 16) / kLanesPerEntry) * kRowStep;
+                            shared_storage.dscore[lane_idx / 16][row] += sum;
                         }
                     }
-                    const float sum = reduce_scatter(contributions);
-                    constexpr uint32_t kLanesPerEntry = 32 / kDscoreChunk;
-                    if (lane_idx % kLanesPerEntry == 0 and not (kDiagAblate & 2u)) {
-                        const uint32_t row = epilogue_warp_idx / 2 +
-                            (chunk + lane_idx / kLanesPerEntry) * (kNumEpilogueThreads / (BLOCK_N / 2));
-                        shared_storage.dscore[epilogue_warp_idx % 2][row] += sum;
+                } else if constexpr (kActivationLoop == 1) {
+                    // Row r of this warp is row_base + kRowStep * i for iteration i; lane i holds that row's
+                    // score so each element gets it with one shuffle instead of a global load.
+                    constexpr uint32_t kChunk = kActivationChunk != 0 ? kActivationChunk : kDscoreChunk;
+                    constexpr uint32_t kRowStep = kNumEpilogueThreads / (BLOCK_N / 2);
+                    constexpr bool kClamp = kActivationLimitBits != mono_ep_act::kNoLimitBits;
+                    DG_STATIC_ASSERT(kElemIters <= 32 and kElemIters % kChunk == 0 and kChunk <= 32,
+                                     "Activation loop needs one score lane per row");
+                    const float alpha = __uint_as_float(kActivationAlphaBits);
+                    const float limit = __uint_as_float(kActivationLimitBits);
+                    const uint32_t row_base = epilogue_thread_idx / (BLOCK_N / 2);
+                    const uint32_t p = epilogue_thread_idx % (BLOCK_N / 2);
+                    const uint32_t gate_col = 16 * (p / 8) + p % 8;
+                    const uint32_t n = n_block_idx * 64 + p;
+                    const uint32_t lane_row = row_base + kRowStep * lane_idx;
+                    const float lane_score = lane_idx < kElemIters and lane_row < valid_m
+                        ? buffer.l1_topk_weights_buffer.get_base_ptr<float>()[ring_m_idx + lane_row] : 0.0f;
+                    const bool packed = backward.qh_col != nullptr;
+                    const uint32_t scratch_m_idx = packed ? ring_m_idx : pool_m_idx;
+                    #pragma unroll 1
+                    for (uint32_t chunk = 0; chunk < kElemIters; chunk += kChunk) {
+                        float contributions[kChunk];
+                        #pragma unroll
+                        for (uint32_t c = 0; c < kChunk; ++c) {
+                            const uint32_t row = row_base + kRowStep * (chunk + c);
+                            const bool valid = row < valid_m;
+                            const float score = __shfl_sync(0xffffffff, lane_score, chunk + c);
+                            const float gate = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col]);
+                            const float up = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8]);
+                            const float dh = __bfloat162float(
+                                shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p]);
+                            const auto g = mono_ep_act::backward<kActivation, kClamp>(
+                                gate, up, dh * score, alpha, limit);
+                            const float h = g.out * score;
+                            const uint64_t scratch = static_cast<uint64_t>(scratch_m_idx + row);
+                            // The packed-wgrad path reads h from shared memory; its BF16 h pool is never consumed.
+                            if (not packed)
+                                backward.h_pool[scratch * kIntermediateHidden + n] = __float2bfloat16_rn(valid ? h : 0.0f);
+                            backward.dz_pool[scratch * (2 * kIntermediateHidden) + n] =
+                                __float2bfloat16_rn(valid ? g.dx : 0.0f);
+                            backward.dz_pool[scratch * (2 * kIntermediateHidden) + kIntermediateHidden + n] =
+                                __float2bfloat16_rn(valid ? g.dy : 0.0f);
+                            contributions[c] = valid ? dh * g.f * g.g : 0.0f;
+                            if (packed) {
+                                shared_storage.smem_d.raw[row * BLOCK_N + gate_col] = d_dtype_t(valid ? h : 0.0f);
+                                shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8] = d_dtype_t(valid ? g.dx : 0.0f);
+                                shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p] =
+                                    __float2bfloat16_rn(valid ? g.dy : 0.0f);
+                            }
+                        }
+                        const float sum = reduce_scatter(contributions);
+                        constexpr uint32_t kLanesPerEntry = 32 / kChunk;
+                        if (lane_idx % kLanesPerEntry == 0 and not (kDiagAblate & 2u)) {
+                            const uint32_t row = row_base + (chunk + lane_idx / kLanesPerEntry) * kRowStep;
+                            shared_storage.dscore[epilogue_warp_idx % 2][row] += sum;
+                        }
                     }
+                } else {
+                    #pragma unroll 1
+                    for (uint32_t chunk = 0; chunk < kElemIters; chunk += kDscoreChunk) {
+                        float contributions[kDscoreChunk];
+                        #pragma unroll
+                        for (uint32_t c = 0; c < kDscoreChunk; ++c) {
+                            const uint32_t linear = epilogue_thread_idx + (chunk + c) * kNumEpilogueThreads;
+                            const uint32_t row = linear / (BLOCK_N / 2);
+                            const uint32_t p = linear % (BLOCK_N / 2);
+                            const uint32_t gate_col = 16 * (p / 8) + p % 8;
+                            const float gate = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col]);
+                            const float up = static_cast<float>(shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8]);
+                            const float dh = __bfloat162float(
+                                shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p]);
+                            const float score = row < valid_m
+                                ? buffer.l1_topk_weights_buffer.get_base_ptr<float>()[ring_m_idx + row] : 0.0f;
+                            const float sigmoid = 1.0f / (1.0f + expf(-gate));
+                            const float silu = gate * sigmoid;
+                            const float h = silu * up * score;
+                            const float dg = dh * score * up * (sigmoid + silu * (1.0f - sigmoid));
+                            const float du = dh * score * silu;
+                            const uint32_t n = n_block_idx * 64 + p;
+                            const uint32_t scratch_m_idx = backward.qh_col == nullptr ? pool_m_idx : ring_m_idx;
+                            const uint64_t scratch = static_cast<uint64_t>(scratch_m_idx + row);
+                            const bool valid = row < valid_m;
+                            backward.h_pool[scratch * kIntermediateHidden + n] = __float2bfloat16_rn(valid ? h : 0.0f);
+                            backward.dz_pool[scratch * (2 * kIntermediateHidden) + n] = __float2bfloat16_rn(valid ? dg : 0.0f);
+                            backward.dz_pool[scratch * (2 * kIntermediateHidden) + kIntermediateHidden + n] =
+                                __float2bfloat16_rn(valid ? du : 0.0f);
+                            contributions[c] = valid ? dh * silu * up : 0.0f;
+                            if (backward.qh_col != nullptr) {
+                                shared_storage.smem_d.raw[row * BLOCK_N + gate_col] =
+                                    d_dtype_t(valid ? h : 0.0f);
+                                shared_storage.smem_d.raw[row * BLOCK_N + gate_col + 8] =
+                                    d_dtype_t(valid ? dg : 0.0f);
+                                shared_storage.backward_epilogue.dh[row * BLOCK_N + half * 64 + p] =
+                                    __float2bfloat16_rn(valid ? du : 0.0f);
+                            }
+                        }
+                        const float sum = reduce_scatter(contributions);
+                        constexpr uint32_t kLanesPerEntry = 32 / kDscoreChunk;
+                        if (lane_idx % kLanesPerEntry == 0 and not (kDiagAblate & 2u)) {
+                            const uint32_t row = epilogue_warp_idx / 2 +
+                                (chunk + lane_idx / kLanesPerEntry) * (kNumEpilogueThreads / (BLOCK_N / 2));
+                            shared_storage.dscore[epilogue_warp_idx % 2][row] += sum;
+                        }
+                    }
+                    overlap_yield(2);
                 }
                 __threadfence();
                 asm volatile("fence.proxy.async.global;" ::: "memory");
@@ -1867,6 +2204,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                             }
                             scratch_chunks[row * 8 + (chunk ^ ((row / 16) % 8))] = value;
                         }
+                        overlap_yield(3);
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                         const uint32_t width = kind == 0 ? kIntermediateHidden : 2 * kIntermediateHidden;
                         auto* scales = kind == 0 ? backward.sh_col : backward.sdz_col;
@@ -1920,6 +2258,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                             *reinterpret_cast<uint4*>(q + dst) = out_lo;
                             *reinterpret_cast<uint4*>(q + dst + padded_count) = out_hi;
                         }
+                        overlap_yield(4);
                         // The closing barrier below covers the last kind's scratch reads.
                         if (kind < 2)
                             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -2072,6 +2411,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                                 raw[b][0] = src[0];
                                 raw[b][1] = src[1];
                             }
+                            overlap_yield(5);
                             #pragma unroll
                             for (uint32_t b = 0; b < kBatch; ++b) {
                                 const uint32_t span = base + b * 4 + lane_idx / 8;
@@ -2102,6 +2442,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                                                                  values[4 * i + 2] * inv, values[4 * i + 3] * inv);
                                 *reinterpret_cast<uint4*>(backward.qdz_pool + offset + segment * 16) = out;
                             }
+                            overlap_yield(7);
                         }
                         asm volatile("fence.proxy.async.global;" ::: "memory");
                         __threadfence();
@@ -2215,8 +2556,11 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     #pragma unroll
                     for (uint32_t step = 0; step < kNumSteps; ++step) {
                         const uint32_t row_base = (step * kNumEpilogueWarps + epilogue_warp_idx) * kRowsPerStep;
-                        if (row_base >= valid_m)
-                            break;
+                        if constexpr (kOverlapEpilogue == 0) {
+                            if (row_base >= valid_m)
+                                break;
+                        }
+                        if (kOverlapEpilogue == 0 or row_base < valid_m) {
                         const uint32_t row = row_base + sub;
                         // Lanes 4-7 of each row load their two 16-byte halves in swapped order: conflict-free LDS.128
                         const uint32_t swap = (part >> 2) & 1u;
@@ -2269,6 +2613,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                                                src_rank)[0] = __uint_as_float(exponent << 23);
                             }
                         }
+                        }
+                        overlap_yield(6);
                     }
                 } else if constexpr (kFP8Combine) {
                     for (uint32_t row = epilogue_warp_idx; row < valid_m; row += kNumEpilogueWarps) {
@@ -2385,6 +2731,8 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 }
                 trace_prev_end = trace_end;
             }
+            if constexpr (kOverlapEpilogue != 0)
+                task_info = ov_next_task;
         }
         if constexpr (kDispatchXdyPack) {
             if (epilogue_thread_idx == 0)
@@ -2395,6 +2743,14 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 trace_set(4, trace_clock());
                 trace_add(19, trace_mblock);
                 dist_set(8, trace_globaltimer());
+                if constexpr (kOverlapEpilogue != 0) {
+                    trace_add(39, trace_ov_kblocks);
+                    if constexpr (not (kDiagAblate & 64u)) {
+                        trace_add(61, trace_ov_cycles);
+                        trace_add(62, trace_yield_full);
+                        trace_add(63, trace_yield_mma);
+                    }
+                }
             }
         }
 

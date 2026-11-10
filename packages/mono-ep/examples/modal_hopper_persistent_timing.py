@@ -5,7 +5,7 @@
 
 import json
 import os
-import subprocess
+import subprocess  # nosec B404
 from pathlib import Path
 
 import modal
@@ -33,15 +33,44 @@ def _benchmark(
     fp8_combine: bool = False,
     trap_timeouts: bool = False,
     expected_gpu: str = "H200",
+    variants: str = "",
+    routings: str = "",
+    routing_override: str = "",
 ):
     import torch
+
+    if routings and not routing_override:
+        # One process per routing, one after another in this allocation.
+        runs = [
+            dict(
+                routing=routing,
+                **_benchmark(
+                    profile,
+                    compare_forward_layouts,
+                    compare_kernel_layouts,
+                    fp8_transport,
+                    fp8_combine,
+                    trap_timeouts,
+                    expected_gpu,
+                    variants,
+                    routing_override=routing,
+                ),
+            )
+            for routing in routings.split(",")
+        ]
+        return dict(
+            returncode=max(r["returncode"] for r in runs),
+            device=torch.cuda.get_device_name(),
+            modal_task_id=os.environ.get("MODAL_TASK_ID"),
+            runs=runs,
+        )
 
     actual_gpu = torch.cuda.get_device_name()
     if expected_gpu not in actual_gpu:
         raise RuntimeError(f"Expected {expected_gpu}, allocated {actual_gpu}")
     if fp8_combine and not fp8_transport:
         raise ValueError("FP8 combine requires FP8 input transport")
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603 B607
         [
             "python",
             "-m",
@@ -57,6 +86,8 @@ def _benchmark(
             *(["--profile"] if profile else []),
             *(["--compare-forward-layouts"] if compare_forward_layouts else []),
             *(["--compare-kernel-layouts"] if compare_kernel_layouts else []),
+            *(["--variants", variants] if variants else []),
+            *(["--routing", routing_override] if routing_override else []),
         ],
         env={
             **os.environ,
@@ -68,7 +99,7 @@ def _benchmark(
         },
         capture_output=True,
         text=True,
-        timeout=1700,
+        timeout=3000,
         check=False,
     )
     return dict(
@@ -76,14 +107,14 @@ def _benchmark(
     )
 
 
-@app.function(image=image, gpu="H100!:8", cpu=32, memory=131072, timeout=1800)
-def benchmark_h100(*args):
-    return _benchmark(*args, expected_gpu="H100")
+@app.function(image=image, gpu="H100!:8", cpu=32, memory=131072, timeout=7200)
+def benchmark_h100(*args, **kwargs):
+    return _benchmark(*args, expected_gpu="H100", **kwargs)
 
 
 @app.function(image=image, gpu="H200:8", cpu=32, memory=131072, timeout=1800)
-def benchmark_h200(*args):
-    return _benchmark(*args, expected_gpu="H200")
+def benchmark_h200(*args, **kwargs):
+    return _benchmark(*args, expected_gpu="H200", **kwargs)
 
 
 @app.local_entrypoint()
@@ -95,7 +126,11 @@ def main(
     fp8_transport: bool = False,
     fp8_combine: bool = False,
     trap_timeouts: bool = False,
+    variants: str = "",
+    routings: str = "",
+    out: str = "",
 ):
+    """variants: native env variants 'name:ENV=V+ENV2=V2,...'; routings: e.g. 'balanced,skewed'."""
     if compare_forward_layouts and compare_kernel_layouts:
         raise ValueError(
             "Forward-layout and kernel-layout comparisons are separate runs"
@@ -112,7 +147,12 @@ def main(
         fp8_transport,
         fp8_combine,
         trap_timeouts,
+        variants=variants,
+        routings=routings,
     )
+    result["modal_app_id"] = os.environ.get("MODAL_APP_ID") or app.app_id
+    if out:
+        Path(out).write_text(json.dumps(result, indent=1))
     print(json.dumps(result))
     if result["returncode"]:
         raise RuntimeError(f"{gpu} native FP8 timing failed")
