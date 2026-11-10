@@ -9,8 +9,10 @@ __all__ = [
     "PersistentMoE",
     "SonicExperts",
     "MonoEP",
+    "MonoEPDispatchRuntime",
     "MonoEPRuntime",
     "check_nccl_env",
+    "dispatch_unsupported_reason",
     "nccl_env",
     "pipelined_moe",
     "resolve_precision",
@@ -22,8 +24,10 @@ __all__ = [
 _API = frozenset(
     {
         "DEFAULT_RESERVED_SMS",
+        "MonoEPDispatchRuntime",
         "MonoEPRuntime",
         "check_nccl_env",
+        "dispatch_unsupported_reason",
         "nccl_env",
         "resolve_precision",
         "unsupported_reason",

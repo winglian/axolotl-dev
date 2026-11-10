@@ -21,8 +21,13 @@ if TYPE_CHECKING:
 
 DEFAULT_RESERVED_SMS = 16
 PRECISIONS = ("auto", "bf16", "mxfp8", "fp8", "fp8_bwd")
+MODES = ("auto", "fused", "dispatch")
 FORWARD_OP = "mono_ep::persistent_forward"
 BACKWARD_OP = "mono_ep::persistent_backward"
+DISPATCH_OP = "mono_ep::peer_dispatch"
+COMBINE_OP = "mono_ep::peer_combine"
+DISPATCH_BACKWARD_OP = "mono_ep::peer_dispatch_backward"
+COMBINE_BACKWARD_OP = "mono_ep::peer_combine_backward"
 HIDDEN_MULTIPLE = 256
 INTERMEDIATE_MULTIPLE = 128
 
@@ -83,6 +88,25 @@ def unsupported_reason(
     return None
 
 
+def dispatch_unsupported_reason(
+    *, capability: tuple[int, int], single_host: bool = True
+) -> str | None:
+    """Why the peer dispatch/combine ops cannot run here, or ``None``.
+
+    They need torch symmetric memory (peer access inside one node) and the Triton
+    gather/scatter kernels; the local experts kernel decides everything else.
+    """
+    major, minor = capability
+    if major < 8:
+        return (
+            f"compute capability sm_{major}{minor} is unsupported; peer dispatch needs "
+            "SM80 or newer"
+        )
+    if not single_host:
+        return "the expert-parallel group spans more than one host; symmetric memory is node-local"
+    return None
+
+
 def _max_ctas(reserved_sms: int, dp_replicate: int) -> int:
     # HSDP adds a second concurrent collective stream (replicate all-reduce).
     return max(1, reserved_sms // (3 if dp_replicate > 1 else 2))
@@ -131,6 +155,91 @@ def _single_host(group) -> bool:
     hosts: list[str | None] = [None] * dist.get_world_size(group)
     dist.all_gather_object(hosts, socket.gethostname(), group=group)
     return len(set(hosts)) == 1
+
+
+class MonoEPDispatchRuntime:
+    """Peer-memory dispatch and combine around a caller-supplied local experts kernel.
+
+    Wraps :class:`mono_ep.peer_dispatch.PeerDispatch`: ``dispatch`` and ``combine`` go
+    through the ``mono_ep::peer_dispatch`` / ``peer_combine`` custom ops (with their own
+    backward ops), move only routed rows over NVLink symmetric memory and return the
+    DeepEP row layout (``world * max_tokens_per_rank`` rows, local expert ids with
+    ``-1`` for remote slots, zero weights there). Build one per process and share it
+    across layers; no DeepGEMM, SM reservation or ``NCCL_MAX_CTAS`` is involved.
+    """
+
+    dispatch_op = DISPATCH_OP
+    combine_op = COMBINE_OP
+    dispatch_backward_op = DISPATCH_BACKWARD_OP
+    combine_backward_op = COMBINE_BACKWARD_OP
+
+    def __init__(self, *, group, max_tokens_per_rank: int, top_k: int, hidden: int):
+        from .peer_dispatch import PeerDispatch
+
+        reason = dispatch_unsupported_reason(
+            capability=torch.cuda.get_device_capability(),
+            single_host=_single_host(group),
+        )
+        if reason is not None:
+            raise ValueError(f"mono_ep: {reason}")
+        self._dispatch: PeerDispatch | None = PeerDispatch(
+            capacity=max_tokens_per_rank, top_k=top_k, hidden=hidden, group=group
+        )
+        self.max_tokens_per_rank = max_tokens_per_rank
+        self.world_size = self._dispatch.world
+        self.receive_rows = self._dispatch.rows
+
+    def _live(self):
+        if self._dispatch is None:
+            raise RuntimeError("mono_ep dispatch runtime used after destroy()")
+        return self._dispatch
+
+    def dispatch(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_local_experts: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``x`` BF16 ``[T, H]``, ``topk_idx`` int64 global ids ``[T, K]`` (``-1`` =
+        dropped), ``topk_weights`` FP32 ``[T, K]`` -> ``(recv_x, recv_idx, recv_w)`` over
+        ``world * max_tokens_per_rank`` rows."""
+        from .peer_dispatch import peer_dispatch
+
+        return peer_dispatch(
+            x.contiguous(),
+            topk_idx.contiguous(),
+            topk_weights.contiguous(),
+            num_local_experts,
+            self._live().key,
+        )
+
+    def combine(
+        self,
+        local_out: torch.Tensor,
+        recv_idx: torch.Tensor,
+        topk_idx: torch.Tensor,
+        num_local_experts: int,
+    ) -> torch.Tensor:
+        """Sum the per-rank partial rows ``local_out`` (the local kernel's output for
+        ``dispatch``'s rows) onto this rank's ``topk_idx.shape[0]`` source tokens."""
+        from .peer_dispatch import peer_combine
+
+        routed = (recv_idx >= 0).any(dim=-1)
+        return peer_combine(
+            local_out.contiguous(),
+            routed,
+            topk_idx.contiguous(),
+            num_local_experts,
+            self._live().key,
+        )
+
+    def destroy(self) -> None:
+        """Release the symmetric buffers; call only after every graph using them has finished."""
+        if self._dispatch is None:
+            return
+        self._dispatch.destroy()
+        self._dispatch = None
 
 
 class MonoEPRuntime:
