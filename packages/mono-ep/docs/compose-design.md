@@ -382,6 +382,74 @@ the layout is small and the latency is hidden. Before any EP8 use the pull/push 
 bandwidth-shaped kernel (wide per-program row ranges, vectorized 16 B loads, several rows in
 flight) and the compact-rows follow-up; both are in section 4.
 
+### 5.2 Peer-gather microbench: can the GEMM's A gather read the peer directly?
+
+Before giving the dispatch mode a producer hook through SonicMoE, `examples/peer_gather_microbench.py`
+(driver `modal_peer_gather_microbench.py`, 2 GPUs, rank `r` reads rank `1-r`) asks whether
+quack's gathered-A grouped GEMM (SonicMoE's gate_up GEMM, hub snapshot `f5bd36408f`) reads its
+A rows from the peer GPU over NVLink at anything like local speed, with no kernel changes
+("Tier 1"). Same per-rank shape as the EP8 contract: A rows 131072 x H 2048 BF16 (512 MB),
+16 local experts, B [16, 2048, 1536], balanced `cu_seqlens_m`, `A_idx` a random permutation;
+one pinned config per GEMM (the production profile winner: H100 128x256 cluster 2x1 cp.async
+gather; B200 256x512 cluster 2x1 dynamic-persistent, TMA gather4 and the same tiles on the
+cp.async path), 3 warmups + 15 CUDA-event samples with `dist.barrier` + `synchronize` around
+each, medians, max over active ranks. A placements: local; the peer's torch symmetric-memory
+buffer; and a contiguous peer-mapped VA window `[2 * cap, H]` built with the CUDA VMM API
+(`cuMemCreate` + POSIX-fd export over an AF_UNIX socket + `cuMemAddressReserve`/`cuMemMap`
+at consecutive offsets, slice `s` = rank `s`, wrapped as a tensor through a DLPack capsule),
+with indices in the local slice, in the peer slice, or 65536 rows from each. Raw transfers
+alongside: a Triton row copy (int64 view, 16 B vector loads, 8 rows per tile, 4 programs per
+SM), `Tensor.copy_` from the peer view, today's `pack_peer_rows` pull, NCCL `send`/`recv` and
+`all_to_all_single`; one-directional (rank 1 idle) and both directions at once. Nominal
+one-way NVLink per GPU taken as 450 GB/s (H100 SXM) / 900 GB/s (B200). Every peer-A GEMM
+output is bitwise equal to the local-A GEMM on the same data (preact and postact), on both
+GPUs and both SM100 gather paths; the VA window round-trips its own slice and its peer slice
+matches the NCCL copy.
+
+2 x H100 80GB (Modal `ap-hlcd3SdrB8dfX0qDNJ7GjD`, 51 s, 0.03 GPU-h), 512 MB per active rank:
+
+| method | one-way ms / GB/s / of NVLink | both-ways ms / GB/s / of NVLink |
+|---|---|---|
+| `Tensor.copy_` from peer view | 1.36 / 395 / 0.88 | 1.44 / 373 / 0.83 |
+| Triton row copy from peer view | 1.47 / 366 / 0.81 | 1.62 / 331 / 0.74 |
+| `pack_peer_rows` from peer (today's pull) | 1.53 / 351 / 0.78 | 1.69 / 318 / 0.71 |
+| NCCL `send`/`recv` | 1.50 / 358 / 0.80 | 1.59 / 338 / 0.75 |
+| NCCL `all_to_all_single`, 512 MB to peer | | 1.74 / 309 / 0.69 |
+| NCCL `all_to_all_single`, 350 MB per rank (175 MB crossing) | | 0.71 / 258 / 0.57 |
+| same copies from local memory: Triton 0.41 ms, `pack_peer_rows` 0.88 ms | | |
+| gated GEMM, A local (cp.async gather) | 1.20 ms | |
+| gated GEMM, A = peer symmetric buffer | 9.63 ms (+8.43; 64 GB/s, 0.14) | |
+| gated GEMM, A = VA window, local slice | 1.22 ms | |
+| gated GEMM, A = VA window, peer slice | 9.65 ms (+8.44; 64 GB/s, 0.14) | |
+| gated GEMM, A = VA window, half each slice | 4.89 ms (+3.69 for 256 MB; 73 GB/s) | |
+
+2 x B200 (Modal `ap-dhlQOdLeE5WqdpG1NN9FRz`, 33 s, 0.02 GPU-h), 512 MB per active rank:
+
+| method | one-way ms / GB/s / of NVLink | both-ways ms / GB/s / of NVLink |
+|---|---|---|
+| `Tensor.copy_` from peer view | 0.66 / 816 / 0.91 | 0.73 / 731 / 0.81 |
+| Triton row copy from peer view | 0.71 / 760 / 0.84 | 0.82 / 655 / 0.73 |
+| `pack_peer_rows` from peer (today's pull) | 2.24 / 240 / 0.27 | 2.29 / 235 / 0.26 |
+| NCCL `send`/`recv` | 0.81 / 659 / 0.73 | 0.89 / 606 / 0.67 |
+| NCCL `all_to_all_single`, 512 MB to peer | | 1.27 / 421 / 0.47 |
+| NCCL `all_to_all_single`, 350 MB per rank (175 MB crossing) | | 0.58 / 314 / 0.35 |
+| same copies from local memory: Triton 0.19 ms, `pack_peer_rows` 0.80 ms | | |
+| gated GEMM, A local (TMA gather4 / cp.async) | 0.61 / 0.61 ms | |
+| gated GEMM, A = peer symmetric buffer | 2.43 / 2.43 ms (+1.82; 295 GB/s, 0.33) | |
+| gated GEMM, A = VA window, local slice | 0.60 / 0.61 ms | |
+| gated GEMM, A = VA window, peer slice | 2.43 / 2.43 ms (+1.83; 294 GB/s, 0.33) | |
+| gated GEMM, A = VA window, half each slice | 1.25 / 1.25 ms (+0.65 for 256 MB; 415 GB/s) | |
+
+Verdict: an in-mainloop gather from peer memory does not hide the dispatch pull. The peer-A
+GEMM costs 8.4 ms more than the local-A GEMM on H100 against a 1.4-1.5 ms standalone pull
+(the GEMM's four cp.async load warps keep far too little in flight for NVLink latency: 14%
+of the link), and 1.8 ms more on B200 against a 0.7 ms copy (33% of the link; TMA gather4
+on peer-mapped memory works, no descriptor, launch or data error, but is no faster than
+cp.async), so even on B200 a copy plus a local GEMM (1.27 ms) beats the direct read (2.43 ms).
+Plain SM copies reach 88-91% of one-way NVLink and NCCL 73-80%; `pack_peer_rows` reaches 78%
+on H100 but only 27% on B200 at this contiguous EP2 pattern, so the bandwidth-shaped pull of
+section 4 is the fix, and a producer hook through the GEMM is not worth building.
+
 ### 5.3 Transfer microbench at the EP8 pattern on 2 GPUs (2026-11-10)
 
 `examples/peer_stream_microbench.py` (driver `modal_peer_stream_microbench.py`; 2 x H100 80GB
