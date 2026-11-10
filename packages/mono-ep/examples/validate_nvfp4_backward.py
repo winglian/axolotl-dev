@@ -40,10 +40,11 @@ def oracle_grads(x, indices, scores, w1c, w2, dy):
     ``dx, dscore, dW1 (concat order), dW2``."""
     from validate_nvfp4_forward import oracle_fp32
 
-    x32 = x.float().requires_grad_()
-    s32 = scores.float().requires_grad_()
-    w1 = w1c.clone().requires_grad_()
-    w2r = w2.clone().requires_grad_()
+    # detach first: .float() on an fp32 input returns the caller's tensor itself
+    x32 = x.detach().float().requires_grad_()
+    s32 = scores.detach().clone().float().requires_grad_()
+    w1 = w1c.detach().clone().requires_grad_()
+    w2r = w2.detach().clone().requires_grad_()
     y = oracle_fp32(x32, indices, s32, w1, w2r)
     return torch.autograd.grad((y * dy.float()).sum(), (x32, s32, w1, w2r))
 
