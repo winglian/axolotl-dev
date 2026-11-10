@@ -231,10 +231,10 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
         tw1 = prepare_persistent_mxfp8(w1, weights=True, interleave=True)
         tw2 = prepare_persistent_mxfp8(w2, weights=True)
     else:
+        from .weight_cache import weight_layouts
+
         buffer.x[:tokens].copy_(x)
-        tw1, tw2 = deep_gemm.transform_weights_for_mono_ep(
-            w1.bfloat16(), w2.bfloat16()
-        )
+        tw1, tw2 = weight_layouts(w1, w2, "w1_interleaved", "w2")
     buffer.topk_idx[:tokens].copy_(indices)
     buffer.topk_weights[:tokens].copy_(scores)
     y = torch.empty_like(x)

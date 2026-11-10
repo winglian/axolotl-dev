@@ -22,9 +22,7 @@ class NativePersistentBackward:
 
         self.arch = torch.cuda.get_device_capability()[0]
         self.native_name = (
-            "bf16_mono_ep_backward_sm90"
-            if self.arch == 9
-            else "bf16_mono_ep_backward"
+            "bf16_mono_ep_backward_sm90" if self.arch == 9 else "bf16_mono_ep_backward"
         )
         self.blockwise = runtime.compute_dtype == "blockwise"
         transport = os.getenv("MONO_EP_SM90_FP8_TRANSPORT")
@@ -42,9 +40,7 @@ class NativePersistentBackward:
                 raise ValueError("Native blockwise FP8 requires SM90")
             self.native_name = "fp8_mono_ep_backward_sm90"
         if self.arch not in (9, 10) or not hasattr(deep_gemm._C, self.native_name):
-            raise RuntimeError(
-                "Rebuild vendored DeepGEMM with native MonoEP backward"
-            )
+            raise RuntimeError("Rebuild vendored DeepGEMM with native MonoEP backward")
         if (
             runtime.compute_dtype not in ("bf16", "blockwise")
             or runtime.retain_activations
@@ -258,10 +254,11 @@ class NativePersistentBackward:
             interleaved, w2t, w1t = [p[0] for p in prepared]
             scale_args = ([p[1] for p in prepared],)
         else:
-            w1 = w1.bfloat16()
-            w2t = w2.bfloat16().transpose(1, 2).contiguous()
-            w1t = w1.transpose(1, 2).contiguous()
-            interleaved = _interleave_weights(w1)
+            from .weight_cache import weight_layouts
+
+            interleaved, w2t, w1t = weight_layouts(
+                w1, w2, "w1_interleaved", "w2t", "w1t"
+            )
         dx = torch.empty_like(x)
         ds = torch.empty_like(scores, dtype=torch.float32)
         getattr(deep_gemm._C, self.native_name)(
@@ -320,6 +317,15 @@ class NativePersistentBackward:
             )
             dw2 = weight_grad_bf16_gpu_offsets(
                 dy_pool, h_pool, self.starts, ends, expected_k
+            )
+        elif os.getenv("MONO_EP_SM100_DW_DIRECT", "0") == "1":
+            from .ops import weight_grad_bf16_direct
+
+            dw1 = weight_grad_bf16_direct(
+                dz_pool, x_pool, ends, self.counts, self.experts
+            )
+            dw2 = weight_grad_bf16_direct(
+                dy_pool, h_pool, ends, self.counts, self.experts
             )
         else:
             dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)

@@ -37,6 +37,9 @@ template <
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
     bool kOwnMBlocks = true,
+    bool kPhaseTrace = false,
+    uint32_t kDiagAblate = 0,
+    uint32_t kOptions = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -148,8 +151,31 @@ sm100_bf16_mono_ep_backward_impl(void* y,
     constexpr uint32_t kSwizzleCDMode = 128;
     DG_STATIC_ASSERT(BLOCK_N * sizeof(nv_bfloat16) % kSwizzleCDMode == 0, "Invalid block N");
 
+    // Opt-in variants (bitmask): 1 staged 16-byte h/dz pool stores, 2 TMEM release before the
+    // recompute/dh epilogue math, 4 four TMEM accumulator stages, 8 overlapped dispatch x/dy copies
+    // (with kNumBytesPerPull == 2 * hidden bytes, whole x and dy rows travel in one round trip).
+    constexpr bool kStagedPoolStores = kOptions & 1u;
+    constexpr bool kEarlyTmemRelease = kOptions & 2u;
+    constexpr bool kAsyncDispatchCopy = kOptions & 8u;
+    // 16: lookahead pull (needs 8 and whole x/dy rows in the pull buffer): the next row's routing, source index and
+    // weight are resolved while this row's NVLink load is in flight, and the next load is issued before this row is
+    // published. Same rows, pool slots and counts as the default loop.
+    constexpr bool kLookaheadPull = kOptions & 16u;
+    // L2 residency hints: 32 weight (B) tiles loaded EVICT_LAST; 64 h-pool stores (read only by dW after the
+    // kernel) with an L2 evict_first policy (needs 1).
+    constexpr uint64_t kWeightCacheHint = static_cast<uint64_t>((kOptions & 32u) ?
+        cute::TMA::CacheHintSm100::EVICT_LAST : cute::TMA::CacheHintSm100::EVICT_NORMAL);
+    constexpr bool kEvictFirstHStores = kOptions & 64u;
+    // 128: A (dy / x / dz pool) tiles loaded EVICT_FIRST on their last use in the owned M-block (Dh and
+    // RecomputeHigh at the last inner N cluster, Dx at the last output N cluster); 256: dispatch source-row loads
+    // EVICT_NORMAL instead of EVICT_FIRST (each source row is read top-k times).
+    constexpr bool kEvictFirstLastA = kOptions & 128u;
+    constexpr auto kDispatchLoadHint = (kOptions & 256u) ?
+        cute::TMA::CacheHintSm100::EVICT_NORMAL : cute::TMA::CacheHintSm100::EVICT_FIRST;
+    DG_STATIC_ASSERT(not kEvictFirstHStores or kStagedPoolStores, "Evict-first h stores need the staged stores");
+
     // Epilogue configs
-    constexpr uint32_t kNumEpilogueStages = 2;
+    constexpr uint32_t kNumEpilogueStages = (kOptions & 4u) ? 4 : 2;
     constexpr uint32_t kNumTMAStoreStages = 2;
 
     // Shared memory
@@ -194,6 +220,14 @@ sm100_bf16_mono_ep_backward_impl(void* y,
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
+    if constexpr (kNumStages > 2) {
+        DG_STATIC_ASSERT(sizeof(SharedStorage) <= 232448, "Shared storage exceeds the SM100 opt-in capacity");
+        // Deeper opt-in pipelines size shared memory on the host; refuse to run past the allocation.
+        uint32_t dynamic_smem_bytes;
+        asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dynamic_smem_bytes));
+        if (sizeof(SharedStorage) > dynamic_smem_bytes)
+            asm volatile("trap;");
+    }
 
     // Send buffers
     constexpr auto pull_layout = layout::Data(kNumBytesPerPull);
@@ -254,6 +288,50 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
+
+    // Diagnostic per-CTA phase trace (kPhaseTrace only); the pointer rides in the unused saved_z argument.
+    constexpr uint32_t kTraceHeader = 96, kTraceMBlockSlots = 64, kTraceMBlockFields = 8;
+    constexpr uint32_t kTraceCTAStride = kTraceHeader + kTraceMBlockSlots * kTraceMBlockFields;
+    unsigned long long* const phase_trace = kPhaseTrace
+        ? reinterpret_cast<unsigned long long*>(saved_z) + static_cast<uint64_t>(sm_idx) * kTraceCTAStride : nullptr;
+    const auto trace_clock = [&]() -> uint64_t {
+        if constexpr (kPhaseTrace) return clock64(); else return 0;
+    };
+    const auto trace_add = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kPhaseTrace) atomicAdd(phase_trace + slot, static_cast<unsigned long long>(value));
+    };
+    const auto trace_set = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kPhaseTrace) phase_trace[slot] = value;
+    };
+    const auto trace_globaltimer = [&]() -> uint64_t {
+        uint64_t t = 0;
+        if constexpr (kPhaseTrace) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        return t;
+    };
+    if constexpr (kPhaseTrace) {
+        if (thread_idx == 0) {
+            trace_set(0, trace_globaltimer());
+            trace_set(1, trace_clock());
+        }
+    }
+
+    // Diagnostic multi-rank extension (kPhaseTrace with kDiagAblate bit 1024; no ablation): 64 slots per CTA after
+    // all CTA records, globaltimer stamps (comparable across the ranks of one node) and per-peer pull statistics.
+    constexpr bool kDistTrace = kPhaseTrace and (kDiagAblate & 1024u) != 0;
+    DG_STATIC_ASSERT(not kDistTrace or kNumRanks <= 8, "Distributed trace supports at most 8 ranks");
+    constexpr uint32_t kDistTraceStride = 64;
+    unsigned long long* const dist_trace = kDistTrace
+        ? phase_trace + static_cast<uint64_t>(kNumSMs - sm_idx) * kTraceCTAStride + static_cast<uint64_t>(sm_idx) * kDistTraceStride
+        : nullptr;
+    const auto dist_set = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kDistTrace) dist_trace[slot] = value;
+    };
+    const auto dist_add = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kDistTrace) atomicAdd(dist_trace + slot, static_cast<unsigned long long>(value));
+    };
+    const auto dist_max = [&](const uint32_t& slot, const uint64_t& value) {
+        if constexpr (kDistTrace) atomicMax(dist_trace + slot, static_cast<unsigned long long>(value));
+    };
 
     // Task scheduler
     auto scheduler = sched::MonoEPScheduler<
@@ -362,6 +440,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
 
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(0, trace_globaltimer());
+        }
+
         // Write expert count
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
@@ -394,6 +476,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             /* After the NVLink barrier, there is a grid sync */ true
         );
 
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(1, trace_globaltimer());
+        }
+
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
@@ -413,6 +499,165 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         scheduler.fetch_expert_recv_count();
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
+        const uint64_t trace_pull_start = trace_clock();
+        uint64_t trace_ring_wait = 0, trace_copy = 0, trace_rows = 0;
+        if constexpr (kLookaheadPull) {
+            constexpr uint32_t kRowBytes = kHidden * sizeof(nv_bfloat16);
+            DG_STATIC_ASSERT(kAsyncDispatchCopy and kNumBytesPerPull == 2 * kRowBytes,
+                             "The lookahead pull needs whole x and dy rows in one pull buffer");
+            constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
+            struct PullRow {
+                const void* src_x;
+                const void* src_dy;
+                float weight;
+                uint32_t pool_token_idx;
+                uint32_t rank;
+                uint32_t src_token_idx;
+                uint32_t src_topk_idx;
+                bool is_last_token;
+            };
+            const auto resolve = [&](const uint32_t& token_idx, PullRow& row) -> bool {
+                int old_expert_idx = current_expert_idx;
+                while (token_idx >= expert_end_idx) {
+                    if (++ current_expert_idx >= kNumExpertsPerRank)
+                        break;
+                    expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
+                    expert_start_idx = expert_end_idx;
+                    expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
+                }
+                if (current_expert_idx >= kNumExpertsPerRank)
+                    return false;
+                if (old_expert_idx != current_expert_idx) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        const uint32_t j = i * 32 + lane_idx;
+                        stored_rank_count[i] = j < kNumRanks ?
+                            static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
+                    }
+                }
+                uint32_t current_rank_in_expert_idx = 0;
+                uint32_t remaining[kNumRanksPerLane];
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                    remaining[i] = stored_rank_count[i];
+                uint32_t offset = 0;
+                const uint32_t token_idx_in_expert = token_idx - expert_start_idx;
+                uint32_t slot_idx = token_idx_in_expert;
+                uint32_t token_idx_in_rank = 0;
+                while (true) {
+                    uint32_t num_actives_in_lane = 0;
+                    uint32_t min_in_lane = 0xffffffff;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        num_actives_in_lane += remaining[i] > 0;
+                        if (remaining[i] > 0)
+                            min_in_lane = cute::min(min_in_lane, remaining[i]);
+                    }
+                    const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
+                    const uint32_t length = __reduce_min_sync(0xffffffff, min_in_lane);
+                    const uint32_t num_round_tokens = length * num_active_ranks;
+                    if (slot_idx < num_round_tokens) {
+                        const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
+                        uint32_t num_seen_ranks = 0;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                            const uint32_t mask = __ballot_sync(0xffffffff, remaining[i] > 0);
+                            const uint32_t num_active_lanes = __popc(mask);
+                            if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
+                                current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
+                            num_seen_ranks += num_active_lanes;
+                        }
+                        token_idx_in_rank = offset + (slot_idx / num_active_ranks);
+                        break;
+                    }
+                    slot_idx -= num_round_tokens;
+                    offset += length;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                        remaining[i] -= cute::min(remaining[i], length);
+                }
+                const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
+                    current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+                row.src_token_idx = src_token_topk_idx / kNumTopk;
+                row.src_topk_idx = src_token_topk_idx % kNumTopk;
+                row.rank = current_rank_in_expert_idx;
+                row.pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+                row.is_last_token = token_idx == expert_end_idx - 1;
+                row.src_x = sym_buffer.map(
+                    buffer.input_token_buffer.get_data_buffer(row.src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+                row.src_dy = backward.dy.map(
+                    backward.dy.get_base_ptr<__nv_bfloat16*>() + static_cast<uint64_t>(row.src_token_idx) * kHidden,
+                    current_rank_in_expert_idx);
+                // Consumed only at publish, so the remote load overlaps the row copy
+                row.weight = *sym_buffer.map(
+                    buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, current_rank_in_expert_idx);
+                return true;
+            };
+            const auto smem_x = pull_buffer.get_base_ptr();
+            const auto smem_dy = math::advance_ptr(smem_x, kRowBytes);
+            const auto issue = [&](const PullRow& row) {
+                if (not (kDiagAblate & 64u) and cute::elect_one_sync()) {
+                    ptx::tma_load_1d(smem_x, row.src_x, pull_mbarrier, kRowBytes, kDispatchLoadHint);
+                    ptx::tma_load_1d(smem_dy, row.src_dy, pull_mbarrier, kRowBytes, kDispatchLoadHint);
+                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, 2 * kRowBytes);
+                }
+                __syncwarp();
+            };
+            uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
+            PullRow cur, next;
+            bool has_cur = resolve(token_idx, cur);
+            if (has_cur)
+                issue(cur);
+            while (has_cur) {
+                token_idx += kNumGlobalWarps;
+                const bool has_next = resolve(token_idx, next);
+
+                // Ring slot wait for this row only (no other row of this warp is unpublished)
+                const uint32_t pool_block_idx = cur.pool_token_idx / BLOCK_M;
+                const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
+                const uint64_t trace_ring0 = trace_clock();
+                if (l1_empty_count_target > 0) {
+                    const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                }
+                const uint64_t trace_copy0 = trace_clock();
+                trace_ring_wait += trace_copy0 - trace_ring0;
+                ++ trace_rows;
+
+                if (not (kDiagAblate & 64u) and cute::elect_one_sync()) {
+                    ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+                    ptx::tma_store_1d(backward.x_pool + static_cast<uint64_t>(cur.pool_token_idx) * kHidden, smem_x, kRowBytes);
+                    ptx::tma_store_1d(backward.dy_pool + static_cast<uint64_t>(cur.pool_token_idx) * kHidden, smem_dy, kRowBytes);
+                    cute::tma_store_arrive();
+                    cute::tma_store_wait<0>();
+                }
+                __syncwarp();
+                if (has_next)
+                    issue(next);
+
+                if (cute::elect_one_sync()) {
+                    *buffer.l1_topk_weights_buffer.get_data_buffer(cur.pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = cur.weight;
+                    *workspace.get_token_src_metadata_ptr(cur.pool_token_idx) = {cur.rank, cur.src_token_idx, cur.src_topk_idx};
+                    ptx::red_add_rel(
+                        workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
+                        cur.is_last_token ? BLOCK_M - (cur.pool_token_idx % BLOCK_M) : 1u);
+                }
+                __syncwarp();
+                const uint64_t trace_row_copy = trace_clock() - trace_copy0;
+                trace_copy += trace_row_copy;
+                if constexpr (kDistTrace) {
+                    if (lane_idx == 0) {
+                        const uint64_t arrival = trace_globaltimer();
+                        dist_add(8 + cur.rank, 1);
+                        dist_max(16 + cur.rank, ~arrival);
+                        dist_max(24 + cur.rank, arrival);
+                        dist_add(32 + cur.rank, trace_row_copy);
+                    }
+                }
+                cur = next;
+                has_cur = has_next;
+            }
+        } else
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
@@ -502,8 +747,11 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
             // Hidden bytes are divided into chunks
             constexpr uint32_t kHiddenBytes = kHidden * sizeof(nv_bfloat16);
-            constexpr uint32_t kNumChunks = kHiddenBytes / kNumBytesPerPull;
-            DG_STATIC_ASSERT(kHiddenBytes % kNumBytesPerPull == 0, "Invalid hidden");
+            // A pull buffer of two rows (x and dy together, one NVLink round trip per token) needs the overlapped copy
+            DG_STATIC_ASSERT(kNumBytesPerPull <= kHiddenBytes or (kAsyncDispatchCopy and kNumBytesPerPull == 2 * kHiddenBytes),
+                             "Pull buffers larger than a row require the overlapped dispatch copy");
+            constexpr uint32_t kNumChunks = kNumBytesPerPull <= kHiddenBytes ? kHiddenBytes / kNumBytesPerPull : 1;
+            DG_STATIC_ASSERT(kNumBytesPerPull > kHiddenBytes or kHiddenBytes % kNumBytesPerPull == 0, "Invalid hidden");
 
             // TMA load token from remote rank and store into local
             const auto pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
@@ -512,10 +760,14 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             // Wait for ring buffer slot to be available (previous consumer must have finished all N blocks)
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
             const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
+            const uint64_t trace_ring0 = trace_clock();
             if (l1_empty_count_target > 0) {
                 const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
+            const uint64_t trace_copy0 = trace_clock();
+            trace_ring_wait += trace_copy0 - trace_ring0;
+            ++ trace_rows;
 
             const auto src_x = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
@@ -525,7 +777,32 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             const auto weight = *sym_buffer.map(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
-            if (cute::elect_one_sync()) {
+            if constexpr (kAsyncDispatchCopy) {
+                if (not (kDiagAblate & 64u) and cute::elect_one_sync()) {
+                    // Pull x and dy concurrently in half-buffer pieces; only the last piece waits for store completion
+                    constexpr uint32_t kHalfBytes = kNumBytesPerPull / 2;
+                    DG_STATIC_ASSERT(kHalfBytes % 16 == 0 and kHiddenBytes % kHalfBytes == 0, "Invalid pull split");
+                    auto* dst_x = backward.x_pool + static_cast<uint64_t>(pool_token_idx) * kHidden;
+                    auto* dst_dy = backward.dy_pool + static_cast<uint64_t>(pool_token_idx) * kHidden;
+                    const auto smem_lo = pull_buffer.get_base_ptr();
+                    const auto smem_hi = math::advance_ptr(smem_lo, kHalfBytes);
+                    for (uint32_t i = 0; i < kHiddenBytes / kHalfBytes; ++i) {
+                        if (i > 0)
+                            cute::tma_store_wait<0>();
+                        ptx::tma_load_1d(smem_lo, static_cast<const uint8_t*>(src_x) + i * kHalfBytes, pull_mbarrier, kHalfBytes,
+                                         kDispatchLoadHint);
+                        ptx::tma_load_1d(smem_hi, reinterpret_cast<const uint8_t*>(src_dy) + i * kHalfBytes, pull_mbarrier, kHalfBytes,
+                                         kDispatchLoadHint);
+                        ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, 2 * kHalfBytes);
+                        ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+                        ptx::tma_store_1d(math::advance_ptr(dst_x, i * kHalfBytes), smem_lo, kHalfBytes);
+                        ptx::tma_store_1d(math::advance_ptr(dst_dy, i * kHalfBytes), smem_hi, kHalfBytes);
+                        cute::tma_store_arrive();
+                    }
+                    ptx::tma_store_wait<0>();
+                }
+            } else
+            if (not (kDiagAblate & 64u) and cute::elect_one_sync()) {
                 for (uint32_t operand = 0; operand < 2; ++operand) {
                     const void* src = operand == 0 ? src_x : src_dy;
                     auto* dst = (operand == 0 ? backward.x_pool : backward.dy_pool) +
@@ -533,7 +810,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     for (uint32_t i = 0; i < kNumChunks; ++i) {
                         ptx::tma_load_1d(pull_buffer.get_base_ptr(),
                             static_cast<const uint8_t*>(src) + i * kNumBytesPerPull,
-                            pull_mbarrier, kNumBytesPerPull);
+                            pull_mbarrier, kNumBytesPerPull, kDispatchLoadHint);
                         ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kNumBytesPerPull);
                         ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                         ptx::tma_store_1d(math::advance_ptr(dst, i * kNumBytesPerPull),
@@ -544,6 +821,17 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 }
             }
             __syncwarp();
+            const uint64_t trace_row_copy = trace_clock() - trace_copy0;
+            trace_copy += trace_row_copy;
+            if constexpr (kDistTrace) {
+                if (lane_idx == 0) {
+                    const uint64_t arrival = trace_globaltimer();
+                    dist_add(8 + current_rank_in_expert_idx, 1);
+                    dist_max(16 + current_rank_in_expert_idx, ~arrival);
+                    dist_max(24 + current_rank_in_expert_idx, arrival);
+                    dist_add(32 + current_rank_in_expert_idx, trace_row_copy);
+                }
+            }
 
             // Store weights and metadata
             if (cute::elect_one_sync()) {
@@ -564,10 +852,26 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             __syncwarp();
         }
 
+        if constexpr (kPhaseTrace) {
+            if (lane_idx == 0) {
+                const uint64_t trace_pull_end = trace_clock();
+                trace_set(46 + warp_idx * 3, trace_pull_end - trace_pull_start);
+                trace_set(47 + warp_idx * 3, trace_ring_wait);
+                trace_set(48 + warp_idx * 3, trace_copy);
+                trace_add(58, trace_rows);
+                atomicMax(phase_trace + 59, static_cast<unsigned long long>(trace_pull_end));
+                if (warp_idx == 0) trace_set(60, trace_pull_start);
+                dist_max(2, trace_globaltimer());
+            }
+        }
+
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+        if constexpr (kDistTrace) {
+            if (thread_idx == 0) dist_set(3, trace_globaltimer());
+        }
         DG_STATIC_ASSERT(kNumSMs > 1, "Invalid SM count");
         if (sm_idx == 0) {
             // SM 0: clear expert send count and schedule task counters
@@ -638,12 +942,17 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+        if constexpr (kPhaseTrace) {
+            if (thread_idx == 0) trace_set(62, trace_clock());
+            if (thread_idx == 0) dist_set(4, trace_globaltimer());
+        }
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for tokens
         task_info_t task_info;
+        uint64_t trace_l1_spin = 0, trace_l2_spin = 0, trace_a_empty = 0;
         while (scheduler.get_next_task(task_info)) {
             const auto tensor_map_a_ptr = task_info.block_phase == sched::BlockPhase::BackwardDh ? &tensor_map_dy :
                 task_info.block_phase == sched::BlockPhase::BackwardDx ? &tensor_map_l2_acts : &tensor_map_l1_acts;
@@ -654,20 +963,25 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
             const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
 
+            const uint64_t trace_spin0 = trace_clock();
             if (task_info.block_phase != sched::BlockPhase::BackwardDx) {
                 const auto expected = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(workspace.get_l1_full_count_ptr(ring_block_idx)) != expected);
+                trace_l1_spin += trace_clock() - trace_spin0;
             } else {
                 constexpr auto full = L2KBlockDependency::kFullMask;
                 const auto expected = (pool_block_idx / kNumRingBlocks) & 1 ? 0ull : full;
                 while (ptx::ld_acq_gpu(workspace.get_l2_full_mask_ptr(ring_block_idx)) != expected);
+                trace_l2_spin += trace_clock() - trace_spin0;
             }
 
             // Issue TMA
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
 
                 // Wait consumer release
+                const uint64_t trace_empty0 = trace_clock();
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
+                trace_a_empty += trace_clock() - trace_empty0;
 
                 // Compute token offset from ring block index
                 uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -679,8 +993,22 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
                 // TMA copy tokens, then arrive at full barrier
                 if (cute::elect_one_sync()) {
+                    bool last_a_use = false;
+                    if constexpr (kEvictFirstLastA) {
+                        const auto phase = task_info.block_phase;
+                        last_a_use = phase == sched::BlockPhase::BackwardDx ?
+                            task_info.n_cluster_idx == L2_SHAPE_N / (BLOCK_N * 2) - 1 :
+                            (phase == sched::BlockPhase::BackwardDh or phase == sched::BlockPhase::BackwardRecomputeHigh) and
+                            task_info.n_cluster_idx == kIntermediateHidden / (BLOCK_N * 2) - 1;
+                    }
+                    if (last_a_use) {
+                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, false,
+                                  static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_FIRST)>(
+                            tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                    } else {
                     tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
                         tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                    }
                     if (is_leader_cta) {
                         // Multicast
                         shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_a[0]) * 2);
@@ -689,6 +1017,13 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     }
                 }
                 __syncwarp();
+            }
+        }
+        if constexpr (kPhaseTrace) {
+            if (lane_idx == 0) {
+                trace_set(43, trace_l1_spin);
+                trace_set(44, trace_l2_spin);
+                trace_set(45, trace_a_empty);
             }
         }
     } else if (warp_idx == kNumDispatchWarps + 1) {
@@ -717,7 +1052,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
                 // TMA copy weights
                 if (cute::elect_one_sync()) {
-                    tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
+                    tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4, kWeightCacheHint>(
                         tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
                     if (is_leader_cta) {
                         shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_b[0]) * 2);
@@ -753,7 +1088,14 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             // Persistently schedule over blocks
             uint32_t current_iter_idx = 0;
             task_info_t task_info;
+            uint64_t trace_mma_prev = trace_clock();
+            if constexpr (kPhaseTrace) {
+                if (lane_idx == 0) trace_set(32, trace_mma_prev);
+                if (lane_idx == 0) dist_set(48, trace_globaltimer());
+            }
             while (scheduler.get_next_task(task_info)) {
+                const uint64_t trace_mma_task = trace_clock();
+                uint64_t trace_mma_full = 0;
                 const auto num_k_blocks = task_info.shape_k / BLOCK_K;
                 // Dynamic update of UMMA N based on effective M
                 mma::sm100::update_instr_desc_with_umma_n(instr_desc, task_info.get_umma_aligned_valid_m());
@@ -763,6 +1105,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
                 shared_storage.tmem_empty_barriers[accum_stage_idx].wait(accum_phase ^ 1);
                 ptx::tcgen05_after_thread_sync();
+                const uint64_t trace_mma_empty_done = trace_clock();
 
                 // Empty barrier arrival
                 auto empty_barrier_arrive = [&](const bool& do_tmem_full_arrive) {
@@ -782,8 +1125,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 #pragma unroll 2
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     // Wait TMA load completion
+                    const uint64_t trace_full0 = trace_clock();
                     shared_storage.full_barriers[stage_idx].wait(phase);
                     ptx::tcgen05_after_thread_sync();
+                    trace_mma_full += trace_clock() - trace_full0;
 
                     const uint32_t a_desc_base_lo = a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16;
                     const uint32_t b_desc_base_lo = b_desc_lo + stage_idx * sizeof(SharedStorage::smem_b[0]) / 16;
@@ -810,6 +1155,25 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     // No explicit `tcgen05.fence::before_thread_sync` is needed, as this is implicitly performed by `tcgen05.commit`
                     empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
                 }
+                if constexpr (kPhaseTrace) {
+                    const uint64_t trace_mma_end = trace_clock();
+                    if (lane_idx == 0) {
+                        const uint32_t phase_idx = task_info.block_phase == sched::BlockPhase::BackwardDh ? 0u :
+                            task_info.block_phase == sched::BlockPhase::BackwardRecomputeLow ? 1u :
+                            task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh ? 2u : 3u;
+                        trace_add(30, trace_mma_empty_done - trace_mma_task);
+                        trace_add(31, trace_mma_full);
+                        trace_add(34 + phase_idx, trace_mma_end - trace_mma_empty_done);
+                        trace_add(38 + phase_idx, trace_mma_empty_done - trace_mma_task);
+                        trace_add(42, trace_mma_task - trace_mma_prev);
+                        trace_add(64 + phase_idx, num_k_blocks);
+                    }
+                    trace_mma_prev = trace_mma_end;
+                }
+            }
+            if constexpr (kPhaseTrace) {
+                if (lane_idx == 0) trace_set(33, trace_clock());
+                if (lane_idx == 0) dist_set(49, trace_globaltimer());
             }
 
             // To safely deconstruct barriers, we need another round of waits
@@ -866,12 +1230,22 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
         task_info_t task_info;
+        const bool trace_leader = epilogue_thread_idx == 0;
+        uint32_t trace_mblock = 0;
+        uint64_t trace_prev_end = trace_clock();
+        if constexpr (kPhaseTrace) {
+            if (trace_leader) trace_set(4, trace_prev_end);
+            if (trace_leader) dist_set(40, trace_globaltimer());
+        }
         while (scheduler.get_next_task(task_info)) {
+            const uint64_t trace_task = trace_clock();
             // Wait UMMA arrival
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
             shared_storage.tmem_full_barriers[accum_stage_idx].wait(accum_phase);
             ptx::tcgen05_after_thread_sync();
+            const uint64_t trace_got = trace_clock();
+            uint64_t trace_spin = 0, trace_atoms = 0, trace_tail = 0, trace_dscore_partial = 0, trace_dx_tail = 0;
 
             // Now we can release the task
             scheduler.release_task_info();
@@ -895,16 +1269,20 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     for (uint32_t row = epilogue_thread_idx; row < BLOCK_M; row += kNumEpilogueThreads)
                         shared_storage.dscore[row] = 0;
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    trace_spin = trace_clock() - trace_got;
                 }
-                for (uint32_t atom = 0; atom < WG_BLOCK_M / ATOM_M; ++atom) {
+                const uint64_t trace_atom0 = trace_clock();
+                constexpr uint32_t kNumAtoms = WG_BLOCK_M / ATOM_M;
+                constexpr uint32_t kStageRows = 2 * ATOM_M, kStageStride = 64 + 8;
+                DG_STATIC_ASSERT(not kStagedPoolStores or
+                                 3 * kStageRows * kStageStride * sizeof(nv_bfloat16) <= sizeof(shared_storage.smem_d.l1[0]),
+                                 "h/dz staging does not fit the L1 output staging buffer");
+                DG_STATIC_ASSERT(kNumAtoms % 2 == 0, "Staged pool stores pair atoms");
+                const auto process_atom = [&](const uint32_t& atom, const uint32_t (&values)[8]) {
                     const auto atom_row = epilogue_wg_idx * WG_BLOCK_M + atom * ATOM_M;
-                    const auto tmem_addr = accum_stage_idx * UMMA_N + atom_row;
-                    uint32_t values[8];
-                    cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr, values[0], values[1], values[2], values[3]);
-                    cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000, values[4], values[5], values[6], values[7]);
-                    cutlass::arch::fence_view_async_tmem_load();
                     if (is_dh) {
-                        shared_storage.backward_epilogue.retain_dh_atom(values, atom_row, warp_idx_in_wg, lane_idx, valid_m);
+                        if constexpr (not (kDiagAblate & 1u))
+                            shared_storage.backward_epilogue.retain_dh_atom(values, atom_row, warp_idx_in_wg, lane_idx, valid_m);
                     } else {
                         const auto row = atom_row + (lane_idx % 4) * 2;
                         const auto half = task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh ? 1u : 0u;
@@ -912,8 +1290,74 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                         const float2 scores = {
                             row < valid_m ? score_ptr[ring_m_idx + row] : 0.0f,
                             row + 1 < valid_m ? score_ptr[ring_m_idx + row + 1] : 0.0f};
-                        const auto result = shared_storage.backward_epilogue.recompute_atom(
-                            values, atom_row, warp_idx_in_wg, lane_idx, half, scores);
+                        epilogue::MoEBackwardAtom result;
+                        if constexpr (kDiagAblate & 8u) {
+                            #pragma unroll
+                            for (uint32_t col = 0; col < 2; ++col) {
+                                result.h[col] = __floats2bfloat162_rn(__uint_as_float(values[col * 4]), __uint_as_float(values[col * 4 + 1]));
+                                result.gate[col] = __floats2bfloat162_rn(__uint_as_float(values[col * 4 + 2]), __uint_as_float(values[col * 4 + 3]));
+                                result.up[col] = result.h[col];
+                            }
+                            result.dscore = {__uint_as_float(values[0]), __uint_as_float(values[4])};
+                        } else {
+                            result = shared_storage.backward_epilogue.recompute_atom(
+                                values, atom_row, warp_idx_in_wg, lane_idx, half, scores);
+                        }
+                        if constexpr (kDiagAblate & 2u) {
+                            // Keep the derivative math live without storing it.
+                            uint32_t sink = 0;
+                            #pragma unroll
+                            for (uint32_t col = 0; col < 2; ++col) {
+                                sink ^= *reinterpret_cast<const uint32_t*>(&result.h[col]);
+                                sink ^= *reinterpret_cast<const uint32_t*>(&result.gate[col]);
+                                sink ^= *reinterpret_cast<const uint32_t*>(&result.up[col]);
+                            }
+                            if (sink == 0x7fc17fc1u and valid_m == 0xffffffffu)
+                                *static_cast<uint32_t*>(y) = sink;
+                        } else {
+                        if constexpr (kStagedPoolStores) {
+                            // Stage the WG's 64 h/dg/du columns of this atom in shared memory, then write two atoms
+                            // (16 full rows) at a time with 16-byte stores.
+                            const auto stage = reinterpret_cast<nv_bfloat16*>(shared_storage.smem_d.l1[epilogue_wg_idx]);
+                            #pragma unroll
+                            for (uint32_t col = 0; col < 2; ++col) {
+                                const auto c = warp_idx_in_wg * 16 + lane_idx / 4 + col * 8;
+                                #pragma unroll
+                                for (uint32_t v = 0; v < 2; ++v) {
+                                    const auto r = (atom % 2) * ATOM_M + (lane_idx % 4) * 2 + v;
+                                    const bool valid = row + v < valid_m;
+                                    const auto zero = __float2bfloat16_rn(0.0f);
+                                    stage[(0 * kStageRows + r) * kStageStride + c] = valid ? (v ? result.h[col].y : result.h[col].x) : zero;
+                                    stage[(1 * kStageRows + r) * kStageStride + c] = valid ? (v ? result.gate[col].y : result.gate[col].x) : zero;
+                                    stage[(2 * kStageRows + r) * kStageStride + c] = valid ? (v ? result.up[col].y : result.up[col].x) : zero;
+                                }
+                            }
+                            if (atom % 2 == 1) {
+                                ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                                const uint32_t t = warp_idx_in_wg * 32 + lane_idx;
+                                const uint32_t r = t / 8, chunk = t % 8;
+                                const auto packed = static_cast<uint64_t>(pool_m_idx + epilogue_wg_idx * WG_BLOCK_M + (atom - 1) * ATOM_M + r);
+                                const auto n = n_block_idx * 64 + chunk * 8;
+                                #pragma unroll
+                                for (uint32_t o = 0; o < 3; ++o) {
+                                    const auto value = ptx::ld_shared(reinterpret_cast<float4*>(stage + (o * kStageRows + r) * kStageStride + chunk * 8));
+                                    auto* dst = o == 0 ? backward.h_pool + packed * kIntermediateHidden + n :
+                                        backward.dz_pool + packed * (2 * kIntermediateHidden) + (o - 1) * kIntermediateHidden + n;
+                                    if constexpr (kEvictFirstHStores) {
+                                        if (o == 0) {
+                                            asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" ::
+                                                "l"(dst), "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w),
+                                                "l"(static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_FIRST)) : "memory");
+                                        } else {
+                                            *reinterpret_cast<float4*>(dst) = value;
+                                        }
+                                    } else {
+                                        *reinterpret_cast<float4*>(dst) = value;
+                                    }
+                                }
+                                ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                            }
+                        } else {
                         for (uint32_t col = 0; col < 2; ++col) {
                             const auto n = n_block_idx * 64 + warp_idx_in_wg * 16 + lane_idx / 4 + col * 8;
                             const auto h = __bfloat1622float2(result.h[col]);
@@ -927,6 +1371,9 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                                 backward.dz_pool[packed * (2 * kIntermediateHidden) + kIntermediateHidden + n] = __float2bfloat16_rn(valid ? (v ? du.y : du.x) : 0.0f);
                             }
                         }
+                        }
+                        }
+                        if constexpr (not (kDiagAblate & 4u)) {
                         auto ds = result.dscore;
                         for (uint32_t delta = 4; delta <= 16; delta *= 2) {
                             ds.x += __shfl_xor_sync(0xffffffff, ds.x, delta);
@@ -936,10 +1383,40 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                             if (row < valid_m) atomicAdd(shared_storage.dscore + row, ds.x);
                             if (row + 1 < valid_m) atomicAdd(shared_storage.dscore + row + 1, ds.y);
                         }
+                        }
+                    }
+                };
+                if constexpr (kEarlyTmemRelease) {
+                    // Drain the whole accumulator into registers so the MMA warp can reuse the stage during the math
+                    uint32_t atom_values[kNumAtoms][8];
+                    #pragma unroll
+                    for (uint32_t atom = 0; atom < kNumAtoms; ++atom) {
+                        const auto tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + atom * ATOM_M;
+                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr, atom_values[atom][0], atom_values[atom][1], atom_values[atom][2], atom_values[atom][3]);
+                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000, atom_values[atom][4], atom_values[atom][5], atom_values[atom][6], atom_values[atom][7]);
+                    }
+                    cutlass::arch::fence_view_async_tmem_load();
+                    ptx::tcgen05_before_thread_sync();
+                    shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                    #pragma unroll
+                    for (uint32_t atom = 0; atom < kNumAtoms; ++atom)
+                        process_atom(atom, atom_values[atom]);
+                } else {
+                    for (uint32_t atom = 0; atom < kNumAtoms; ++atom) {
+                        const auto tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + atom * ATOM_M;
+                        uint32_t values[8];
+                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr, values[0], values[1], values[2], values[3]);
+                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000, values[4], values[5], values[6], values[7]);
+                        cutlass::arch::fence_view_async_tmem_load();
+                        process_atom(atom, values);
                     }
                 }
-                ptx::tcgen05_before_thread_sync();
-                shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                const uint64_t trace_atom1 = trace_clock();
+                trace_atoms = trace_atom1 - trace_atom0;
+                if constexpr (not kEarlyTmemRelease) {
+                    ptx::tcgen05_before_thread_sync();
+                    shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                }
                 __threadfence();
                 asm volatile("fence.proxy.async.global;" ::: "memory");
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -950,6 +1427,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     }
                     if (task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
                         task_info.n_cluster_idx + 1 == kIntermediateHidden / (2 * BLOCK_N)) {
+                        trace_dscore_partial = trace_clock();
                         for (uint32_t row = epilogue_thread_idx; row < valid_m; row += kNumEpilogueThreads) {
                             const auto src = *workspace.get_token_src_metadata_ptr(pool_m_idx + row);
                             const auto& [rank, token, slot] = src;
@@ -957,8 +1435,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                             dst[(static_cast<uint64_t>(token) * kNumTopk + slot) * 2 + (is_leader_cta ? 0u : 1u)] = shared_storage.dscore[row];
                         }
                         __threadfence_system();
+                        trace_dscore_partial = trace_clock() - trace_dscore_partial;
                     }
                 }
+                trace_tail = trace_clock() - trace_atom1;
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
                 if (not task_info.is_shared()) {
@@ -972,6 +1452,11 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
                 constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;
 
+                const uint64_t trace_dx0 = trace_clock();
+                if constexpr (kDiagAblate & 16u) {
+                    ptx::tcgen05_before_thread_sync();
+                    shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                } else {
                 // L2 BF16 epilogue: write GEMM output to remote combine buffer via NVLink
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
@@ -1072,8 +1557,61 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     }
                 }
 
+                }
+                const uint64_t trace_dx1 = trace_clock();
+                trace_atoms = trace_dx1 - trace_dx0;
+
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                trace_dx_tail = trace_clock() - trace_dx1;
+            }
+            if constexpr (kPhaseTrace) {
+                const uint64_t trace_end = trace_clock();
+                if (trace_leader) {
+                    const bool trace_is_dh = task_info.block_phase == sched::BlockPhase::BackwardDh;
+                    const bool trace_is_dx = task_info.block_phase == sched::BlockPhase::BackwardDx;
+                    const uint32_t phase_idx = trace_is_dh ? 0u :
+                        task_info.block_phase == sched::BlockPhase::BackwardRecomputeLow ? 1u :
+                        task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh ? 2u : 3u;
+                    const uint64_t busy = trace_end - trace_got, wait = trace_got - trace_task;
+                    trace_add(6, wait);
+                    trace_add(7 + phase_idx, busy);
+                    trace_add(11 + phase_idx, wait);
+                    trace_add(15, trace_spin);
+                    if (trace_is_dh) trace_add(16, trace_atoms);
+                    else if (not trace_is_dx) trace_add(17, trace_atoms);
+                    else trace_add(19, trace_atoms);
+                    trace_add(18, trace_tail);
+                    trace_add(20, trace_dx_tail);
+                    trace_add(23, 1);
+                    trace_add(25, trace_dscore_partial);
+                    trace_add(26, trace_task - trace_prev_end);
+                    if (trace_is_dh and task_info.n_cluster_idx == 0) {
+                        ++ trace_mblock;
+                        if (trace_mblock <= kTraceMBlockSlots) {
+                            const uint32_t base = kTraceHeader + (trace_mblock - 1) * kTraceMBlockFields;
+                            trace_set(base + 0, pool_block_idx + 1);
+                            trace_set(base + 1, trace_task);
+                            trace_set(base + 5, trace_spin);
+                        }
+                    }
+                    if (trace_mblock >= 1 and trace_mblock <= kTraceMBlockSlots) {
+                        const uint32_t base = kTraceHeader + (trace_mblock - 1) * kTraceMBlockFields;
+                        trace_set(base + 2, trace_end);
+                        trace_add(base + 3, busy);
+                        trace_add(base + 4, wait);
+                        if (not trace_is_dh and not trace_is_dx) trace_add(base + 6, trace_atoms);
+                        if (trace_is_dx) trace_add(base + 7, trace_atoms);
+                    }
+                }
+                trace_prev_end = trace_end;
+            }
+        }
+        if constexpr (kPhaseTrace) {
+            if (trace_leader) {
+                trace_set(5, trace_clock());
+                trace_add(24, trace_mblock);
+                dist_set(41, trace_globaltimer());
             }
         }
 
@@ -1135,6 +1673,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
 
+        if constexpr (kDistTrace) {
+            if (epilogue_thread_idx == 0) dist_set(42, trace_globaltimer());
+        }
+
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
@@ -1144,6 +1686,14 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = ptx::get_grid_idx() + 1;
+        const uint64_t trace_combine0 = trace_clock();
+        if constexpr (kPhaseTrace) {
+            if (trace_leader) trace_set(21, trace_combine0);
+            if (trace_leader) dist_set(43, trace_globaltimer());
+        }
+        [[maybe_unused]] uint64_t dist_ready_wait = 0, dist_first_ready_wait = 0, dist_tokens = 0;
+        [[maybe_unused]] bool dist_first_token = true;
+        if constexpr (not (kDiagAblate & 32u))
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
@@ -1158,8 +1708,16 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+            [[maybe_unused]] const uint64_t dist_wait0 = trace_clock();
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            if constexpr (kDistTrace) {
+                const uint64_t waited = trace_clock() - dist_wait0;
+                dist_ready_wait += waited;
+                if (dist_first_token) dist_first_ready_wait = waited;
+                dist_first_token = false;
+                ++ dist_tokens;
+            }
 
             if (chunk_idx == 0 and lane_idx < kNumTopk) {
                 const auto offset = static_cast<uint64_t>(token_idx) * kNumTopk + lane_idx;
@@ -1245,6 +1803,21 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 cute::tma_store_arrive();
             }
             __syncwarp();
+        }
+        if constexpr (kDistTrace) {
+            if (lane_idx == 0) {
+                dist_add(44, dist_ready_wait);
+                dist_add(47, dist_tokens);
+                dist_max(46, dist_first_ready_wait);
+            }
+            if (trace_leader) dist_set(45, dist_first_ready_wait);
+        }
+        if constexpr (kPhaseTrace) {
+            if (trace_leader) {
+                trace_set(22, trace_clock());
+                trace_set(2, trace_globaltimer());
+                trace_set(3, trace_clock());
+            }
         }
     }
 #else

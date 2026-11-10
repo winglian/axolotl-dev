@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdlib>
 #include <format>
+#include <string>
 #include <torch/python.h>
 
 #include <deep_gemm/layout/mono_ep.cuh>
@@ -93,8 +95,38 @@ static void sm100_bf16_mono_ep(
 
     const auto num_sms = get_num_sms_for_mono_ep();
 
+    // Diagnostic only: a device pointer to a zeroed uint64 phase-trace buffer (carried in the stats argument),
+    // and an epilogue ablation bitmask (outputs become invalid). Unset leaves the default instantiation unchanged.
+    const char* phase_trace_selector = std::getenv("MONO_EP_SM100_FORWARD_PHASE_TRACE");
+    const uint64_t phase_trace_ptr = phase_trace_selector == nullptr ? 0 :
+        std::strtoull(phase_trace_selector, nullptr, 10);
+    const char* ablate_selector = std::getenv("MONO_EP_SM100_FORWARD_DIAG_ABLATE");
+    const uint32_t diag_ablate = ablate_selector == nullptr ? 0 :
+        static_cast<uint32_t>(std::strtoul(ablate_selector, nullptr, 10));
+    // Kernel variants (bitmask): 1 lookahead dispatch pull, the default whenever the pull buffer holds one row;
+    // MONO_EP_SM100_FORWARD_OPTIONS=0 restores the original pull loop.
+    const char* options_selector = std::getenv("MONO_EP_SM100_FORWARD_OPTIONS");
+    const uint32_t forward_options = options_selector == nullptr ? (config.num_bytes_per_pull == hidden * 2 ? 1u : 0u) :
+        static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10));
+    DG_HOST_ASSERT(forward_options < 2);
+    const bool lookahead = forward_options & 1u;
+    DG_HOST_ASSERT(not lookahead or config.num_bytes_per_pull == hidden * 2);
+    const bool diag = phase_trace_ptr != 0 or diag_ablate != 0;
+    const std::string diag_suffix = (diag or lookahead)
+        ? std::format(",\n        false, {}, {}u{}", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
+                      lookahead ? ", true" : "") : std::string();
+    const std::string diag_name = (diag
+        ? std::format("_diag_t{}_a{}", phase_trace_ptr != 0 ? 1 : 0, diag_ablate) : std::string()) +
+        (lookahead ? "_look" : "");
+    if (phase_trace_ptr != 0) {
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats_ptr == nullptr);
+        cumulative_local_expert_recv_stats_ptr = reinterpret_cast<int*>(phase_trace_ptr);
+    }
+
     // Compile
-    const auto kernel = jit->compile("sm100_bf16_mono_ep", std::format(R"(
+    const std::string pull_name = config.num_bytes_per_pull > hidden * 2
+        ? std::format("_pull{}", config.num_bytes_per_pull) : std::string();
+    const auto kernel = jit->compile("sm100_bf16_mono_ep" + diag_name + pull_name, std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_mono_ep.cuh>
 
 using namespace deep_gemm;
@@ -113,7 +145,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}
+        {}{}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -128,7 +160,7 @@ static void __instantiate_kernel() {{
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
         to_string(activation_clamp),
-        fast_math ? "true" : "false"));
+        fast_math ? "true" : "false", diag_suffix));
 
     // Launch
     jit->launch(

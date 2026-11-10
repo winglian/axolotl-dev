@@ -12,8 +12,8 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch.utils.checkpoint import checkpoint
 from mono_ep.runtime import PersistentMoE
+from torch.utils.checkpoint import checkpoint
 
 _COMPACT_FORWARD_ENV = "MONO_EP_SM90_FP8_COMPACT_FORWARD"
 _COMPACT_BACKWARD_ENV = "MONO_EP_SM90_FP8_COMPACT_BACKWARD"
@@ -330,6 +330,14 @@ def run(
         torch.randn(experts // world, hidden, inner, device="cuda") / inner**0.5
     ).requires_grad_()
     dy = torch.randn_like(x)
+    # SMs left free for other streams (the FSDP2 x EP seam needs them for NCCL); 0 keeps every SM
+    reserved_sms = int(os.getenv("MONO_EP_BENCH_RESERVED_SMS", "0"))
+    if reserved_sms:
+        import deep_gemm
+
+        deep_gemm.set_num_sms(
+            torch.cuda.get_device_properties(rank).multi_processor_count - reserved_sms
+        )
     runtime = PersistentMoE(
         dist.group.WORLD,
         experts,
@@ -340,6 +348,7 @@ def run(
         compute_dtype=compute_dtype,
         fuse_activation=compute_dtype == "bf16",
         retain_activations=not recompute,
+        reserved_sms=reserved_sms,
     )
     if peer_backward:
         from mono_ep.peer_backward import PeerBackward
@@ -759,6 +768,7 @@ def run(
                     else "nccl_fixed_capacity",
                     router_in_timing=False,
                     optimizer_in_timing=False,
+                    weight_versions_bumped_before_each_iteration=bump_versions,
                     whole_layer_fullgraph=compiled,
                     triton_cudagraphs_disabled_for_forward_layout_comparison=(
                         compare_forward_layouts

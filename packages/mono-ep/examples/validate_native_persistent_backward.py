@@ -76,12 +76,18 @@ def run():
     starts, counts = [
         torch.zeros(experts // 2, device="cuda", dtype=torch.int32) for _ in range(2)
     ]
+    stages = int(os.environ.get("MONO_EP_SM100_BACKWARD_STAGES", "6"))
+    options = int(os.environ.get("MONO_EP_SM100_BACKWARD_OPTIONS", "11"))
+    pull = int(os.environ.get("MONO_EP_SM100_BACKWARD_PULL_BYTES", "4096"))
     build = Path(tempfile.mkdtemp(prefix="native_backward_"))
     source = (
         Path("/probe/persistent_backward_probe.cu")
         .read_text()
         .replace("@MAX_T@", str(capacity))
         .replace("@RING@", str(buffer.l1_acts.shape[0]))
+        .replace("@STAGES@", str(stages))
+        .replace("@OPTIONS@", str(options))
+        .replace("@PULL@", str(pull))
     )
     (build / "probe.cu").write_text(source)
     (build / "binding.cpp").write_text(
@@ -90,7 +96,7 @@ def run():
         'PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){m.def("launch",&launch);}\n'
     )
     native = load(
-        name="mono_ep_native_backward_probe",
+        name=f"mono_ep_native_backward_probe_s{stages}_o{options}_p{pull}",
         sources=[str(build / "binding.cpp"), str(build / "probe.cu")],
         extra_include_paths=[
             "/probe/native",
@@ -101,6 +107,7 @@ def run():
             "-std=c++20",
             "--expt-relaxed-constexpr",
             "-gencode=arch=compute_100a,code=sm_100a",
+            "-Xcompiler=-Wno-missing-field-initializers",
         ],
         extra_ldflags=["-lcuda"],
         build_directory=str(build),
@@ -228,6 +235,9 @@ def run():
             json.dumps(
                 dict(
                     rank=rank,
+                    stages=stages,
+                    options=options,
+                    pull=pull,
                     skew=skew,
                     tokens=tokens,
                     errors=errors,

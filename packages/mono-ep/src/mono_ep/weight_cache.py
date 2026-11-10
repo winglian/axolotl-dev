@@ -235,6 +235,47 @@ def _compiled(name, w1, w2):
         return _EAGER_BUILDERS[name](w1, w2)
 
 
+_FUSED: dict = {}
+
+
+def _compiled_many(names, w1, w2):
+    """Several missing layouts from one compiled call (one guard check and wrapper call instead of one per layout)."""
+    function = _FUSED.get(names)
+    if function is False:
+        return None
+    if function is None:
+
+        def build(w1, w2):
+            return tuple(
+                _compiled_interleave(w1)
+                if name == "w1_interleaved"
+                else _compiled_transpose(w1 if name == "w1t" else w2)
+                for name in names
+            )
+
+        function = torch.compile(build, dynamic=False)
+        _FUSED[names] = function
+    try:
+        return function(w1, w2)
+    except Exception:  # noqa: BLE001
+        _FUSED[names] = False
+        _STATS["compile_fallbacks"] += 1
+        return None
+
+
+def _build_missing(missing, w1, w2):
+    """Opt-in (``MONO_EP_WEIGHT_CACHE_FUSED=1``): fuse the compiled builds of one call."""
+    fusable = tuple(name for name in missing if name != "w2")
+    if (
+        len(fusable) < 2
+        or os.getenv("MONO_EP_WEIGHT_CACHE_FUSED", "0") != "1"
+        or os.getenv("MONO_EP_WEIGHT_CACHE_COMPILED", "1") != "1"
+    ):
+        return {}
+    built = _compiled_many(fusable, w1, w2)
+    return {} if built is None else dict(zip(fusable, built, strict=True))
+
+
 def _build(name, w1, w2):
     if os.getenv("MONO_EP_WEIGHT_CACHE_COMPILED", "1") == "1":
         return _compiled(name, w1, w2)
@@ -262,6 +303,8 @@ def weight_layouts(w1, w2, *names):
     missing = [name for name in names if name not in layouts]
     _STATS["builds" if missing else "hits"] += 1
     _STATS["layouts_built"] += len(set(missing))
+    if missing:
+        layouts.update(_build_missing(tuple(dict.fromkeys(missing)), w1, w2))
     for name in missing:
         if name not in layouts:
             layouts[name] = _BUILDERS[name](w1, w2)

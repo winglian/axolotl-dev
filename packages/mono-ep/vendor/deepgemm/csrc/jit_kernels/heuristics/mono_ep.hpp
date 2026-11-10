@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <format>
 #include <iostream>
 #include <limits>
@@ -250,6 +251,16 @@ static MonoEPConfig get_mono_ep_config(
     while (num_bytes_per_pull > num_max_pull_bytes) {
         DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
         num_bytes_per_pull /= 2;
+    }
+    // Opt-in (BF16 only): a two-row pull buffer per dispatch warp, so two tokens share one NVLink round trip
+    if (mma_kind == MmaKind::BF16) {
+        const char* pull_selector = std::getenv("MONO_EP_SM100_FORWARD_PULL_BYTES");
+        if (pull_selector != nullptr) {
+            const int requested = std::atoi(pull_selector);
+            const int row_bytes = hidden * get_num_mma_elem_bytes(mma_kind);
+            DG_HOST_ASSERT(requested == num_bytes_per_pull or (requested == 2 * row_bytes and num_bytes_per_pull == row_bytes));
+            num_bytes_per_pull = requested;
+        }
     }
 
     // Pipeline

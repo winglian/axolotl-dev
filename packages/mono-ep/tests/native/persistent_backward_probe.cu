@@ -32,14 +32,19 @@ int launch(std::vector<uintptr_t> p, std::vector<int64_t> sym,
     };
     const auto x = acts(p[2], H), gy = acts(p[3], H), dz = acts(p[5], 2 * I);
     const auto w1 = weights(p[6], 2 * I, H), w2t = weights(p[7], I, H), w1t = weights(p[8], H, 2 * I);
-    deep_gemm::layout::MoEBackwardBuffers buffers{
-        deep_gemm::layout::SymBuffer<>(dy, rank), deep_gemm::layout::SymBuffer<>(ds, rank),
-        reinterpret_cast<__nv_bfloat16*>(p[2]), reinterpret_cast<__nv_bfloat16*>(p[3]),
-        reinterpret_cast<__nv_bfloat16*>(p[4]), reinterpret_cast<__nv_bfloat16*>(p[5]),
-        reinterpret_cast<float*>(p[1]), reinterpret_cast<uint32_t*>(p[9]), reinterpret_cast<uint32_t*>(p[10])};
+    deep_gemm::layout::MoEBackwardBuffers buffers{};
+    buffers.dy = deep_gemm::layout::SymBuffer<>(dy, rank);
+    buffers.dscore_partials = deep_gemm::layout::SymBuffer<>(ds, rank);
+    buffers.x_pool = reinterpret_cast<__nv_bfloat16*>(p[2]);
+    buffers.dy_pool = reinterpret_cast<__nv_bfloat16*>(p[3]);
+    buffers.h_pool = reinterpret_cast<__nv_bfloat16*>(p[4]);
+    buffers.dz_pool = reinterpret_cast<__nv_bfloat16*>(p[5]);
+    buffers.dscore = reinterpret_cast<float*>(p[1]);
+    buffers.expert_starts = reinterpret_cast<uint32_t*>(p[9]);
+    buffers.expert_counts = reinterpret_cast<uint32_t*>(p[10]);
     auto kernel = &deep_gemm::sm100_bf16_mono_ep_backward_impl<
         @MAX_T@, H, I, 16, 0, 4, 128, 128, 64, 32,
-        @RING@, 2, 4096, 128, 128, 256, 128, 2>;
+        @RING@, @STAGES@, @PULL@, 128, 128, 256, 128, 2, true, false, 0u, @OPTIONS@u>;
     int device, smem;
     cudaGetDevice(&device);
     cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
