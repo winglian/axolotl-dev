@@ -23,10 +23,19 @@ if modal.is_local():
 
 @app.function(image=image, gpu="H100!:2", cpu=16, memory=65536, timeout=2400)
 def validate(extra):
+    return _validate(extra, 2)
+
+
+@app.function(image=image, gpu="H100!:4", cpu=32, memory=131072, timeout=2400)
+def validate4(extra):
+    return _validate(extra, 4)
+
+
+def _validate(extra, gpus):
     import torch
 
     names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-    if len(names) != 2 or not all("H100" in n for n in names):
+    if len(names) != gpus or not all("H100" in n for n in names):
         return dict(returncode=2, devices=names)
     result = subprocess.run(  # nosec B603 B607
         [
@@ -34,7 +43,7 @@ def validate(extra):
             "-m",
             "torch.distributed.run",
             "--standalone",
-            "--nproc-per-node=2",
+            f"--nproc-per-node={gpus}",
             "/probe/validate.py",
             "--out",
             "/tmp/fsdp2.json",  # nosec B108
@@ -68,8 +77,8 @@ def validate(extra):
 
 
 @app.local_entrypoint()
-def main(out: str, extra_args: str = ""):
-    result = validate.remote(extra_args.split())
+def main(out: str, extra_args: str = "", gpus: int = 2):
+    result = (validate4 if gpus == 4 else validate).remote(extra_args.split())
     result["modal_app_id"] = os.environ.get("MODAL_APP_ID") or app.app_id
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps(result, indent=1))

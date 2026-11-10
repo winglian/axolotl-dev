@@ -7,7 +7,7 @@ Quantizes the token rows (and, for backward, the output-gradient rows) into the 
 buffers with 1x128 power-of-two scales and copies the routing indices and weights into the
 symmetric buffer, which otherwise takes one Triton launch per tensor plus two copy kernels.
 Values and scales are bitwise equal to ``quantize_tokens_into``.
-``MONO_EP_SM90_FP8_FUSED_PREP=1`` selects it (default ``0``).
+On by default; ``MONO_EP_SM90_FP8_FUSED_PREP=0`` restores the per-tensor launches.
 """
 
 import os
@@ -71,7 +71,7 @@ def _prepare(
 
 
 def enabled():
-    value = os.getenv("MONO_EP_SM90_FP8_FUSED_PREP", "0")
+    value = os.getenv("MONO_EP_SM90_FP8_FUSED_PREP", "1")
     if value not in ("0", "1"):
         raise ValueError("MONO_EP_SM90_FP8_FUSED_PREP must be 0 or 1")
     return value == "1"

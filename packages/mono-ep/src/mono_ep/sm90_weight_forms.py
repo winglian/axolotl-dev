@@ -12,8 +12,8 @@ per-call quantizers.
 
 ``MONO_EP_SM90_FP8_WEIGHT_CACHE``:
 
-* ``0`` (default): quantize per call, as before.
-* ``1``: cache the forms per weight version (:mod:`mono_ep.weight_cache`); the first call
+* ``0``: quantize per call, as before.
+* ``1`` (default): cache the forms per weight version (:mod:`mono_ep.weight_cache`); the first call
   of a step builds all five in one launch, the checkpoint recompute and the backward reuse them.
 * ``forms``: cache, but build only the requested forms with the per-form kernels.
 
@@ -253,7 +253,7 @@ def quantize_form(w1, w2, name):
 
 
 def cache_mode():
-    value = os.getenv("MONO_EP_SM90_FP8_WEIGHT_CACHE", "0")
+    value = os.getenv("MONO_EP_SM90_FP8_WEIGHT_CACHE", "1")
     if value not in ("0", "1", "forms"):
         raise ValueError("MONO_EP_SM90_FP8_WEIGHT_CACHE must be 0, 1 or forms")
     return value

@@ -226,7 +226,8 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(not dist_trace or (phase_trace_ptr != 0 and world <= 8));
     // Tail scheduling bits: 1 = per-tile dX claims in the last-wave window, taken by idle CTAs;
     // 2 = partial M blocks claimed last inside that window. 0 keeps the original claim order.
-    const int tail_mode = env_mode("MONO_EP_SM90_FP8_TAIL_SCHEDULE", 0, 3);
+    // Default 1 on 512-thread launches (-0.14 ms balanced checkpointed 2F+B at EP8; slower single-rank).
+    const int tail_mode = env_mode("MONO_EP_SM90_FP8_TAIL_SCHEDULE", compact_non_math ? 0 : 1, 3);
     DG_HOST_ASSERT((tail_mode & 2) == 0 or experts <= 32);
     const auto activation = select_mono_ep_activation(not compact_non_math);
     const bool fast_pair = activation.kind == 1 and activation.limit_bits == 0x7f7fffffu;
@@ -248,9 +249,9 @@ static void fp8_mono_ep_backward_sm90(
     // Issue the next task's k-blocks (same M block) from yield points inside the epilogues:
     // 1 = the measured best site set (dZ quantize after its loads, dX scatter), N > 1 = raw site
     // bitmask of the kernel's yield sites (diagnostic).
-    // Default 1 when the caches are on, without the dispatch-warp pack (spills) or a mainloop mode (exclusive).
-    const int overlap_mode = env_mode("MONO_EP_SM90_FP8_OVERLAP_EPILOGUE",
-        cached and cached_dz and not dispatch_xdy_pack and mainloop_mode == 0 and not compact_non_math ? 1 : 0, 255);
+    // Off by default: 0.13 ms faster single-rank but 0.01-0.14 ms slower checkpointed 2F+B at EP8.
+    // Needs the caches; excludes the dispatch-warp pack (spills) and the mainloop modes.
+    const int overlap_mode = env_mode("MONO_EP_SM90_FP8_OVERLAP_EPILOGUE", 0, 255);
     const int overlap_epilogue = overlap_mode == 1 ? 0x60 : overlap_mode;
     DG_HOST_ASSERT(overlap_epilogue == 0 or (cached and cached_dz));
     DG_HOST_ASSERT(overlap_epilogue == 0 or mainloop_mode == 0);

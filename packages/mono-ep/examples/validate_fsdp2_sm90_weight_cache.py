@@ -20,8 +20,12 @@ param_dtype), ``uncached`` (cache off), ``no_invalidation`` (global hook off, no
 since the data pointer is still in the key) and the validator self-check ``frozen`` (a fixed caller
 epoch and no invalidation, which must be caught serving stale weights).
 
-Each rank's EP group has one rank, so the persistent kernels never wait on peers; reserved SMs
-(``--reserved-sms``, default 16) and NCCL_MAX_CTAS still leave room for the FSDP2 collectives.
+``--ep N`` (default 1) builds a (dp_shard, ep) mesh instead: the layer is sharded over
+dp_shard only, each EP group of N ranks runs the persistent kernels across peers with 16 local
+experts per rank (16 N routed experts), expert weights differ per EP rank and agree across
+dp_shard, and the reference dW is averaged over dp_shard. With ``--ep 1`` each rank's EP group has
+one rank, so the persistent kernels never wait on peers; reserved SMs (``--reserved-sms``,
+default 16) and NCCL_MAX_CTAS still leave room for the FSDP2 collectives.
 """
 
 import argparse
@@ -49,9 +53,10 @@ CASES = (
 
 
 class Layer(nn.Module):
-    def __init__(self, runner):
+    def __init__(self, runner, ep_rank=0):
         super().__init__()
         self.proj = nn.Linear(HIDDEN, HIDDEN, bias=False)
+        torch.manual_seed(4321 + ep_rank)
         self.w1 = nn.Parameter(torch.randn(EXPERTS, 2 * INNER, HIDDEN) / HIDDEN**0.5)
         self.w2 = nn.Parameter(torch.randn(EXPERTS, HIDDEN, INNER) / INNER**0.5)
         self.runner = runner
@@ -73,7 +78,7 @@ def _relative(a, b):
     return float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12))
 
 
-def run_case(case, args, runtime, compiled, device, rank, world):
+def run_case(case, args, runtime, compiled, device, rank, mesh):
     from mono_ep import weight_cache
 
     os.environ["MONO_EP_SM90_FP8_WEIGHT_CACHE"] = (
@@ -89,14 +94,15 @@ def run_case(case, args, runtime, compiled, device, rank, world):
     stats0 = weight_cache.cache_stats()
 
     torch.manual_seed(1234)
-    layer = Layer(compiled).to(device)
+    ep_rank = mesh["ep"].get_local_rank()
+    dp_group, dp_size = mesh["dp_shard"].get_group(), mesh["dp_shard"].size()
+    layer = Layer(compiled, ep_rank).to(device)
     mp = (
         MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         if case == "bf16_params"
         else MixedPrecisionPolicy()
     )
-    mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("dp_shard",))
-    fully_shard(layer, mesh=mesh, mp_policy=mp)
+    fully_shard(layer, mesh=mesh["dp_shard"], mp_policy=mp)
     optimizer = torch.optim.AdamW(layer.parameters(), lr=args.lr, weight_decay=0.0)
     handle = None
     if case == "optimizer_hook":
@@ -116,7 +122,9 @@ def run_case(case, args, runtime, compiled, device, rank, world):
             generator=generator,
         )
         ids = (
-            torch.rand(args.tokens, EXPERTS, device=device, generator=generator)
+            torch.rand(
+                args.tokens, EXPERTS * args.ep, device=device, generator=generator
+            )
             .argsort(-1)[:, :TOPK]
             .contiguous()
         )
@@ -153,8 +161,8 @@ def run_case(case, args, runtime, compiled, device, rank, world):
         grads_ref = []
         for g in (w1_ref.grad, w2_ref.grad):
             g = g.float()
-            dist.all_reduce(g)
-            grads_ref.append(g / world)
+            dist.all_reduce(g, group=dp_group)
+            grads_ref.append(g / dp_size)
         grads = [layer.w1.grad.full_tensor(), layer.w2.grad.full_tensor()]
         record = dict(
             step=step,
@@ -219,6 +227,7 @@ def main():
     parser.add_argument("--cases", default=",".join(CASES))
     parser.add_argument("--out", default="")
     parser.add_argument("--reserved-sms", type=int, default=16)
+    parser.add_argument("--ep", type=int, default=1)
     args = parser.parse_args()
 
     rank = int(os.environ["LOCAL_RANK"])
@@ -235,10 +244,14 @@ def main():
 
     physical = torch.cuda.get_device_properties(device).multi_processor_count
     deep_gemm.set_num_sms(physical - args.reserved_sms)
-    groups = [dist.new_group([r]) for r in range(world)]
+    if world % args.ep:
+        raise ValueError("world must be a multiple of --ep")
+    mesh = init_device_mesh(
+        "cuda", (world // args.ep, args.ep), mesh_dim_names=("dp_shard", "ep")
+    )
     runtime = PersistentMoE(
-        groups[rank],
-        EXPERTS,
+        mesh["ep"].get_group(),
+        EXPERTS * args.ep,
         args.tokens,
         TOPK,
         HIDDEN,
@@ -251,7 +264,7 @@ def main():
     results = []
     for case in args.cases.split(","):
         try:
-            results.append(run_case(case, args, runtime, compiled, device, rank, world))
+            results.append(run_case(case, args, runtime, compiled, device, rank, mesh))
         except Exception:  # noqa: BLE001
             results.append(dict(case=case, passed=False, error=traceback.format_exc()))
     gathered = [None] * world
@@ -261,7 +274,12 @@ def main():
             device=torch.cuda.get_device_name(),
             torch_version=torch.__version__,
             world_size=world,
-            sharding="fully_shard(whole layer) over dp_shard=world, EP world 1 per rank",
+            sharding=f"fully_shard(whole layer) over dp_shard={world // args.ep}, "
+            f"EP world {args.ep} ({EXPERTS} local experts per rank)",
+            mesh_dp_shard_x_ep=[world // args.ep, args.ep],
+            env_defaults_overridden={
+                k: v for k, v in os.environ.items() if k.startswith("MONO_EP_")
+            },
             tokens_per_rank=args.tokens,
             steps=args.steps,
             lr=args.lr,

@@ -113,12 +113,16 @@ def _benchmark(
         timeout=3000,
         check=False,
     )
+    # Echo into the container log so a run is recoverable from `modal app logs` if the runner dies.
+    print(f"ROUTING_RESULT {routing_override} rc={result.returncode}", flush=True)
+    print(result.stdout[-200000:], flush=True)
+    print(result.stderr[-6000:], flush=True)
     return dict(
         returncode=result.returncode, stdout=result.stdout, stderr=result.stderr
     )
 
 
-@app.function(image=image, gpu="H100!:8", cpu=32, memory=131072, timeout=7200)
+@app.function(image=image, gpu="H100!:8", cpu=32, memory=262144, timeout=7200)
 def benchmark_h100(*args, **kwargs):
     return _benchmark(*args, expected_gpu="H100", **kwargs)
 
