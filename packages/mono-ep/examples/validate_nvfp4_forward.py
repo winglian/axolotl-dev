@@ -46,6 +46,7 @@ def _sonicmoe():
     return types.SimpleNamespace(
         requant=vendored.nvfp4_requant,
         triton_requant=vendored.triton_nvfp4_requant,
+        cuda_requant=vendored.cuda_nvfp4_requant,
         quant=importlib.import_module(f"{name}.nvfp4_quant"),
         sf_layout=importlib.import_module(f"{name}.sf_layout"),
         name=name,
@@ -164,7 +165,14 @@ def run_case(name, experts, hidden, inter, topk, tokens, skew, sm, device):
     b1 = torch.randn(2 * inter, RANK * experts, device=device, generator=gen) * 0.02
     a2 = torch.randn(experts * RANK, inter, device=device, generator=gen) / inter**0.5
     b2 = torch.randn(hidden, RANK * experts, device=device, generator=gen) * 0.02
-    r1 = triton_requant.requant_lora_packed(
+    # MONO_EP_NVFP4_REQUANT picks the kernel; the forward forms are the same bytes for cuda and cuda_fused
+    backend = os.environ.get("MONO_EP_NVFP4_REQUANT", "triton")
+    requant_lora_packed = (
+        triton_requant.requant_lora_packed
+        if backend == "triton"
+        else sm.cuda_requant.requant_lora_packed_cuda
+    )
+    r1 = requant_lora_packed(
         q1i,
         s1i,
         pts1,
@@ -173,9 +181,7 @@ def run_case(name, experts, hidden, inter, topk, tokens, skew, sm, device):
         SCALING,
         pts1,
     )
-    r2 = triton_requant.requant_lora_packed(
-        q2, s2, pts2, a2.bfloat16(), b2.bfloat16(), SCALING, pts2
-    )
+    r2 = requant_lora_packed(q2, s2, pts2, a2.bfloat16(), b2.bfloat16(), SCALING, pts2)
     torch.cuda.synchronize()
 
     # Merged weights, dequantized to FP32 (interleaved L1 rows -> concat order for the oracles)
@@ -254,6 +260,7 @@ def run_case(name, experts, hidden, inter, topk, tokens, skew, sm, device):
     ).bfloat16()
     result = dict(
         case=name,
+        requant_backend=backend,
         shape=dict(
             experts=experts,
             hidden=hidden,

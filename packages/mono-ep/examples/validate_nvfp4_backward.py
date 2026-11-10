@@ -224,6 +224,7 @@ def run_case(name, experts, hidden, inter, topk, tokens, skew, device):
     )
     reps = dict(zip(outs, rep, strict=True))
     result = dict(
+        requant_backend=layer.backend,
         case=name,
         shape=dict(
             experts=experts,

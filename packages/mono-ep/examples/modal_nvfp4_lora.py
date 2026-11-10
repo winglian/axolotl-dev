@@ -99,30 +99,39 @@ def _run(script, nproc, extra_env, timeout):
     return dict(returncode=proc.returncode, result=result, tail="".join(lines[-80:]))
 
 
+def _requant_env(requant):
+    """``MONO_EP_NVFP4_REQUANT`` for the remote run (the requant kernel selector)."""
+    return {"MONO_EP_NVFP4_REQUANT": requant} if requant else {}
+
+
 @app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=3600)
-def forward_parity(cases: str = ""):
-    env = {"NVFP4_CASES": cases} if cases else {}
+def forward_parity(cases: str = "", requant: str = ""):
+    env = _requant_env(requant) | ({"NVFP4_CASES": cases} if cases else {})
     return _run("validate_nvfp4_forward.py", 1, env, 3400)
 
 
 @app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=3600)
-def backward_parity(cases: str = ""):
-    env = {"NVFP4_CASES": cases} if cases else {}
+def backward_parity(cases: str = "", requant: str = ""):
+    env = _requant_env(requant) | ({"NVFP4_CASES": cases} if cases else {})
     return _run("validate_nvfp4_backward.py", 1, env, 3400)
 
 
 @app.function(image=image, gpu="B200:4", cpu=16, memory=131072, timeout=3600)
-def fsdp2_training():
-    return _run("validate_nvfp4_fsdp2.py", 4, {"NCCL_MAX_CTAS": "8"}, 3400)
+def fsdp2_training(requant: str = ""):
+    return _run(
+        "validate_nvfp4_fsdp2.py",
+        4,
+        {"NCCL_MAX_CTAS": "8"} | _requant_env(requant),
+        3400,
+    )
 
 
 @app.function(image=image, gpu="B200:8", cpu=32, memory=262144, timeout=7200)
-def timing(cases: str = ""):
+def timing(cases: str = "", requant: str = ""):
     runs = {}
     for case in (cases or "qwen30b,beam").split(","):
-        runs[case] = _run(
-            "benchmark_nvfp4_lora_b200.py", 8, {"NVFP4_BENCH_CASE": case}, 3000
-        )
+        env = {"NVFP4_BENCH_CASE": case} | _requant_env(requant)
+        runs[case] = _run("benchmark_nvfp4_lora_b200.py", 8, env, 3000)
     return dict(
         returncode=max(r["returncode"] for r in runs.values()),
         result={k: r["result"] for k, r in runs.items()},
@@ -131,23 +140,23 @@ def timing(cases: str = ""):
 
 
 @app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=7200)
-def profile(cases: str = ""):
-    env = {"NVFP4_CASES": cases} if cases else {}
+def profile(cases: str = "", requant: str = ""):
+    env = _requant_env(requant) | ({"NVFP4_CASES": cases} if cases else {})
     return _run("profile_nvfp4_lora_b200.py", 1, env, 7000)
 
 
 @app.local_entrypoint()
-def main(job: str = "forward", out: str = "", cases: str = ""):
+def main(job: str = "forward", out: str = "", cases: str = "", requant: str = ""):
     if job == "forward":
-        result = forward_parity.remote(cases)
+        result = forward_parity.remote(cases, requant)
     elif job == "backward":
-        result = backward_parity.remote(cases)
+        result = backward_parity.remote(cases, requant)
     elif job == "fsdp2":
-        result = fsdp2_training.remote()
+        result = fsdp2_training.remote(requant)
     elif job == "timing":
-        result = timing.remote(cases)
+        result = timing.remote(cases, requant)
     elif job == "profile":
-        result = profile.remote(cases)
+        result = profile.remote(cases, requant)
     else:
         raise ValueError(job)
     result["modal_app_id"] = app.app_id

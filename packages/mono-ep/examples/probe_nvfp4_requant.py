@@ -29,12 +29,20 @@ def main():
     b = (torch.randn(E, N, r, device="cuda", generator=gen) * 0.02).bfloat16()
     a_rm = a.reshape(E * r, K)
     b_rm = b.permute(1, 2, 0).reshape(N, r * E).contiguous()
+    qt = torch.randint(
+        0, 256, (E, K, N // 2), device="cuda", dtype=torch.uint8, generator=gen
+    )
+    st = torch.randint(
+        0x30, 0x50, (E, K, N // 16), device="cuda", dtype=torch.uint8, generator=gen
+    )
     which = os.environ.get("PROBE_KERNELS", "triton,cuda,cuda_fused").split(",")
     for _ in range(3):
         if "triton" in which:
             tr.requant_lora_packed(q, s, pts, a_rm, b_rm, 2.0, pts)
         if "cuda" in which:
             cr.requant_natural(q, s, pts, a, b, 2.0, pts)
+        if "cuda_paired" in which:
+            cr.requant_paired(q, s, qt, st, pts, a, b, 2.0, interleave=8)
         if "cuda_fused" in which:
             cr.requant_fused(q, s, pts, a, b, 2.0, interleave=8)
     torch.cuda.synchronize()

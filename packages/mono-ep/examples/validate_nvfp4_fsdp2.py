@@ -298,6 +298,7 @@ def main():
             lr=args.lr,
             reserved_sms=args.reserved_sms,
             nccl_max_ctas=os.environ.get("NCCL_MAX_CTAS"),
+            requant_backend=layer.backend,
         ),
         steps=results,
         passed=all(r["passed"] for r in results),
