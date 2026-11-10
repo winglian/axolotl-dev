@@ -66,7 +66,9 @@ class Fp4CuteMergedExperts(torch.autograd.Function):
         q2 = gmm(post, a2.transpose(1, 2).contiguous(), offs=offs)
         da2 = s * gmm(p2.t(), post, offs=offs).float()
         db2 = s * gmm(dy.t(), q2, offs=offs).float()
-        gate, up = z.float().chunk(2, -1)
+        # The gated engine stores the preact interleaved [g0, u0, g1, u1, ...]
+        zf = z.float()
+        gate, up = zf[:, 0::2], zf[:, 1::2]
         sig = torch.sigmoid(gate)
         dhf = dh.float()
         dz = torch.cat(
