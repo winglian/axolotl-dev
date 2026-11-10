@@ -368,6 +368,7 @@ def main():
     import deep_gemm
     from mono_ep.nvfp4_lora import (
         Nvfp4LoraExperts,
+        Nvfp4PersistentBackward,
         RequantCache,
         nvfp4_lora_moe,
         requant_modules,
@@ -404,8 +405,10 @@ def main():
     q1, s1 = quantize_base(w1, pts1)
     q2, s2 = quantize_base(w2, pts2)
     layer = Nvfp4LoraExperts(q1, s1, pts1, q2, s2, pts2, scaling=SCALING)
-    w1_bf = w1.bfloat16().requires_grad_()
-    w2_bf = w2.bfloat16().requires_grad_()
+    # Opt-in: NVFP4 persistent variants only (no BF16 runtimes, no all-to-all baselines), for memory headroom
+    nvfp4_only = os.environ.get("NVFP4_BENCH_NVFP4_ONLY", "0") != "0"
+    w1_bf = None if nvfp4_only else w1.bfloat16().requires_grad_()
+    w2_bf = None if nvfp4_only else w2.bfloat16().requires_grad_()
     del w1, w2
     a1 = (
         (torch.randn(local, RANK, hidden, device=device, generator=gen) / hidden**0.5)
@@ -428,6 +431,7 @@ def main():
         .requires_grad_()
     )
     adapters = (a1, b1, a2, b2)
+    trainable = [t for t in (w1_bf, w2_bf, *adapters) if t is not None]
 
     runtime_nv = PersistentMoE(
         dist.group.WORLD,
@@ -438,47 +442,73 @@ def main():
         inter,
         compute_dtype="nvfp4_lora",
     )
-    runtime_bf = PersistentMoE(
-        dist.group.WORLD,
-        experts,
-        tokens,
-        topk,
-        hidden,
-        inter,
-        compute_dtype="bf16",
-        fuse_activation=True,
-        backward_backend="native",
-    )
-    # Same BF16 path without the owned-backward ring floor (the forward's ring sizing)
-    os.environ["MONO_EP_BACKWARD_RING_WAVES"] = "0"
-    runtime_bf_ring = PersistentMoE(
-        dist.group.WORLD,
-        experts,
-        tokens,
-        topk,
-        hidden,
-        inter,
-        compute_dtype="bf16",
-        fuse_activation=True,
-        backward_backend="native",
-    )
-    os.environ.pop("MONO_EP_BACKWARD_RING_WAVES")
+    runtime_bf = runtime_bf_ring = a2a = None
     cache = RequantCache()
-    a2a = Fp4CuteA2A(layer, experts, topk, SCALING)
-
     variants = {
         "nvfp4_lora": lambda x, ids, s: nvfp4_lora_moe(
             x, ids, s, *adapters, runtime_nv, layer, cache
         ),
-        "bf16_persistent": lambda x, ids, s: runtime_bf(x, ids, s, w1_bf, w2_bf),
-        "bf16_persistent_ring0": lambda x, ids, s: runtime_bf_ring(
-            x, ids, s, w1_bf, w2_bf
-        ),
-        "fp4_cute_a2a": lambda x, ids, s: a2a(x, ids, s, *adapters),
     }
+    if not nvfp4_only:
+        runtime_bf = PersistentMoE(
+            dist.group.WORLD,
+            experts,
+            tokens,
+            topk,
+            hidden,
+            inter,
+            compute_dtype="bf16",
+            fuse_activation=True,
+            backward_backend="native",
+        )
+        # Same BF16 path without the owned-backward ring floor (the forward's ring sizing)
+        os.environ["MONO_EP_BACKWARD_RING_WAVES"] = "0"
+        runtime_bf_ring = PersistentMoE(
+            dist.group.WORLD,
+            experts,
+            tokens,
+            topk,
+            hidden,
+            inter,
+            compute_dtype="bf16",
+            fuse_activation=True,
+            backward_backend="native",
+        )
+        os.environ.pop("MONO_EP_BACKWARD_RING_WAVES")
+        a2a = Fp4CuteA2A(layer, experts, topk, SCALING)
+        variants["bf16_persistent"] = lambda x, ids, s: runtime_bf(
+            x, ids, s, w1_bf, w2_bf
+        )
+        variants["bf16_persistent_ring0"] = lambda x, ids, s: runtime_bf_ring(
+            x, ids, s, w1_bf, w2_bf
+        )
+        variants["fp4_cute_a2a"] = lambda x, ids, s: a2a(x, ids, s, *adapters)
+    # Opt-in: backward kernel option variants, each on its own runtime built like `nvfp4_lora`'s (options 2051 =
+    # 3 | 2048 with the lean recompute tail, 3 without it). The instances are created after the main runtime, so
+    # comparing them with each other rather than with `nvfp4_lora` keeps construction effects out.
+    extra_runtimes = {}
+    if os.environ.get("NVFP4_BENCH_OPTION_VARIANTS", "0") != "0":
+        for name, options in (
+            ("nvfp4_lora_lean", 3 | 2048),
+            ("nvfp4_lora_default2", 3),
+        ):
+            rt = PersistentMoE(
+                dist.group.WORLD,
+                experts,
+                tokens,
+                topk,
+                hidden,
+                inter,
+                compute_dtype="nvfp4_lora",
+            )
+            rt._nvfp4_backward = Nvfp4PersistentBackward(rt, options=options)
+            extra_runtimes[name] = rt
+            variants[name] = lambda x, ids, s, rt=rt: nvfp4_lora_moe(
+                x, ids, s, *adapters, rt, layer, cache
+            )
     # Only on the image with the cuDNN frontend (Modal job `timing_cudnn`)
     cudnn_a2a = None
-    if importlib.util.find_spec("cudnn") is not None:
+    if not nvfp4_only and importlib.util.find_spec("cudnn") is not None:
         cudnn_a2a = CudnnGroupedA2A(layer, experts, topk, SCALING)
         variants["cudnn_grouped_a2a"] = lambda x, ids, s: cudnn_a2a(
             x, ids, s, *adapters
@@ -527,9 +557,15 @@ def main():
             (f"nvfp4_lora/requant_4_forms[{b}]", lambda b=b: merged_with(b))
             for b in backends[1:]
         ),
-        (
-            "fp4_cute_a2a/requant_2_forms_plus_bf16_dequant",
-            lambda: a2a.rebuild(*adapters),
+        *(
+            [
+                (
+                    "fp4_cute_a2a/requant_2_forms_plus_bf16_dequant",
+                    lambda: a2a.rebuild(*adapters),
+                )
+            ]
+            if a2a is not None
+            else []
         ),
         *(
             [
@@ -552,7 +588,8 @@ def main():
             mean_rank_median_ms=_median([statistics.mean(r) for r in samples]),
         )
     cache.get(layer, adapters)
-    a2a.rebuild(*adapters)
+    if a2a is not None:
+        a2a.rebuild(*adapters)
     agreement = {}
     if cudnn_a2a is not None:
         # Same layer through both all-to-all baselines: y and dx agreement (two NVFP4 quantizers)
@@ -590,7 +627,7 @@ def main():
         for iteration in range(WARMUP + SAMPLES):
             for variant, scope in combos if iteration % 2 == 0 else combos[::-1]:
                 fn = variants[variant]
-                for t in (x, scores, w1_bf, w2_bf, *adapters):
+                for t in (x, scores, *trainable):
                     t.grad = None
                 y = fn(x, ids, scores) if scope == "backward" else None
                 run = _make_run(scope, fn, x, ids, scores, y, dy)
@@ -671,14 +708,22 @@ def main():
             v: m / 2**30 for v, m in zip(variants, mem.tolist(), strict=True)
         },
         timings=results,
+        extra_runtime_creation_order=list(extra_runtimes),
         backward_ring_tokens=dict(
-            nvfp4_lora=runtime_nv._nvfp4_backward.buffer.l1_acts.shape[0],
+            nvfp4_lora=runtime_nv._nvfp4_backward.buffer.l1_acts.shape[0]
+        ),
+    )
+    if runtime_bf is not None:
+        summary["backward_ring_tokens"].update(
             bf16_persistent=runtime_bf._peer_backward.buffer.l1_acts.shape[0],
             bf16_persistent_ring0=runtime_bf_ring._peer_backward.buffer.l1_acts.shape[
                 0
             ],
-        ),
-    )
+        )
+    for name, rt in extra_runtimes.items():
+        summary["backward_ring_tokens"][name] = rt._nvfp4_backward.buffer.l1_acts.shape[
+            0
+        ]
     if rank == 0:
         print("BENCH_JSON " + json.dumps(summary), flush=True)
         out = os.environ.get("NVFP4_OUT")
@@ -687,8 +732,11 @@ def main():
                 json.dump(summary, f, indent=1)
     dist.barrier()
     runtime_nv.close()
-    runtime_bf.close()
-    runtime_bf_ring.close()
+    for rt in extra_runtimes.values():
+        rt.close()
+    if runtime_bf is not None:
+        runtime_bf.close()
+        runtime_bf_ring.close()
     dist.destroy_process_group()
 
 
