@@ -53,7 +53,7 @@ def interleave_perm(n2, device):
     ``16j + 8h + i`` holds gate (h=0) / up (h=1) output column ``8j + i``."""
     from deep_gemm.mega import _interleave_weights
 
-    return _interleave_weights(torch.arange(n2, device=device).view(1, n2)).view(-1)
+    return _interleave_weights(torch.arange(n2, device=device).view(n2, 1)).view(-1)
 
 
 def fake_quant_rows(x, sf_scale, inv_pts):

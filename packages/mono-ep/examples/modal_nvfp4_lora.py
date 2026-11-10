@@ -11,7 +11,8 @@ from pathlib import Path
 import modal
 
 ROOT = Path(__file__).resolve().parents[1]
-AXOLOTL_SRC = ROOT.parents[1] / "src"
+# Resolved only on the client; the remote container imports this file from /root.
+AXOLOTL_SRC = ROOT.parents[1] / "src" if len(ROOT.parents) > 1 else ROOT / "src"
 BASE_IMAGE = os.environ.get(
     "MONO_EP_BASE_IMAGE",
     "axolotlai/axolotl-cloud-uv:main-py3.14-cu130-2.14.1-blackwell",
@@ -24,7 +25,14 @@ image = (
         "apt-get update && apt-get install -y libdw-dev libelf-dev software-properties-common",
         "add-apt-repository -y ppa:ubuntu-toolchain-r/test && apt-get update && apt-get install -y g++-13",
     )
-    .add_local_dir(ROOT / "vendor", "/opt/mono-ep/vendor", copy=True)
+    # The JIT-only kernel headers are overlaid at run time (see `_overlay_headers`), so editing them
+    # does not rebuild the host extension.
+    .add_local_dir(
+        ROOT / "vendor",
+        "/opt/mono-ep/vendor",
+        copy=True,
+        ignore=["deepgemm/deep_gemm/include/deep_gemm/impls/**"],
+    )
     .add_local_file(
         ROOT / "tools/fetch_build_dependencies.py",
         "/opt/mono-ep/tools/fetch_build_dependencies.py",
@@ -40,6 +48,7 @@ image = (
         AXOLOTL_SRC / "axolotl/integrations/kernels/libs/sonicmoe", "/probe/sonicmoe"
     )
     .add_local_dir(ROOT / "examples", "/probe/examples")
+    .add_local_dir(ROOT / "vendor/deepgemm/deep_gemm/include", "/probe/include")
 )
 ENV = {
     "PYTHONPATH": "/probe/src",
@@ -49,7 +58,20 @@ ENV = {
 }
 
 
+def _overlay_headers():
+    import shutil
+
+    import deep_gemm
+
+    shutil.copytree(
+        "/probe/include",
+        Path(deep_gemm.__file__).parent / "include",
+        dirs_exist_ok=True,
+    )
+
+
 def _run(script, nproc, extra_env, timeout):
+    _overlay_headers()
     out = "/tmp/result.json"  # nosec B108
     env = {**os.environ, **ENV, **extra_env, "NVFP4_OUT": out}
     cmd = [
