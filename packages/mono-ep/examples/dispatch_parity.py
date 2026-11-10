@@ -83,6 +83,26 @@ class RoutingStats:
         return (self.counts / self.counts.sum().clamp_min(1)).tolist()
 
 
+def sonicmoe_available():
+    """Register axolotl's LoRA-aware SonicMoE forward (the ``use_sonicmoe`` path) when the
+    hub kernel can load here."""
+    try:
+        from transformers.integrations.sonicmoe import is_sonicmoe_loadable
+
+        from axolotl.integrations.kernels.libs.sonicmoe.experts import (
+            register_sonicmoe_experts,
+        )
+
+        if not is_sonicmoe_loadable():
+            is_sonicmoe_loadable(raise_error=True)
+        register_sonicmoe_experts()
+        return True
+    except Exception as error:  # noqa: BLE001
+        if dist.get_rank() == 0:
+            print(f"sonicmoe unavailable: {error!r}", flush=True)
+        return False
+
+
 def training_checks():
     from mono_ep import DEFAULT_RESERVED_SMS, nccl_env
     from torch.distributed.device_mesh import init_device_mesh
@@ -122,6 +142,8 @@ def training_checks():
     except Exception as error:  # noqa: BLE001
         if dist.get_rank() == 0:
             print(f"scattermoe unavailable: {error!r}", flush=True)
+    if sonicmoe_available():
+        local_kernels.append("sonicmoe")
 
     def layers_of(model):
         base = model.get_base_model() if hasattr(model, "get_base_model") else model
@@ -273,15 +295,16 @@ def training_checks():
                 if dist.get_rank() == 0:
                     print(json.dumps(results[-1]), flush=True)
     sac.clear_registered_saves()
-    timing = layer_timing(ep_group)
+    timing = layer_timing(ep_group, local_kernels)
     if dist.get_rank() == 0:
         print("RESULT " + json.dumps({"parity": results, "timing": timing}), flush=True)
     dist.barrier()
     dist.destroy_process_group()
 
 
-def layer_timing(ep_group):
-    """Forward+backward of one MoE block per backend at a moderate geometry."""
+def layer_timing(ep_group, local_kernels):
+    """Forward+backward of one MoE block per backend and local kernel at a moderate
+    geometry."""
     from mono_ep import MonoEPDispatchRuntime
     from transformers import Qwen3MoeConfig
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
@@ -303,7 +326,6 @@ def layer_timing(ep_group):
     with torch.no_grad():
         block.gate.weight.normal_(std=0.02)
     assert shard_expert_weights(block, ep_group) == 1
-    experts_fn.set_local_implementation("grouped_mm")
     generator = torch.Generator(device="cuda").manual_seed(11 + dist.get_rank())
     x = torch.randn(
         1,
@@ -322,56 +344,64 @@ def layer_timing(ep_group):
     )
     experts_fn.set_mono_ep_runtime(runtime)
     experts_fn.set_mono_ep_mode("dispatch")
-    outputs = {}
-    timings = {}
-    for backend in ("torch", "mono_ep"):
-        experts_fn.set_backend(backend)
-        inp = x.detach().clone().requires_grad_(True)
-
-        def step(inp=inp):
-            inp.grad = None
-            block.zero_grad(set_to_none=True)
-            block(inp).backward(grad)
-
-        for _ in range(5):
-            step()
-        torch.cuda.synchronize()
-        dist.barrier(group=ep_group)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        iterations = 20
-        start.record()
-        for _ in range(iterations):
-            step()
-        end.record()
-        torch.cuda.synchronize()
-        elapsed = torch.tensor(start.elapsed_time(end) / iterations, device="cuda")
-        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX, group=ep_group)
-        timings[backend] = elapsed.item()
-        step()
-        outputs[backend] = (
-            block(inp).detach().float(),
-            inp.grad.detach().float(),
-            block.experts.gate_up_proj.grad.detach().float().clone(),
-        )
-    experts_fn.set_mono_ep_runtime(None)
-    runtime.destroy()
 
     def rel(a, b):
         return ((a - b).norm() / b.norm().clamp_min(1e-8)).item()
 
+    iterations = 20
+    per_kernel = {}
+    for local in local_kernels:
+        experts_fn.set_local_implementation(local)
+        outputs = {}
+        timings = {}
+        for backend in ("torch", "mono_ep"):
+            experts_fn.set_backend(backend)
+            inp = x.detach().clone().requires_grad_(True)
+
+            def step(inp=inp):
+                inp.grad = None
+                block.zero_grad(set_to_none=True)
+                block(inp).backward(grad)
+
+            for _ in range(5):
+                step()
+            torch.cuda.synchronize()
+            dist.barrier(group=ep_group)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iterations):
+                step()
+            end.record()
+            torch.cuda.synchronize()
+            elapsed = torch.tensor(start.elapsed_time(end) / iterations, device="cuda")
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX, group=ep_group)
+            timings[backend] = elapsed.item()
+            step()
+            outputs[backend] = (
+                block(inp).detach().float(),
+                inp.grad.detach().float(),
+                block.experts.gate_up_proj.grad.detach().float().clone(),
+            )
+        per_kernel[local] = {
+            "forward_backward_ms": {
+                "torch_nccl": timings["torch"],
+                "mono_ep_dispatch": timings["mono_ep"],
+            },
+            "relative_l2_vs_torch": {
+                "y": rel(outputs["mono_ep"][0], outputs["torch"][0]),
+                "dx": rel(outputs["mono_ep"][1], outputs["torch"][1]),
+                "dgate_up": rel(outputs["mono_ep"][2], outputs["torch"][2]),
+            },
+        }
+        if dist.get_rank() == 0:
+            print(json.dumps({"timing": local, **per_kernel[local]}), flush=True)
+    experts_fn.set_mono_ep_runtime(None)
+    runtime.destroy()
     return {
-        "geometry": {**BENCH, "local_kernel": "grouped_mm", "dtype": "bf16"},
-        "forward_backward_ms": {
-            "torch_nccl": timings["torch"],
-            "mono_ep_dispatch": timings["mono_ep"],
-        },
-        "relative_l2_vs_torch": {
-            "y": rel(outputs["mono_ep"][0], outputs["torch"][0]),
-            "dx": rel(outputs["mono_ep"][1], outputs["torch"][1]),
-            "dgate_up": rel(outputs["mono_ep"][2], outputs["torch"][2]),
-        },
-        "iterations": 20,
+        "geometry": {**BENCH, "dtype": "bf16"},
+        "iterations": iterations,
+        "local_kernels": per_kernel,
     }
 
 

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Axolotl AI
 
-"""Modal driver for ``dispatch_parity.py``: 2 x H100, EP2 x FSDP2.
+"""Modal driver for ``dispatch_parity.py``: 2 x H100, EP2 x FSDP2, grouped_mm, scattermoe
+and SonicMoE local kernels.
 
 The dispatch mode needs only the package's Triton kernels and torch symmetric memory,
 so the image is the stock Axolotl image plus the checkout's ``src`` trees; no DeepGEMM
@@ -19,6 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 app = modal.App("axolotl-mono-ep-dispatch-parity")
 image = (
     modal.Image.from_registry("axolotlai/axolotl-uv:main-latest")
+    # the SonicMoE hub kernel's CuteDSL build deps (axolotl's blackwell extra pins quack on
+    # top of these; the plain swiglu path needs only the DSL and its FFI)
+    .run_commands(
+        'uv pip install --python "$(command -v python)" '
+        '"nvidia-cutlass-dsl==4.8.0" "apache-tvm-ffi>=0.1.10"'
+    )
     .add_local_dir(ROOT / "src", "/probe/mono_ep_src")
     .add_local_dir(ROOT / "../../src", "/probe/framework")
     .add_local_file(ROOT / "examples/dispatch_parity.py", "/probe/dispatch_parity.py")

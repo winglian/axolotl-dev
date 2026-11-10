@@ -192,8 +192,10 @@ assert).
   (`MonoEPRuntime` or `MonoEPDispatchRuntime`), `_register_checkpoint_saves` adds the dispatch
   op outputs as preferred saves under `expert_parallel_save_dispatch` (mirror of the torch
   all-to-all saves); the router `topk` save is already mandatory.
-- `get_distributed_env` is unchanged (`NCCL_MAX_CTAS` is still exported for `mono_ep`; the mode
-  is only known after the model is built, and the reservation is harmless in dispatch mode).
+- `get_distributed_env` exports `NCCL_MAX_CTAS` only while the fused mode is still possible for
+  the config (`mono_ep` backend, mode not forced to `dispatch`, no adapter, no quantized
+  loading); the model-level fused checks run later, so an `auto` config that ends up in dispatch
+  mode because of its model shape still carries the harmless reservation.
 
 ### 3.5 Compile and sync discipline
 
@@ -201,11 +203,60 @@ No `.item()`/`.tolist()`: shapes are fixed by the runtime, routing math is tenso
 `peer_epoch_barrier`-style syncs happen inside the custom ops. The CPU tests compile `_ep_forward`
 with `fullgraph=True` against a fake runtime to keep the seam itself break-free.
 
+### 3.6 Cost of the fixed layout
+
+The receive side is `world * capacity` rows per layer whatever the routing, with
+`capacity = sequence_len * max(micro_batch_size, eval_batch_size) / context_parallel_size`
+(the fused runtime's rule):
+
+| EP | tokens/rank | receive rows | `recv_x` BF16 at H=2048 | `recv_x` BF16 at H=7168 |
+|----|-------------|--------------|-------------------------|-------------------------|
+| 2  | 4096        | 8192         | 32 MB                   | 112 MB                  |
+| 8  | 16384       | 131072       | 512 MB                  | 1.8 GB                  |
+
+The local kernel sees every row (sentinel rows are zero-compute in grouped_mm, SonicMoE and
+ScatterMoE, but row-count-sized work such as SonicMoE's pow2 padding and the index/weight
+tensors scales with it), and `expert_parallel_save_dispatch: true` holds that `recv_x` per
+layer across the backward. The symmetric buffers themselves are `x [cap, H]`, `y [world*cap,
+H]` and the small `idx`/`w`/`gw` tensors, allocated once per process. Compacting the rows needs
+the host count the design avoids (follow-up below).
+
+`collect()` (combine and dispatch-backward receive) does one masked FP32 pass over the own
+`[world, T, H]` return buffer per producer rank: `world` reads of `T x H` plus the FP32 sum. At
+EP2 this is noise next to the GEMMs; at EP8 it is the first thing to fuse (one Triton pass that
+reads all producer slots of a token once and writes BF16), together with the `torch.stack` of
+the `world` routing views in `collect_routing()`.
+
 ## 4. Follow-ups (not in this change)
 
 - Compact receive rows via an optional host count (trade one sync per layer for a smaller local
   kernel input, like the torch backend).
+- Fuse `collect()` and `collect_routing()` into one Triton pass before EP8 timings (see 3.6).
 - FP8 transport for `recv_x` when the local kernel accepts it.
-- Skip `NCCL_MAX_CTAS` when `dispatch` is forced (no persistent grid to protect).
 - Overlap: issue the gather of layer `l+1` under layer `l`'s local kernel (needs a second buffer
   set).
+
+## 5. Validation (2026-11-09)
+
+- CPU: `packages/mono-ep/tests/test_peer_dispatch.py` (3-rank threaded simulation, autograd
+  parity, receive layout, fullgraph compile, lifecycle) and
+  `tests/integrations/expert_parallel/test_mono_ep_backend.py` / `test_validation.py` (mode
+  resolution, fallback matrix, fake-runtime seam forward incl. fullgraph compile, SAC
+  registration, validation warnings).
+- GPU (`examples/modal_dispatch_parity.py`, Modal app `ap-F77wFpKRWjBAfX9QYF0e9Z`, 2 x H100 strict,
+  EP2 x FSDP2, 2 AdamW steps, balanced + fully skewed routing, full fine-tune + PEFT expert
+  LoRA): gradients and post-step weights of the dispatch mode match the torch backend with the
+  same local kernel bitwise for **grouped_mm, ScatterMoE and SonicMoE** (12 cases,
+  `benchmarks/dispatch_mode_parity_h100.json`). One MoE block, H 2048 / I 1024 / 64 experts /
+  top-8 / 4096 tokens per rank, bf16, forward+backward, max over ranks:
+
+  | local kernel | torch all-to-all | mono_ep dispatch |
+  |--------------|------------------|------------------|
+  | grouped_mm   | 13.09 ms         | 11.99 ms         |
+  | ScatterMoE   | 9.91 ms          | 9.08 ms          |
+  | SonicMoE     | 6.70 ms          | 6.41 ms          |
+
+  Caveat: on this H100 image most quack autotune configs for SonicMoE's GEMMs failed to
+  compile (the py3.14 forkserver / async-compile issue already known from the kernel lanes),
+  so SonicMoE ran on the surviving configs; both backends share the kernel, so the comparison
+  holds but the absolute SonicMoE numbers are pessimistic.
