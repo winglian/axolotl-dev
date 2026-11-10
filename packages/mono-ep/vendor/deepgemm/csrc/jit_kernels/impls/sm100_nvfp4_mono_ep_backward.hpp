@@ -15,8 +15,9 @@
 namespace deep_gemm {
 
 // Kernel variant bitmask for the SM100 NVFP4 persistent backward: 1 staged h/dz pool stores, 2 TMEM release
-// before the recompute/dH math. The dispatch pulls whole x and dy rows with lookahead unless a chunked pull is selected.
-static constexpr uint32_t kDefaultNvfp4BackwardOptions = 3;
+// before the recompute/dH math, 2048 lean recompute tail (one fence per block and CTA instead of per task). The
+// dispatch pulls whole x and dy rows with lookahead unless a chunked pull is selected.
+static constexpr uint32_t kDefaultNvfp4BackwardOptions = 3u | 2048u;
 
 // Persistent NVFP4 LoRA backward: BF16 x/dy rows are pulled, stored to the BF16 pools and quantized into packed
 // FP4 pools (x with the expert's static scale, dy and dz per row); the three GEMM phases run `kind::mxf4nvf4`
@@ -140,8 +141,8 @@ static void nvfp4_mono_ep_backward(
     const char* options_selector = std::getenv("MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS");
     const uint32_t options = options_selector == nullptr ? kDefaultNvfp4BackwardOptions :
         static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10));
-    // Opt-in bit beyond the defaults: 2048 lean recompute tail. This bitmask is the NVFP4 backward's own; it is
-    // separate from the SM100 BF16 backward's options (where 512 is in-kernel dW and 2048 the MXFP8 backward).
+    // This bitmask is the NVFP4 backward's own, separate from the SM100 BF16 backward's options (where 512 is
+    // in-kernel dW and 2048 the MXFP8 backward); `3` restores the pre-2048 default.
     DG_HOST_ASSERT((options & ~(3u | 2048u)) == 0);
     // Exact `SharedStorage` size of the kernel for `n` TMA/UMMA stages (asserted by the kernel at run time)
     const auto exact_smem_for_pull = [&](const int& n, const int& pull) {

@@ -106,7 +106,7 @@ before it was made the default; setting that value restores the previous behavio
 | `MONO_EP_SM100_DW_DIRECT` | `0` | | SM100: direct weight-gradient operands (experiment). |
 | `MONO_EP_BACKWARD_RING_WAVES` | `1` | `0` (the forward's interleaved-schedule ring sizing) | Owned-backward ring floor for the BF16 (SM90, SM100) and blockwise-FP8 (SM90) backwards, in waves of owning clusters: one wave is `num_sms x 128` tokens on SM90 and `num_sms / 2 x 128` on SM100. It only raises the ring, so the Qwen3-30B-A3B shape is unchanged; wide-expert shapes (hidden 5120) gain most. The ring size is a kernel template parameter. |
 | `MONO_EP_NVFP4_BACKWARD_RING_WAVES` | `1` | `0` | The same floor for the SM100 NVFP4 LoRA backward. |
-| `MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS` | `3` | `0` | NVFP4 LoRA backward bits: 1 staged h/dz pool stores, 2 TMEM release before the recompute/dH math. |
+| `MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS` | `2051` | `3` (before the lean tail), `0` | NVFP4 LoRA backward bits: 1 staged h/dz pool stores, 2 TMEM release before the recompute/dH math, 2048 lean recompute tail (Dh and recompute tasks skip the per-task fence; each CTA fences once at its block's last recompute tile). Its own option space: bit 2048 here is not the BF16 backward's MXFP8 bit. |
 | `MONO_EP_SM100_NVFP4_BACKWARD_PULL_BYTES` | whole x and dy rows with lookahead | | Chunked dispatch pull for the NVFP4 backward: four chunks, each a multiple of 128 bytes, at most 4096 and smaller than an x+dy row. |
 | `MONO_EP_SM100_NVFP4_BACKWARD_STAGES` | the most that fit shared memory | | NVFP4 backward TMA/UMMA stages. |
 | `MONO_EP_SM100_NVFP4_OPTIONS` | `1` when the pull buffer holds one row, else `0` | `0` | NVFP4 LoRA forward bits: 1 lookahead dispatch pull. |

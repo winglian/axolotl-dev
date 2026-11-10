@@ -132,6 +132,13 @@ merged tile, which is faster still but changes `w1t` / `w2t` numerics, so it is 
 `nvfp4-lora-design.md` has the design; the requant source is vendored under
 `src/mono_ep/nvfp4_requant/` until the Axolotl copy and this one are reconciled.
 
+The NVFP4 backward's Dh and recompute tasks skip the per-task fence: each CTA fences once at its
+block's last recompute tile and adds all its recompute tiles to the ring's empty count there
+(NVFP4 options bit 2048, the default; `MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS=3` restores the
+per-task fences). This works because the NVFP4 backward always gives a CTA pair whole blocks. A
+cross-M-block pipeline that overlapped one block's Dx with the next block's recompute removed the
+Dx wait but did not shorten the backward, so it was not merged.
+
 ## Dispatch mode and the bounded compact receive
 
 The dispatch mode (`expert_parallel_mono_ep_mode: dispatch`, `MonoEPDispatchRuntime`) runs only

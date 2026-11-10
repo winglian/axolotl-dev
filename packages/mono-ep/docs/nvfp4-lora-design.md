@@ -345,7 +345,9 @@ in memory). `benchmarks.md` has the rebuild timings and the EP8 rows.
   unit), `MONO_EP_SM100_NVFP4_SAT_COUNT` (diagnostic). The BF16 options
   bitmasks apply unchanged where the code is shared.
 - Backward knobs: `MONO_EP_SM100_NVFP4_BACKWARD_STAGES` (at most the deepest
-  that fits), `MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS` (bits 1 and 2),
+  that fits), `MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS` (bits 1, 2 and
+  2048, default 2051; 2048 is the lean recompute tail: one fence per block and
+  CTA instead of per task; this bitmask is separate from the BF16 backward's),
   `MONO_EP_SM100_NVFP4_BACKWARD_PULL_BYTES` (whole rows by default, or a
   chunked 8192 / 4096 / 2048), `MONO_EP_NVFP4_BACKWARD_RING_WAVES` (ring floor
   in waves of CTA pairs, default 1, 0 = forward sizing),
