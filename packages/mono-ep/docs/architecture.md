@@ -101,8 +101,9 @@ its ring was sized by the forward's interleaved schedule. Wide-expert shapes (hi
 backward now takes a floor of one wave of owners, `num_sms x 128` tokens on SM90 and
 `num_sms / 2 x 128` on SM100 (`MONO_EP_BACKWARD_RING_WAVES`, `0` restores the forward sizing;
 `MONO_EP_NVFP4_BACKWARD_RING_WAVES` for the NVFP4 path). The floor only raises the ring, so the
-Qwen3-30B-A3B shape keeps its ring and its kernels; at the Beam shape the B200 BF16 backward
-went from 25.5 to 16.2 ms. The ring size is a template parameter, so a changed ring compiles a
+Qwen3-30B-A3B shape keeps its ring and its kernels; at the Beam shape (8,192 tokens per GPU) the
+8xB200 BF16 backward went from 25.7 to 16.7 ms and the 8xH100 blockwise FP8 backward from 70.1 to
+37.6 ms. The ring size is a template parameter, so a changed ring compiles a
 new kernel.
 
 ## In-kernel weight gradients (SM100, opt-in)
@@ -116,8 +117,8 @@ and after each M-block the scheduler claims up to `_PER_BLOCK` ready tiles befor
 rest. The pool operands are read MN-major through the existing 64 x 64 pool boxes, the epilogue
 stores FP32 straight from TMEM, and the dW pointers and counters ride in an unused tensor-map
 slot. At most 32 local experts. It pays at wide shapes
-(-1.29 ms per backward with wide tiles at H 5120 / I 2560, 8xB200) and costs about 0.1 ms at
-the Qwen3-30B-A3B shape, so it stays opt-in.
+(-1.49 ms per backward with wide tiles at the Beam shape, 8xB200) and costs about 0.1 ms per
+backward at the Qwen3-30B-A3B shape, so it stays opt-in.
 
 ## MXFP8 backward (SM100, opt-in)
 
@@ -141,7 +142,7 @@ optimizer step rebuilds merged NVFP4 weights (base plus the scaled LoRA delta, r
 requant cache, and the persistent forward and backward run `kind::mxf4nvf4` GEMMs on them; the
 adapter gradients are BF16 grouped GEMMs on the pools. The rebuild is an SM100 CUDA kernel
 (`MONO_EP_NVFP4_REQUANT=cuda`, the default), which writes the same bytes as the Triton reference
-in two paired passes (each weight with its transposed form) and cut the Beam rebuild from 10.2
+in two paired passes (each weight with its transposed form) and cut the Beam rebuild from 10.3
 to 3.2 ms per layer per step on 8xB200. `cuda_fused` builds the transposed forms from the
 merged tile, which is faster still but changes `w1t` / `w2t` numerics, so it is opt-in.
 `nvfp4-lora-design.md` has the design; the requant source is vendored under

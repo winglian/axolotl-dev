@@ -97,46 +97,53 @@ adds are in [docs/trl-integration.md](docs/trl-integration.md).
 
 ## Benchmarks
 
-One MoE layer at expert parallel 8 (16,384 tokens per GPU, 128 experts, top-8, FP32 masters,
-`fullgraph` compiled), checkpointed layer step (forward, recomputed forward, backward) in
-max-rank median ms; router and optimizer excluded. Qwen3-30B-A3B is hidden 2048 /
-intermediate 768, Qwen3-235B-A22B hidden 4096 / intermediate 1536.
+One MoE layer at expert parallel 8 (16,384 tokens per GPU, top-8), checkpointed layer step
+(forward, recomputed forward, backward) in max-rank median ms, balanced routing, router and
+optimizer excluded, one Modal allocation per GPU type. Qwen3-30B-A3B is hidden 2048 /
+intermediate 768 / 128 experts, Qwen3-235B-A22B hidden 4096 / intermediate 1536 / 128 experts,
+Beam hidden 5120 / intermediate 2560 / 256 experts. FP8 on Hopper, BF16 on B200, FP32 masters,
+`fullgraph` compiled:
 
-| | 8xH200 30B-A3B | 8xH200 235B-A22B | 8xH100 30B-A3B | 8xB200 30B-A3B |
-|---|---:|---:|---:|---:|
-| mono-ep (FP8 on Hopper, BF16 on B200) | 12.3 | 37.3 | 13.0 | 7.7 |
-| mono-ep, routed TFLOPS per GPU (% of dense peak)¹ | 402 (20%) | 530 (27%) | 380 (19%) | 646 (29%) |
-| Mega MoE, Prime Intellect's published prime-rl numbers (FP8) | 15.9 | 43.7 | | |
-| Mega MoE, routed TFLOPS per GPU (% of dense peak)¹ | 311 (16%) | 453 (23%) | | |
-| torch all-to-all + DeepGEMM FP8, Prime Intellect's published baseline | 39.3 | 71.9 | | |
-| DeepEP + SonicMoE (20 SMs, Axolotl default) | | | 21.5 | 22.1 |
-| DeepEP + SonicMoE (SM-tuned: 40 H100 / 64 B200) | | | 17.6 | 12.8 |
-| torch all-to-all + SonicMoE (Axolotl `torch` backend) | | | 20.9 | 14.4 |
-| mono-ep dispatch mode + SonicMoE (bounded compact receive)² | | | 18.7 | 11.9 |
-| torch all-to-all + grouped_mm | | | 129.7 | 89.7 |
-| NCCL all-to-all backward behind the same forward (same-run control) | 46.5 | 107.1 | 49.6 | 24.5 |
+| Hardware | Shape | mono-ep 2F+B (ms) | Routed TFLOPS per GPU (% of dense peak) | NCCL all-to-all backward, same run (ms) | Reference (ms) |
+|---|---|---:|---:|---:|---|
+| 8xH200 | 30B-A3B | 12.63 | 392 (20%) | 46.67 | Mega MoE (Prime Intellect, published): 15.9 |
+| 8xH200 | 235B-A22B | 38.30 | 517 (26%) | 107.52 | Mega MoE (Prime Intellect, published): 43.7 |
+| 8xH200 | Beam | 79.50 | 519 (26%) | 190.40 |  |
+| 8xH100 | 30B-A3B | 13.55 | 365 (18%) | 49.91 |  |
+| 8xH100 | 235B-A22B | 42.73 | 463 (23%) | 113.76 |  |
+| 8xH100 | Beam | 90.86 | 454 (23%) | did not fit (80 GB) |  |
+| 8xB200 | 30B-A3B | 7.79 | 635 (28%) | 24.89 | MoK BF16 / MXFP8, same run: 6.96 / 6.40 |
+| 8xB200 | 235B-A22B | 21.65 | 914 (41%) | 65.35 | MoK BF16 / MXFP8, same run: 21.05 / 17.06 |
+| 8xB200 | Beam | 49.29 | 837 (37%) | 113.38 | MoK BF16 / MXFP8, same run: 40.63 / 30.33 |
 
-The Mega MoE and published-baseline rows are Prime Intellect's own measurements on 8xH200
-with the same shapes, routing and FP8 precision, not reruns. The DeepEP and torch rows come
-from separate jobs with BF16 expert weights (SonicMoE's dtype) on the same shape, routing and
-timing method (`dispatch_sonicmoe_contract_deep_ep_h100.json`,
-`dispatch_sonicmoe_contract_deep_ep_b200.json`), so the Hopper columns compare FP8 mono-ep
-against BF16 baselines. The 20-SM row is Axolotl's `deep_ep` backend as shipped, with its
-barrier before every combine (without it: 21.1 / 21.8); the SM-tuned row is the fastest SM
-count found in a sweep, which on B200 was still improving at 64. Mixture of
-Kittens (MoK) targets SM100/SM103 at EP16-64 and has not been run on this contract.
-¹ Routed GEMM FLOPs divided by the whole measured layer time. A forward is 2 x tokens x
-top-k x 3 x hidden x intermediate, a backward twice that (input and weight gradients), and
-the checkpointed step is forward + recomputed forward + backward, four forwards in all.
-Using the whole time means dispatch, combine, quantization and the backward kernel's
-internal gate/up recompute count against it. Dense peaks: 1,979 TFLOPS FP8 on H100/H200,
-2,250 TFLOPS BF16 on B200.
+Mega MoE is Prime Intellect's published prime-rl measurement on 8xH200 with the same shapes,
+routing and FP8 precision, not a rerun. Mixture of Kittens (MoK) ran in the same B200
+allocation with its best knobs; its times include a shared expert (1/8 more FLOPs) that
+mono-ep does not compute, and it is faster than mono-ep's BF16 default at every shape, by
+0.6-0.8 ms at the Qwen3 shapes and 8.7 ms at Beam, all of it in the backward. TFLOPS are routed GEMM FLOPs over
+the whole layer time against dense peaks of 1,979 (FP8, Hopper) and 2,250 (BF16, B200).
 
-² mono-ep's dispatch/combine with SonicMoE as the local kernel, BF16 weights, measured in its
-own job with DeepEP and torch rows of its own (DeepEP at 64 SMs: 17.2 / 12.9 ms there).
+The same layer through Axolotl's expert-parallel backends with SonicMoE as the local experts
+kernel and BF16 weights, every column interleaved in one process (the fused column is the same
+kernels uncompiled, with parameters quantized per call):
 
-Forward/backward splits and their TFLOPS, skewed routing, the Modal run behind every number,
-the validators and what these numbers do not measure are in [docs/benchmarks.md](docs/benchmarks.md).
+| Hardware | Shape | mono-ep fused | mono-ep dispatch (bounded) + SonicMoE | DeepEP + SonicMoE, best SM count | DeepEP + SonicMoE, 20 SMs (Axolotl default) | torch all-to-all + SonicMoE |
+|---|---|---:|---:|---:|---:|---:|
+| 8xH200 | 30B-A3B | 13.41 | 19.09 | 18.12 (40 SMs) | 20.10 | 22.09 |
+| 8xH200 | 235B-A22B | 42.19 | 46.67 | 45.87 (40 SMs) | 47.31 | 50.28 |
+| 8xH200 | Beam | 88.56 | 85.09 | 85.24 (40 SMs) | 85.86 | 89.49 |
+| 8xH100 | 30B-A3B | 14.07 | 19.66 | 26.94 (40 SMs) | 28.56 | 22.70 |
+| 8xH100 | 235B-A22B | 44.62 | 48.85 | 51.79 (40 SMs) | 53.73 | 52.69 |
+| 8xH100 | Beam | 94.69 | 87.57 | 89.21 (40 SMs) | 91.11 | 91.92 |
+| 8xB200 | 30B-A3B | 7.77 | 11.53 | 12.71 (64 SMs) | 21.74 | 14.13 |
+| 8xB200 | 235B-A22B | 21.25 | 25.52 | 26.39 (64 SMs) | 40.82 | 29.12 |
+| 8xB200 | Beam | 45.72 | 45.35 | 44.45 (64 SMs) | 60.77 | 49.71 |
+
+mono-ep's lead over the dispatch paths shrinks as the expert GEMMs grow; at the Beam shape every
+path is within a few percent. The H100 allocation had slow NVLink, which penalized DeepEP most,
+so the H200 rows are the clean Hopper comparison. Skewed routing, forward/backward splits,
+the SM100 opt-ins, the ring floor, NVFP4 LoRA, the Modal run behind every number and what these
+do not measure are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## How it works
 

@@ -1,27 +1,47 @@
 # Benchmarks
 
+Every number on this page comes from one re-benchmark of this tree: one Modal allocation per GPU
+type, every row at three layer shapes, run through the harnesses in `examples/`. Numbers from the
+tuning rounds that built these kernels are kept with the development logs, not here.
+
 ## Contract and methodology
 
-A Qwen3-30B-A3B MoE layer at expert parallel 8: 16,384 tokens per GPU, hidden 2048,
-intermediate 768, 128 experts (16 per GPU), top-8, so each GPU receives about 131,072 routed
-rows; FP32 master weights; the whole layer `fullgraph` compiled; five warmups, fifteen
-measured iterations, median over iterations of the slowest rank. The 235B rows use hidden
-4096, intermediate 1536, 128 experts, top-8.
+One MoE layer at expert parallel 8, 16,384 tokens per GPU, top-8, at three shapes:
+
+| Shape | Hidden | Intermediate | Experts (per GPU) | Routed TFLOP per GPU: forward / backward / 2F+B |
+|---|---:|---:|---:|---|
+| Qwen3-30B-A3B | 2048 | 768 | 128 (16) | 1.237 / 2.474 / 4.948 |
+| Qwen3-235B-A22B | 4096 | 1536 | 128 (16) | 4.948 / 9.896 / 19.79 |
+| Beam | 5120 | 2560 | 256 (32) | 10.31 / 20.62 / 41.23 |
 
 - "Checkpointed 2F+B" is the forward, the recomputed forward and the backward of one layer,
-  grouped weight gradients and runtime staging included, router and optimizer excluded.
-- The "NCCL control" shares the same persistent forward and runs a fixed-capacity NCCL
-  all-to-all backward in the same process and allocation. The B200 "peer control" is the
-  earlier symmetric-memory chunk pipeline.
-- Hopper runs are blockwise FP8 (E4M3, 1x128 activation and 128x128 weight scales, with
-  `MONO_EP_SM90_FP8_TRANSPORT=1` and `MONO_EP_SM90_FP8_COMBINE=1`); B200 runs are BF16
-  compute. B200 runs bump the weight versions every iteration so the weight-layout cache
-  rebuilds as it would in training.
-- Balanced routing is uniform random; skewed routing concentrates the hot experts on one
-  rank.
-- Runner: `examples/modal_hopper_persistent_timing.py` (SM90) and the B200 paired-timing
-  runner in `examples/`; the Modal app id of every run is listed under its table. Hopper
-  runs assert the allocated GPU in-process (`H100!` strict, `NVIDIA H200`).
+  weight gradients and runtime staging included, router and optimizer excluded. Five warmups,
+  fifteen measured iterations, median over iterations of the slowest rank, paths interleaved
+  with the order reversed every other iteration.
+- The fused rows use FP32 master weights, the whole layer `fullgraph` compiled, and bump the
+  weight versions every iteration, so the weight-layout cache rebuilds as it does in training.
+  Hopper runs are blockwise FP8 (E4M3, 1x128 activation and 128x128 weight scales,
+  `MONO_EP_SM90_FP8_TRANSPORT=1`, `MONO_EP_SM90_FP8_COMBINE=1`); B200 runs are BF16.
+- The NCCL control shares the same persistent forward and runs a fixed-capacity NCCL
+  all-to-all backward in the same process.
+- Balanced routing is uniform random; skewed routing concentrates the hot experts on one rank.
+- Routed TFLOPS per GPU is routed GEMM FLOPs (2 x rows x 3 x hidden x intermediate per
+  forward, twice that per backward, four forwards per 2F+B) divided by the whole measured
+  time, so dispatch, combine, quantization, the backward's gate/up recompute and weight-layout
+  preparation all count against it. Dense peaks: 1,979 TFLOPS FP8 on H100 and H200, 2,250
+  TFLOPS BF16 on B200.
+
+Allocations (Modal app, commit, device asserted in-process before the first row):
+
+| Hardware | App | Commit | Notes |
+|---|---|---|---|
+| 8xH200 | ap-8NiyZxNCgoy9sN6CVq0J7y | ef76fd6804 | preflight all-to-all 311.6 GB/s |
+| 8xH100 (`H100!`) | ap-QcAVGSp7VUaUBjZYPBHEiB | ef76fd6804 | slow NVLink, see below |
+| 8xB200 | ap-rtKAANKTJOx3UX04OFsnQs | 2d6ef94f60 | about 3% slow, see below |
+
+`ef76fd6804` differs from `2d6ef94f60` only in three timing harnesses (path subsets for the
+80 GB H100, the dispatch contract's fused-row description); the package sources and the JIT
+kernels are identical.
 
 ## 8xH200 against Mega MoE
 
@@ -30,215 +50,221 @@ Intellect published for prime-rl on the same hardware (ratio below 1 is faster):
 
 | Shape | | mono-ep | Mega MoE (published) | ratio | NCCL control |
 |---|---|---:|---:|---:|---:|
-| 30B-A3B | forward | 3.277 | 3.9 | 0.840 | 3.272 |
-| 30B-A3B | backward | 6.601 | 8.2 | 0.805 | 40.653 |
-| 30B-A3B | checkpointed 2F+B | 12.317 | 15.9 | 0.775 | 46.490 |
-| 235B-A22B | forward | 8.447 | 9.5 | 0.889 | 8.445 |
-| 235B-A22B | backward | 21.124 | 24.6 | 0.859 | 90.498 |
-| 235B-A22B | checkpointed 2F+B | 37.333 | 43.7 | 0.854 | 107.124 |
+| 30B-A3B | forward | 3.498 | 3.9 | 0.897 | 3.509 |
+| 30B-A3B | backward | 6.962 | 8.2 | 0.849 | 40.900 |
+| 30B-A3B | checkpointed 2F+B | 12.630 | 15.9 | 0.794 | 46.668 |
+| 235B-A22B | forward | 8.504 | 9.5 | 0.895 | 8.324 |
+| 235B-A22B | backward | 21.275 | 24.6 | 0.865 | 90.789 |
+| 235B-A22B | checkpointed 2F+B | 38.302 | 43.7 | 0.876 | 107.518 |
 
-Run ap-V06KM1a7K9KSAOsvOo4CU4 (one allocation). The 235B shape runs with 5 forward / 3
-backward stages and the 2 KB dispatch pull, because the hidden-2048 stage counts exceed SM90
-shared memory at hidden 4096.
+Prime Intellect's published torch all-to-all + DeepGEMM FP8 baseline is 39.3 ms (30B-A3B) and
+71.9 ms (235B-A22B). The published numbers are their measurements, not reruns.
 
-Skewed routing costs 26% on the 30B 2F+B (15.504 ms) and 28% on the 235B 2F+B (47.799 ms) on
-the same build; the NCCL control moves by 5-8%.
+## Fused training layer
 
-## Achieved TFLOPS
+Balanced routing unless marked, max-rank median ms:
 
-Routed TFLOPS per GPU, with the share of the GPU's dense peak in parentheses:
+| Hardware | Shape | Forward | Backward | Checkpointed 2F+B | TFLOPS (% of peak) | Skewed 2F+B | NCCL control 2F+B | vs control | Peak allocated GiB |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8xH200 FP8 | 30B-A3B | 3.50 | 6.96 | 12.63 | 392 (20%) | 15.81 | 46.67 | 3.69x | 17.2 |
+| 8xH200 FP8 | 235B-A22B | 8.50 | 21.27 | 38.30 | 517 (26%) | 47.40 | 107.52 | 2.81x | 35.8 |
+| 8xH200 FP8 | Beam | 18.34 | 45.40 | 79.50 | 519 (26%) | 100.84 | 190.40 | 2.40x | 49.2 |
+| 8xH100 FP8 | 30B-A3B | 3.66 | 7.27 | 13.55 | 365 (18%) | 16.58 | 49.91 | 3.68x | 17.2 |
+| 8xH100 FP8 | 235B-A22B | 9.53 | 25.05 | 42.73 | 463 (23%) | 53.82 | 113.76 | 2.66x | 35.8 |
+| 8xH100 FP8 | Beam | 19.72 | 55.30 | 90.86 | 454 (23%) | 112.80 | did not fit |  | 49.2 |
+| 8xB200 BF16 | 30B-A3B | 2.15 | 4.20 | 7.79 | 635 (28%) | 9.26 | 24.89 | 3.19x | 21.9 |
+| 8xB200 BF16 | 235B-A22B | 4.27 | 13.06 | 21.65 | 914 (41%) | 27.11 | 65.35 | 3.02x | 34.4 |
+| 8xB200 BF16 | Beam | 8.95 | 30.48 | 49.29 | 837 (37%) | 60.23 | 113.38 | 2.30x | 66.7 |
 
-| Build | Hardware | Shape | Precision | Forward | Backward | Checkpointed 2F+B | Source |
-|---|---|---|---|---:|---:|---:|---|
-| mono-ep | 8xH200 | 30B-A3B | blockwise FP8 | 377 (19.1%) | 375 (18.9%) | 402 (20.3%) | ap-V06KM1a7K9KSAOsvOo4CU4 |
-| mono-ep | 8xH200 | 235B-A22B | blockwise FP8 | 586 (29.6%) | 468 (23.7%) | 530 (26.8%) | ap-V06KM1a7K9KSAOsvOo4CU4 |
-| mono-ep | 8xH100 | 30B-A3B | blockwise FP8 | 358 (18.1%) | 340 (17.2%) | 380 (19.2%) | ap-05NnV2Ph9NslFfBVYrnbLq |
-| mono-ep | 8xB200 | 30B-A3B | BF16 | 590 (26.2%) | 593 (26.4%) | 646 (28.7%) | ap-afG15T7ayDA5cPEJnqpPcC |
-| Mega MoE (published) | 8xH200 | 30B-A3B | blockwise FP8 | 317 (16.0%) | 302 (15.2%) | 311 (15.7%) | Prime Intellect |
-| Mega MoE (published) | 8xH200 | 235B-A22B | blockwise FP8 | 521 (26.3%) | 402 (20.3%) | 453 (22.9%) | Prime Intellect |
-| torch all-to-all + DeepGEMM FP8 (published baseline) | 8xH200 | 30B-A3B | blockwise FP8 | 103 (5.2%) | 161 (8.1%) | 126 (6.4%) | Prime Intellect |
-| torch all-to-all + DeepGEMM FP8 (published baseline) | 8xH200 | 235B-A22B | blockwise FP8 | 239 (12.1%) | 324 (16.4%) | 275 (13.9%) | Prime Intellect |
+Routed TFLOPS per GPU by direction (balanced):
 
-Definition: routed FLOPs per GPU per direction = 2 x rows x 3 x hidden x intermediate, with
-rows = tokens per rank x top-k (the gate/up GEMM is 2 x hidden x 2 x intermediate per row,
-the down GEMM 2 x hidden x intermediate). A backward costs twice a forward (input and weight
-gradients for each GEMM), and the checkpointed step is forward + recomputed forward +
-backward, four forwards in all: 1.237 / 2.474 / 4.948 TFLOP per GPU at the Qwen3-30B-A3B
-shape and four times that at Qwen3-235B-A22B. Achieved TFLOPS is routed FLOPs divided by the
-measured max-rank median time of the whole layer step, so it counts only useful GEMM work
-and charges dispatch, combine, quantization, the backward's gate/up recompute (the backward
-kernel recomputes the gate/up GEMM per M-block, about two thirds of a forward that is not
-counted) and weight-layout preparation to the denominator. Prime Intellect's published times
-are converted the same way.
+| Hardware | Shape | Forward | Backward | Checkpointed 2F+B |
+|---|---|---:|---:|---:|
+| 8xH200 FP8 | 30B-A3B | 354 | 355 | 392 |
+| 8xH200 FP8 | 235B-A22B | 582 | 465 | 517 |
+| 8xH200 FP8 | Beam | 562 | 454 | 519 |
+| 8xH100 FP8 | 30B-A3B | 338 | 340 | 365 |
+| 8xH100 FP8 | 235B-A22B | 519 | 395 | 463 |
+| 8xH100 FP8 | Beam | 523 | 373 | 454 |
+| 8xB200 BF16 | 30B-A3B | 576 | 588 | 635 |
+| 8xB200 BF16 | 235B-A22B | 1158 | 758 | 914 |
+| 8xB200 BF16 | Beam | 1151 | 676 | 837 |
+| Mega MoE (published), 8xH200 FP8 | 30B-A3B | 317 | 302 | 311 |
+| Mega MoE (published), 8xH200 FP8 | 235B-A22B | 521 | 402 | 453 |
 
-Dense peaks: H100 SXM and H200 SXM 1,979 TFLOPS FP8 (NVIDIA's datasheets list 3,958 TFLOPS
-with 2:4 sparsity); B200 2,250 TFLOPS BF16 (NVIDIA's HGX B200 specification lists 36 PFLOPS
-BF16 with sparsity per eight GPUs, 4.5 per GPU, half of that dense). Hopper rows compare
-against the FP8 peak, the B200 row against the BF16 peak.
+The share of peak rises with the GEMM size, because the transfers and the per-row epilogue
+work are a larger share of the small 30B-A3B layer. The backward is the weaker direction
+everywhere; it recomputes the gate/up GEMM per M-block (about two thirds of a forward that is
+not counted) and runs the weight gradients as grouped GEMMs after the main loop.
 
-## 8xH100, Hopper tuning rounds
+## Dispatch mode and the Axolotl backends on one contract
 
-Strict `H100!`, 30B-A3B, balanced, ms, one allocation per row:
+The same layer, routing and timing method run through Axolotl's expert-parallel backends with
+SonicMoE as the local experts kernel and BF16 expert weights (SonicMoE's dtype), every variant
+of a column interleaved in one process (`examples/dispatch_sonicmoe_contract.py --deep-ep
+--retime`). The mono-ep fused row in these tables is the same kernels run uncompiled with BF16
+parameters quantized per call (FP8 transport on Hopper), so it is a same-run reference rather
+than the fused-harness number above. DeepEP is v1.2.1 with the plugin's NVLink buffer; the
+20-SM row is the `deep_ep` backend as shipped. Checkpointed 2F+B, balanced / skewed, ms.
 
-| Build | Forward | Backward | Checkpointed 2F+B | NCCL control 2F+B |
-|---|---:|---:|---:|---:|
-| epilogue integration (start of the rounds) | 4.297 | 9.026 | 16.958 | 51.682 |
-| round 2b | 3.365 | 8.157 | 14.327 | 49.831 |
-| round 3 | 3.255 | 7.534 | 13.480 | 49.911 |
-| round 4 (this tree's SM90 defaults) | 3.385 | 7.036 | 12.998 | 49.647 |
-| this branch, gate run | 3.458 | 7.266 | 13.021 | 49.616 |
+8xH200:
 
-Runs, top to bottom: ap-optFhUPUcC5ywxp9zJPPRe, ap-EsrRmakdPLt73RGAS69kK4,
-ap-ICtWLrsXD20dMONnCSd4Nz, ap-9N7kM7V67pDfcDRXl81ZP5, ap-05NnV2Ph9NslFfBVYrnbLq. Skewed
-routing on the gate run: 4.028 / 8.996 / 16.198 ms, control 52.146
-(ap-tsjPCzmlgpvljSIRdiLOVi); round 4 measured 16.293 skewed.
-
-## 8xB200, Blackwell tuning rounds
-
-30B-A3B, BF16, balanced, max-rank median ms, weight versions bumped every iteration:
-
-| Build | Forward | Backward | Checkpointed 2F+B | Peer control | NCCL control |
-|---|---:|---:|---:|---:|---:|
-| start of the B200 rounds (6 backward stages) | 2.36 | 4.73 | 9.17 | 17.89 | 25.00 |
-| round 1 | 2.19 | 4.40 | 8.31 | 17.39 | 24.53 |
-| round 2 | 2.137 | 4.256 | 7.845 | 17.260 | 24.537 |
-| round 3 (this tree's SM100 defaults) | 2.112 | 4.138 | 7.659 | 17.196 | 24.531 |
-| round 3 with 16 reserved SMs (the FSDP2 setting) | 2.114 | 4.272 | 7.823 | 17.391 | 24.670 |
-| this branch, gate run | 2.098 | 4.172 | 7.660 | 17.046 | 24.242 |
-
-Runs, top to bottom: ap-6Js1FDCUJz1HfsUbBOqL3b, ap-PFK8nCymI9bow1IChnsdrD,
-ap-VBok02Nuf6psSFDeShXEHF, ap-rxwVgU6xxIwEFdt6fNcX3o (both round-3 rows),
-ap-afG15T7ayDA5cPEJnqpPcC.
-
-## Baselines: the Axolotl backends on the same contract
-
-The same layer shape, routing generators and timing method (5 warmups, 15 samples, median
-of the max rank, checkpointed 2F+B), run through Axolotl's expert-parallel backends with
-SonicMoE or `grouped_mm` as the local experts kernel. Expert weights are BF16 (SonicMoE's
-native dtype) and every variant of a column ran interleaved in one allocation
-(`examples/dispatch_sonicmoe_contract.py --deep-ep` on the `features/deepep-contract-baseline`
-branch; 8xH100 ap-ML4Jf7M3m03WlwFVGclzL6, 8xB200 ap-1frtFOq9kwibpsjjWsMTtR; artifacts
-`dispatch_sonicmoe_contract_deep_ep_h100.json` and `dispatch_sonicmoe_contract_deep_ep_b200.json`). DeepEP is v1.2.1 with
-the plugin's 256 MiB NVLink buffer; "as shipped" is the `deep_ep` backend with its
-`barrier_ep` before every combine and DeepEP's default 20 SMs; "kernels only" drops the
-barrier; the swept rows give DeepEP the best SM count found (the H100 sweep stopped at 40
-SMs, the B200 sweep was still improving at 64). Balanced / skewed, ms:
-
-| Variant | 8xH100 | 8xB200 |
-|---|---|---|
-| torch all-to-all + SonicMoE | 20.88 / 23.76 | 14.35 / 15.33 |
-| DeepEP + SonicMoE (20 SMs, Axolotl default), as shipped | 21.48 / 25.68 | 22.13 / 25.24 |
-| DeepEP + SonicMoE (20 SMs, Axolotl default), kernels only | 21.09 / 25.30 | 21.75 / 24.82 |
-| DeepEP + SonicMoE (SM-tuned: 40 H100 / 64 B200) | 17.56 / 20.73 | 12.80 / 14.00 |
-| torch all-to-all + grouped_mm | 129.68 / 149.80 | 89.74 / 103.55 |
-| DeepEP + grouped_mm, 20 SMs | 123.97 / 144.25 | 95.44 / 110.31 |
-| mono-ep fused, pre-tuning build, same job | 18.55 / 22.64 | 10.89 / 13.50 |
-
-The last row is the fused kernel at the state before the Hopper and B200 tuning rounds,
-measured inside the same job as a reference point; this tree's defaults measured 12.998 /
-16.198 (H100) and 7.659 (B200) in their own allocations (tables above). SonicMoE's GEMM time
-is identical in every SonicMoE row (H100 5.4 ms, B200 2.7-2.8 ms per forward+backward):
-nothing overlaps in that serialized path, so DeepEP's SM count only bounds its own dispatch
-and combine kernels. An earlier job with full quack sweeps (8xH100 ap-DPDFL3sbYfPqkGAh5dNWqe,
-8xB200 ap-R8iuf9H6IVXAWgpMWmfv9P) put the torch all-to-all + SonicMoE control at 22.68 /
-14.01 ms balanced. Mixture of Kittens (MoK) has not been run on this contract.
-
-## Dispatch mode on the same contract
-
-The dispatch mode serves the `deep_ep` / `torch` dispatch/combine contract from mono-ep's peer
-transfers, with SonicMoE as the local kernel and BF16 expert weights, on the same layer,
-routing and timing method as the baselines above; every row of a column ran interleaved in
-one allocation. Checkpointed 2F+B, max-rank median ms, balanced / skewed
-(`compose-design.md` 5.7; 8xH100 ap-u57jzYtyxSFbY5pHpZn9xj, 8xB200 ap-O0F3PmsfwBnZTjWsCzB25T):
-
-| Variant | 8xH100 | 8xB200 |
-|---|---|---|
-| mono-ep dispatch, bounded compact receive (`expert_parallel_mono_ep_bounded`) | 18.72 / 21.36 | 11.91 / 12.60 |
-| mono-ep dispatch, compact receive (count stall) | 19.22 / 22.23 | 12.50 / 13.51 |
-| DeepEP + SonicMoE, 40 SMs | 17.57 / 20.40 | 14.89 / 16.86 |
-| DeepEP + SonicMoE, 64 SMs | 17.24 / 20.02 | 12.94 / 14.09 |
-| torch all-to-all + SonicMoE | 20.85 / 23.53 | 14.51 / 15.31 |
-
-On B200 the bounded receive leads DeepEP at its best measured SM count; on H100 DeepEP keeps
-a lead of about 1.4 ms.
-
-## Mixture of Kittens (separate allocation)
-
-cursor/mixture-of-kittens at f3a8bd2432 built for SM100 on the same B200 image (one-line
-`kittens::detail::tcgen05::commit` qualification), best knobs from a sweep, **shared expert
-included in its timing**, in a **separate allocation** from the mono-ep rows (Modal
-ap-tnRPLy5qgP47OeeadOfmRO). Not a same-run A/B. F / B / checkpointed 2F+B ms:
-
-| Shape | MoK BF16 | MoK MXFP8 | mono-ep (this tree) |
+| Variant | 30B-A3B | 235B-A22B | Beam |
 |---|---|---|---|
-| Qwen3-30B-A3B | 2.27 / 3.50 / 7.01 | 2.20 / 2.79 / 6.32 | BF16 2.10 / 4.17 / 7.66 |
-| Qwen3-235B-A22B | 6.34 / 11.06 / 21.22 | 5.46 / 7.90 / 16.63 | |
-| Beam (256 experts) | 11.77 / 21.73 / 40.78 | 9.19 / 15.31 / 30.41 | |
+| mono-ep fused (this tree, uncompiled, BF16 parameters quantized per call) | 13.41 / 16.70 | 42.19 / 54.58 | 88.56 / 110.09 |
+| mono-ep dispatch, bounded compact receive | 19.09 / 21.59 | 46.67 / 56.59 | 85.09 / 104.54 |
+| mono-ep dispatch, compact receive | 19.93 / 22.17 | 47.61 / 58.32 | 86.81 / 107.00 |
+| DeepEP + SonicMoE, 40 SMs | 18.12 / 20.21 | 45.87 / 56.15 | 85.24 / 105.40 |
+| DeepEP + SonicMoE, 20 SMs (Axolotl default) | 20.10 / 23.56 | 47.31 / 58.68 | 85.86 / 106.41 |
+| torch all-to-all + SonicMoE | 22.09 / 24.36 | 50.28 / 60.60 | 89.49 / 111.32 |
 
-On one B200 at the 30B shape (BF16, F / B) MoK takes 2.80 / 5.06 ms against mono-ep's 1.27 /
-3.26. At EP8 mono-ep's forward is faster and MoK's backward is about 0.5 ms faster, which
-matches mono-ep's serial weight-gradient phase (0.93 ms).
+8xH100:
+
+| Variant | 30B-A3B | 235B-A22B | Beam |
+|---|---|---|---|
+| mono-ep fused (this tree, uncompiled, BF16 parameters quantized per call) | 14.07 / 17.42 | 44.62 / 56.52 | 94.69 / 118.08 |
+| mono-ep dispatch, bounded compact receive | 19.66 / 22.09 | 48.85 / 58.24 | 87.57 / 106.09 |
+| mono-ep dispatch, compact receive | 20.48 / 22.94 | 49.92 / 59.94 | 89.00 / 109.31 |
+| DeepEP + SonicMoE, 40 SMs | 26.94 / 29.79 | 51.79 / 61.61 | 89.21 / 109.85 |
+| DeepEP + SonicMoE, 20 SMs (Axolotl default) | 28.56 / 31.65 | 53.73 / 64.41 | 91.11 / 112.28 |
+| torch all-to-all + SonicMoE | 22.70 / 24.78 | 52.69 / 62.35 | 91.92 / 112.43 |
+
+8xB200:
+
+| Variant | 30B-A3B | 235B-A22B | Beam |
+|---|---|---|---|
+| mono-ep fused (this tree, uncompiled, BF16 parameters quantized per call) | 7.77 / 9.32 | 21.25 / 26.05 | 45.72 / 56.47 |
+| mono-ep dispatch, bounded compact receive | 11.53 / 12.48 | 25.52 / 29.68 | 45.35 / 56.94 |
+| mono-ep dispatch, compact receive | 12.35 / 13.30 | 26.17 / 30.84 | 45.67 / 54.65 |
+| DeepEP + SonicMoE, 64 SMs | 12.71 / 13.84 | 26.39 / 31.20 | 44.45 / 52.43 |
+| DeepEP + SonicMoE, 40 SMs | 14.80 / 16.79 | 30.57 / 35.68 | 50.00 / 57.38 |
+| DeepEP + SonicMoE, 20 SMs (Axolotl default) | 21.74 / 24.62 | 40.82 / 47.22 | 60.77 / 70.90 |
+| torch all-to-all + SonicMoE | 14.13 / 15.32 | 29.12 / 33.63 | 49.71 / 58.48 |
+
+The bounded compact receive (`expert_parallel_mono_ep_bounded`) is bitwise equal to the
+compact receive (forward and backward, both routings) at every shape on every GPU, and no
+re-timed row changed its output. On B200 it leads DeepEP at its best SM count at 30B-A3B and
+235B-A22B; on H200 DeepEP at 40 SMs is about 1 ms faster than it at both shapes. At the Beam shape the dispatch paths, DeepEP and the fused kernels land within a
+few percent of each other on every GPU: with 32 local experts and hidden 5120 the expert GEMMs
+dominate the layer, so fusing the transfers into them buys little.
+
+## Mixture of Kittens on 8xB200 (same allocation)
+
+cursor/mixture-of-kittens at f3a8bd2432 built for SM100 in the B200 image (one-line
+`kittens::detail::tcgen05::commit` qualification), run in the same allocation as the mono-ep
+rows with the best knobs from an earlier sweep (fwd / bwd comm SMs, minibatch:
+30B-A3B 52/52, 8192 (BF16) / 52/52, 8192 (MXFP8), 235B-A22B 36/36, 4096 (BF16) / 36/36, 4096 (MXFP8), Beam 24/24, 16384 (BF16) / 36/24, 4096 (MXFP8)). Balanced routing, ms; MoK's checkpointed 2F+B is its
+forward plus its recomputing backward. MoK computes a shared expert of the same intermediate
+size inside every timed number (1/8 more FLOPs at top-8), so its times include work mono-ep
+does not do, and its routed TFLOPS understate it:
+
+| Shape | MoK BF16 F / B / 2F+B | MoK MXFP8 F / B / 2F+B | mono-ep BF16 F / B / 2F+B | mono-ep 2F+B with the MXFP8 backward | MoK BF16 TFLOPS | mono-ep TFLOPS |
+|---|---|---|---|---:|---:|---:|
+| 30B-A3B | 2.25 / 3.47 / 6.96 | 2.26 / 2.85 / 6.40 | 2.15 / 4.20 / 7.79 | 7.32 | 711 | 635 |
+| 235B-A22B | 6.26 / 10.96 / 21.05 | 5.54 / 7.81 / 17.06 | 4.27 / 13.06 / 21.65 | n/a (hidden > 2048) | 940 | 914 |
+| Beam | 11.68 / 21.59 / 40.63 | 9.11 / 15.25 / 30.33 | 8.95 / 30.48 / 49.29 | n/a (hidden > 2048) | 1015 | 837 |
+
+MoK is faster than mono-ep's BF16 default at every shape, by 0.8 ms at 30B-A3B, 0.6 ms at
+235B-A22B and 8.7 ms at Beam. mono-ep's forward is faster at all three shapes; the whole gap
+is in the backward, which grows with the GEMM size.
 
 ## SM100 opt-ins on 8xB200
 
-MXFP8 backward (`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`), BF16 and MXFP8 interleaved per
-iteration in one allocation (ap-vNYQUgp8WL4TzRvFuKprVS), weights bumped every step, ms:
+MXFP8 backward (`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`, hidden up to 2048) and in-kernel
+weight gradients (`MONO_EP_SM100_INKERNEL_DW=1`, `_WIDE=1` for 256 x 256 tiles), interleaved
+with the default per iteration in the fused-harness rows above, backward / 2F+B ms:
 
-| Qwen3-30B-A3B | BF16 | MXFP8 |
-|---|---|---|
-| backward, balanced | 4.164 | 3.794 (-8.9%) |
-| checkpointed 2F+B, balanced | 7.714 | 7.236 (-6.2%) |
-| checkpointed 2F+B, skewed | 9.334 | 8.760 (-6.1%) |
+| Shape | Routing | default BF16 B / 2F+B | MXFP8 backward B / 2F+B | in-kernel dW B / 2F+B | in-kernel dW, wide B / 2F+B |
+|---|---|---|---|---|---|
+| 30B-A3B | balanced | 4.20 / 7.79 | 3.77 / 7.32 | 4.30 / 7.81 | 4.25 / 7.75 |
+| 30B-A3B | skewed | 5.00 / 9.26 | 4.51 / 8.83 | 5.18 / 9.34 | 5.15 / 9.28 |
+| 235B-A22B | balanced | 13.06 / 21.65 | n/a | 13.45 / 21.84 | 13.19 / 21.33 |
+| 235B-A22B | skewed | 15.88 / 27.11 | n/a | 16.41 / 26.59 | 16.01 / 26.38 |
+| Beam | balanced | 30.48 / 49.29 | n/a | 30.33 / 48.76 | 28.99 / 47.99 |
+| Beam | skewed | 38.18 / 60.23 | n/a | 39.11 / 61.75 | 36.68 / 60.59 |
 
-In-kernel weight gradients (`MONO_EP_SM100_INKERNEL_DW`), off / on / wide, one allocation
-(ap-HXzwyX5kvITeMHznIApH69), backward and checkpointed 2F+B ms:
+Neither is a default: the MXFP8 backward is not bitwise (about 6-7% relative error against an
+FP32 reference) and the in-kernel dW costs about 0.1 ms at 30B-A3B while it saves 1.5 ms per
+backward at Beam.
 
-| Shape | off | on (256 x 128) | wide (256 x 256) |
-|---|---|---|---|
-| Qwen3-30B-A3B, balanced | 4.164 / 7.665 | 4.273 / 7.798 | 4.243 / 7.757 |
-| H 5120 / I 2560, 32 local experts | 21.914 / 32.208 | 21.254 / 31.903 | 20.625 / 30.860 |
+## Backward ring floor
+
+`MONO_EP_BACKWARD_RING_WAVES` (default 1) against `0` (the forward sizing), both resident in
+one process unless marked; backward / 2F+B ms. The Beam case runs 8,192 tokens per GPU:
+
+| Hardware | Shape (tokens per GPU) | Routing | ring floor off: B / 2F+B | default (1 wave): B / 2F+B | dx bitwise |
+|---|---|---|---|---|---|
+| 8xB200 BF16 | 30B-A3B (16,384) | balanced | 4.12 / 7.67 | 4.08 / 7.67 | True |
+| 8xB200 BF16 | 30B-A3B (16,384) | skewed | 5.55 / 10.20 | 5.59 / 10.21 | True |
+| 8xB200 BF16 | 235B-A22B (16,384) | balanced | 14.50 / 23.06 | 14.60 / 23.07 | True |
+| 8xB200 BF16 | 235B-A22B (16,384) | skewed | 19.35 / 30.33 | 19.54 / 30.64 | True |
+| 8xB200 BF16 | Beam (8,192) | balanced | 25.70 / 33.60 | 16.66 / 24.40 | True |
+| 8xB200 BF16 | Beam (8,192) | skewed | 34.07 / 42.74 | 22.43 / 32.39 | True |
+| 8xH100 FP8 | 30B-A3B (16,384) | balanced | 13.06 / 18.80 | 13.05 / 18.73 | True |
+| 8xH100 FP8 | 30B-A3B (16,384) | skewed | 14.56 / 22.00 | 14.32 / 21.93 | True |
+| 8xH100 FP8 | 235B-A22B (16,384) | balanced | 36.76 / 51.74 | 36.74 / 51.75 | not checked (separate sets) |
+| 8xH100 FP8 | 235B-A22B (16,384) | skewed | 49.08 / 69.41 | 41.82 / 62.67 | not checked (separate sets) |
+| 8xH100 FP8 | Beam (8,192) | balanced | 70.08 / 86.30 | 37.58 / 52.40 | True |
+| 8xH100 FP8 | Beam (8,192) | skewed | 97.09 / 118.67 | 50.48 / 70.28 | True |
+
+The floor only raises the ring, so the 30B-A3B and 235B-A22B shapes keep their kernels; at the
+Beam shape it removes the backward's ring stalls. The 235B-A22B H100 rows ran the two settings
+in separate processes, so they carry run-to-run noise rather than a paired difference.
 
 ## NVFP4 LoRA (SM100)
 
-`precision="nvfp4_lora"` (frozen NVFP4 experts with LoRA), 8xB200, F / B / checkpointed 2F+B
-ms with the ring floor and the CUDA requant (ap-dJj9XYEA3BDSZ7TDQv3bzS), and the per-step
-merged-weight rebuild per layer:
+`precision="nvfp4_lora"` (frozen NVFP4 experts with LoRA) on 8xB200 against the BF16
+persistent path and two NVFP4 floors with an all-to-all around them (the fp4_cute grouped GEMM
+and the cuDNN frontend grouped NVFP4 GEMM), ms. The rebuild column is the per-step merged-weight
+requant per layer (`MONO_EP_NVFP4_REQUANT`). The Beam case runs 8,192 tokens per GPU:
 
-| Case | nvfp4_lora | rebuild, Triton / `cuda` / `cuda_fused` |
-|---|---|---|
-| Qwen3-30B-A3B, balanced | 2.11 / 4.03 / 7.98 | 0.87 / 0.35 / 0.31 |
-| Qwen3-30B-A3B, skewed | 2.74 / 6.31 / 11.53 | |
-| Beam, balanced | 2.98 / 8.11 / 13.68 | 10.24 / 3.24 / 2.50 |
-| Beam, skewed | 3.64 / 10.35 / 17.44 | |
+| Shape (tokens per GPU) | Routing | nvfp4_lora F / B / 2F+B | BF16 persistent 2F+B | fp4_cute + all-to-all 2F+B | cuDNN grouped + all-to-all 2F+B | rebuild: `cuda` / Triton / `cuda_fused` |
+|---|---|---|---|---|---|---|
+| 30B-A3B (16,384) | balanced | 2.09 / 3.99 / 7.95 | 7.55 | 30.66 | 28.34 | 0.35 / 0.89 / 0.31 |
+| 30B-A3B (16,384) | skewed | 2.76 / 6.34 / 11.67 | 9.95 | 38.56 | 35.54 |  |
+| 235B-A22B (16,384) | balanced | 3.97 / 9.16 / 16.80 | 20.65 | 63.28 | 53.26 | 0.91 / 2.76 / 0.74 |
+| 235B-A22B (16,384) | skewed | 5.40 / 14.20 / 24.39 | 27.54 | 75.65 | 67.73 |  |
+| Beam (8,192) | balanced | 2.98 / 7.84 / 13.49 | 23.88 | 41.71 | 36.76 | 3.25 / 10.25 / 2.51 |
+| Beam (8,192) | skewed | 3.85 / 11.20 / 18.75 | 31.66 | 55.98 | 48.86 |  |
 
-The ring floor took the Beam backward from 11.35 to about 8 ms; with the `cuda` rebuild a Beam
-optimizer step without gradient accumulation goes from 23.9 to 16.9 ms per layer.
+## Hopper backward GEMM roofline
 
-GEMM floor: the cuDNN frontend grouped NVFP4 GEMM on one B200 runs the backward's GEMMs in
-0.568 ms (30B) and 1.551 ms (Beam) against 2.11 and 4.44 ms for the whole persistent backward
-kernel, and its k-loops are 2.2-2.4x faster than the persistent kernel's. As an EP8 layer with an
-all-to-all around it (`cudnn_grouped_a2a`, ap-zZAErn1BHT6XxTyVS0PVIs) it takes 27.82 ms (30B)
-and 36.35 ms (Beam) checkpointed 2F+B against nvfp4_lora's 7.93 and 13.08 in the same run.
+The three backward GEMMs alone on one H100 (prepacked, balanced, blockwise FP8), ms:
+
+| Shape | dh | z recompute | dx | Sum | TFLOPS |
+|---|---:|---:|---:|---:|---:|
+| 30B-A3B | 0.341 | 0.641 | 0.782 | 1.764 | 1169 |
+| 235B-A22B | 1.193 | 2.306 | 2.645 | 6.144 | 1342 |
+| Beam | 2.734 | 5.409 | 5.455 | 13.598 | 1263 |
 
 ## What these do not measure
 
-The H100 and B200 rows are not hardware- or precision-matched with the Mega MoE H200 FP8
-figures; the controls share the persistent forward, so they are not Prime Intellect's
-published baseline (torch all-to-all + DeepGEMM FP8: 39.3 ms at 30B-A3B, 71.9 ms at
-235B-A22B); absolute timings move by up to 16% between allocations of the same GPU type, so
-rows from different allocations are reproductions rather than A/Bs; and these are layer
-timings, not end-to-end training throughput.
+- The H100 allocation had slow NVLink: against an earlier H100 allocation of the same commit
+  the expert GEMMs were unchanged, the fused path was 2-5% slower, and DeepEP 36-54% slower.
+  The H100 dispatch table therefore understates DeepEP on H100; the H200 table is the clean
+  Hopper comparison.
+- The B200 allocation ran about 3% slower than an earlier B200 gate run (NCCL control 24.89 ms
+  against 24.24); compare B200 rows with each other, not across allocations.
+- On the 80 GB H100 the 235B-A22B and Beam rows did not fit with every compared path
+  resident, so each path ran in its own process in the same allocation; the Beam NCCL control
+  did not fit even alone.
+- H200 has no ring-floor rows: the re-benchmark plan ran the ring floor on H100 and B200 only.
+- The Hopper fused rows are FP8 and the B200 rows BF16, and none of them is hardware- or
+  precision-matched with MoK's MXFP8 rows. These are layer timings, not end-to-end training
+  throughput, and only stationary routing was measured.
 
 ## Correctness
 
-- Two-GPU FP32-reference forward/backward validators with the x/dZ caches, the FP8 combine
-  validator with forced ring wrap, and the forward FP32 reference: ap-VN6mzQm22BwbfnE68DZ5rO,
-  ap-wufiJKL44xoazIZkfVaBQv, ap-gK4emj87Im7xQLO4dvCUXF (2xH100).
-- The FSDP2 weight-cache contract test with optimizer steps on `dp_shard 2 x EP 2`:
-  ap-TCBnqZV1beO55aH6SDxtBO (4xH100), ap-mkqekSW1wzK9nne3lsmOne (4xB200, 24 reserved SMs).
-- Bitwise parity of every selector default against its restore value, and JIT kernel names
-  and sources identical to the development branches modulo the package naming (SM90 and
-  SM100).
+- Two-GPU FP32-reference forward/backward validators, the FP8 combine validator with forced
+  ring wrap, and the forward FP32 reference on 2xH100; the in-kernel dW and MXFP8 validators
+  on one and two B200s; the native backward on 2xB200.
+- The FSDP2 weight-cache contract test with optimizer steps on `dp_shard 2 x EP 2`, 4xH100 and
+  4xB200 (24 reserved SMs), and the NVFP4 FSDP2 contract on 4xB200.
+- The dispatch mode's gradients against the `torch` backend on 2xH100 (grouped_mm, ScatterMoE
+  and SonicMoE, with and without LoRA, balanced and skewed): relative L2 0.0 after two
+  optimizer steps.
+- The SM90 kernels are byte-identical in SASS to the pre-integration build; the SM100 default
+  backward differs only by the padded-tail zeroing before the dW GEMMs.
 - The Axolotl parity test `tests/e2e/multigpu/test_ep_mono_ep.py` (EP2 x FSDP2 against the
   `torch` backend with optimizer steps).
 - Long-training convergence has only a loss-curve check: 2xH100, a 739M Qwen3-MoE, 300
