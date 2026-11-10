@@ -35,8 +35,12 @@ def run():
     physical = torch.cuda.get_device_properties(rank).multi_processor_count
     deep_gemm.set_num_sms(16)
     wrap = os.environ.get("MONO_EP_TEST_RING_WRAP") == "1"
-    tokens = 4096 if wrap else 137
-    hidden, inner, experts = 2048, 768, 128
+    tokens = int(os.environ.get("MONO_EP_TEST_TOKENS", 4096 if wrap else 137))
+    hidden, inner, experts = (
+        int(os.environ.get("MONO_EP_TEST_HIDDEN", "2048")),
+        int(os.environ.get("MONO_EP_TEST_INTERMEDIATE", "768")),
+        128,
+    )
     topk = int(os.environ.get("MONO_EP_TEST_TOPK", "8"))
     if topk not in (1, 8) or (wrap and topk != 8):
         raise ValueError("Use top-k 1 or 8; forced ring wrap requires top-k 8")
@@ -162,6 +166,8 @@ def run():
         json.dumps(
             dict(
                 rank=rank,
+                hidden=hidden,
+                intermediate=inner,
                 reference="BF16 per-route contributions independently FP8-quantized before sum",
                 return_buffer_bytes_saved=actual_savings,
                 poisoned_unused_return_capacity=True,

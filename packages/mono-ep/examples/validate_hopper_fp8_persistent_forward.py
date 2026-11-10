@@ -28,7 +28,12 @@ def _run_original_w1_parity(rank):
     from mono_ep.quantization import quantize_fp8
     from mono_ep.token_quantization import quantize_tokens
 
-    hidden, inner, experts, topk = 2048, 768, 128, 8
+    hidden, inner, experts, topk = (
+        int(os.environ.get("MONO_EP_TEST_HIDDEN", "2048")),
+        int(os.environ.get("MONO_EP_TEST_INTERMEDIATE", "768")),
+        128,
+        8,
+    )
     buffer = SymmBuffer(
         dist.group.WORLD, experts, 288, topk, hidden, inner, mma_type="fp8xbf16"
     )
@@ -130,6 +135,8 @@ def _run_original_w1_parity(rank):
             records.append(
                 dict(
                     rank=rank,
+                    hidden=hidden,
+                    intermediate=inner,
                     master_dtype=str(master_dtype),
                     step=step,
                     skewed=skewed,
@@ -182,7 +189,12 @@ def run():
         _run_original_w1_parity(rank)
         dist.destroy_process_group()
         return
-    hidden, inner, experts, topk = 2048, 768, 16, 4
+    hidden, inner, experts, topk = (
+        int(os.environ.get("MONO_EP_TEST_HIDDEN", "2048")),
+        int(os.environ.get("MONO_EP_TEST_INTERMEDIATE", "768")),
+        16,
+        4,
+    )
     buffer = SymmBuffer(
         dist.group.WORLD, experts, 256, topk, hidden, inner, mma_type="fp8xbf16"
     )
@@ -365,6 +377,8 @@ def run():
             json.dumps(
                 dict(
                     rank=rank,
+                    hidden=hidden,
+                    intermediate=inner,
                     step=step,
                     skew=skew,
                     tokens=tokens,

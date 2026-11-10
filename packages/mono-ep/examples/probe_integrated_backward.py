@@ -159,7 +159,13 @@ def run(args):
     dist.init_process_group("nccl", device_id=torch.device("cuda", 0))
     assert dist.get_world_size() == 1
     torch.manual_seed(881)
-    tokens, hidden, inner, experts, topk = 16384, 2048, 768, 16, 8
+    tokens, hidden, inner, experts, topk = (
+        args.tokens,
+        args.hidden,
+        args.intermediate,
+        args.experts,
+        8,
+    )
     runtime = PersistentMoE(
         dist.group.WORLD,
         experts,
@@ -350,6 +356,9 @@ def run(args):
                 intermediate=inner,
                 experts=experts,
                 topk=topk,
+                peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+                device_used_bytes=(lambda f, t: t - f)(*torch.cuda.mem_get_info()),
                 routed_rows=int(backend.counts.sum()),
                 padded_rows=int(backend.padded_counts.sum()),
                 timeout_handler=os.getenv("MONO_EP_SM90_FP8_TRAP_TIMEOUTS"),
@@ -375,4 +384,8 @@ if __name__ == "__main__":
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--ref-path", default="")
     parser.add_argument("--ref-tag", default="")
+    parser.add_argument("--tokens", type=int, default=16384)
+    parser.add_argument("--hidden", type=int, default=2048)
+    parser.add_argument("--intermediate", type=int, default=768)
+    parser.add_argument("--experts", type=int, default=16)
     run(parser.parse_args())

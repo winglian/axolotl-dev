@@ -55,7 +55,12 @@ def run():
     assert dist.get_world_size() == 2
     assert torch.cuda.get_device_properties(rank).major == 9
     torch.manual_seed(517 + rank)
-    hidden, inner, experts, topk = 2048, 768, 16, 4
+    hidden, inner, experts, topk = (
+        int(os.environ.get("MONO_EP_TEST_HIDDEN", "2048")),
+        int(os.environ.get("MONO_EP_TEST_INTERMEDIATE", "768")),
+        16,
+        4,
+    )
     buffer = SymmBuffer(
         dist.group.WORLD, experts, 256, topk, hidden, inner, mma_type="bf16xbf16"
     )
@@ -352,6 +357,8 @@ def run():
             json.dumps(
                 dict(
                     rank=rank,
+                    hidden=hidden,
+                    intermediate=inner,
                     compact_non_math_wg=compact,
                     trap_only_timeouts=trap_timeouts,
                     compute_dtype="blockwise_fp8",

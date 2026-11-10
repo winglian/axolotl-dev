@@ -206,6 +206,58 @@ def _four_layer_stack(
     )
 
 
+def _routed_tflop(tokens, hidden, inner, topk):
+    """Routed GEMM TFLOP per GPU: forward 2 GEMMs (3*H*I MACs per row), backward 2x, 2F+B 4x."""
+    forward = 2 * tokens * topk * 3 * hidden * inner / 1e12
+    return dict(
+        forward=forward,
+        backward=2 * forward,
+        recomputed_layer=3 * forward,
+        checkpointed_layer=4 * forward,
+    )
+
+
+def _time_weight_build(w1, w2, world):
+    """One fused SM90 FP8 weight-forms build (what a cache miss pays), timed directly on the GPU."""
+    from mono_ep.sm90_weight_forms import _fusable, quantize_all_forms
+
+    if not _fusable(w1, w2):
+        return dict(error="weights not fusable")
+    for _ in range(3):
+        forms = quantize_all_forms(w1, w2)
+    form_bytes = sum(
+        t.numel() * t.element_size() for pair in forms.values() for t in pair
+    )
+    del forms
+    samples, gathered = [], torch.empty(world, device="cuda", dtype=torch.float64)
+    for _ in range(15):
+        begin, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        torch.cuda.synchronize()
+        begin.record()
+        forms = quantize_all_forms(w1, w2)
+        end.record()
+        torch.cuda.synchronize()
+        del forms
+        dist.all_gather_into_tensor(
+            gathered,
+            torch.tensor([begin.elapsed_time(end)], device="cuda", dtype=torch.float64),
+        )
+        samples.append(max(gathered.tolist()))
+    # w1_paired and w1_interleaved share one scale tensor.
+    shared_scale = w1.shape[0] * (w1.shape[1] // 128) * (w1.shape[2] // 128) * 4
+    return dict(
+        samples_max_rank_ms=samples,
+        median_max_rank_ms=statistics.median(samples),
+        samples=len(samples),
+        warmups=3,
+        form_bytes_per_entry=form_bytes - shared_scale,
+        scope="quantize_all_forms(w1, w2) alone, CUDA events, FP32 masters, after the timed loop",
+    )
+
+
 def run(
     profile=False,
     compute_dtype="bf16",
@@ -224,6 +276,9 @@ def run(
     routing="balanced",
     bump_versions=False,
     four_layer_variants="",
+    geometry=(16384, 2048, 768, 128, 8),
+    shape_name="qwen3_30b_a3b",
+    time_weight_build=False,
 ):
     variant_envs = _parse_variants(variants)
     four_layer_envs = _parse_variants(four_layer_variants)
@@ -258,7 +313,7 @@ def run(
     dist.init_process_group("nccl", device_id=torch.device("cuda", rank))
     world = dist.get_world_size()
     assert world == 8
-    tokens, hidden, inner, experts, topk = 16384, 2048, 768, 128, 8
+    tokens, hidden, inner, experts, topk = geometry
     torch.manual_seed(812 + rank)
     x = torch.randn(
         tokens, hidden, device="cuda", dtype=torch.bfloat16
@@ -392,6 +447,14 @@ def run(
                 expanded.append(case)
         cases = expanded
     managed_env = {key for _, env in variant_envs for key in env}
+    # Cases without a variant (the NCCL control) run in the launch environment, not with it cleared.
+    launch_env = {key: os.environ[key] for key in managed_env if key in os.environ}
+
+    def reset_managed_env():
+        for key in managed_env:
+            os.environ.pop(key, None)
+        os.environ.update(launch_env)
+
     captured = {}
     variant_parity = {}
     times = {label: [] for _, _, _, _, _, _, _, _, _, label in cases}
@@ -448,8 +511,7 @@ def run(
             label,
         ) in cases if iteration % 2 == 0 else cases[::-1]:
             _select_kernel_layouts(forward_layout, backward_layout)
-            for key in managed_env:
-                os.environ.pop(key, None)
+            reset_managed_env()
             os.environ.update(case_env.get(label, {}))
             runtime.fuse_activation = fused
             runtime._peer_backward = (
@@ -545,8 +607,13 @@ def run(
             )
         variant_parity[f"{variant_name}_vs_{variant_envs[0][0]}/{scope}"] = entry
     captured.clear()
-    for key in managed_env:
-        os.environ.pop(key, None)
+    reset_managed_env()
+    weight_build = None
+    if time_weight_build:
+        try:
+            weight_build = _time_weight_build(w1, w2, world)
+        except Exception as error:  # noqa: BLE001
+            weight_build = dict(error=repr(error))
     four_layer = None
     if four_layer_envs:
         try:
@@ -565,6 +632,9 @@ def run(
             )
         except Exception as error:  # noqa: BLE001
             four_layer = dict(error=repr(error))
+    free, total = torch.cuda.mem_get_info()
+    device_used = torch.tensor([total - free], device="cuda", dtype=torch.int64)
+    dist.all_reduce(device_used, op=dist.ReduceOp.MAX)
     if not profile:
         memory_tensor = torch.tensor(
             list(peak_memory.values()), device="cuda", dtype=torch.int64
@@ -575,12 +645,16 @@ def run(
         print(
             json.dumps(
                 dict(
-                    benchmark="qwen3_30b_a3b_persistent_training",
+                    benchmark=f"{shape_name}_persistent_training",
+                    shape_name=shape_name,
                     device=torch.cuda.get_device_name(),
+                    routed_tflop_per_gpu=_routed_tflop(tokens, hidden, inner, topk),
+                    sm90_weight_forms_build=weight_build,
                     torch_version=torch.__version__,
                     world_size=world,
                     routing=routing,
                     variants={name: env for name, env in variant_envs},
+                    launch_env=launch_env,
                     variant_parity_first_measured_iteration=variant_parity,
                     bump_versions_every_step=bump_versions,
                     four_layer_stack=four_layer,
@@ -628,11 +702,16 @@ def run(
                         if compute_dtype == "blockwise"
                         else compute_dtype
                     ),
-                    prime_reference_ms={
-                        "forward": 3.9,
-                        "backward": 8.2,
-                        "checkpointed_layer": 15.9,
-                    },
+                    prime_reference_ms=(
+                        {
+                            "forward": 3.9,
+                            "backward": 8.2,
+                            "checkpointed_layer": 15.9,
+                        }
+                        if (tokens, hidden, inner, experts, topk)
+                        == (16384, 2048, 768, 128, 8)
+                        else None
+                    ),
                     prime_precision_matched=False,
                     native_backward_input_transport=(
                         "fp8"
@@ -692,6 +771,8 @@ def run(
                     measured_iterations=15,
                     timing="host_wall_synchronized_maximum_rank",
                     workspace_bytes=workspace,
+                    device_used_bytes_max_rank_at_end=int(device_used.item()),
+                    device_total_bytes=total,
                     peak_memory_bytes={
                         label: dict(allocated=value[0], reserved=value[1])
                         for label, value in peak_memory.items()
@@ -837,6 +918,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--routing", choices=("balanced", "skewed"), default="balanced")
     parser.add_argument("--bump-versions", action="store_true")
+    parser.add_argument("--tokens", type=int, default=16384, help="tokens per GPU")
+    parser.add_argument("--hidden", type=int, default=2048)
+    parser.add_argument("--intermediate", type=int, default=768)
+    parser.add_argument("--experts", type=int, default=128, help="total experts")
+    parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument("--shape-name", default="qwen3_30b_a3b")
+    parser.add_argument("--time-weight-build", action="store_true")
     parser.add_argument(
         "--four-layer-variants",
         default="",
@@ -916,4 +1004,7 @@ if __name__ == "__main__":
         args.routing,
         args.bump_versions,
         args.four_layer_variants,
+        (args.tokens, args.hidden, args.intermediate, args.experts, args.topk),
+        args.shape_name,
+        args.time_weight_build,
     )
