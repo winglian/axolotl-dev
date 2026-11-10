@@ -669,7 +669,7 @@ on hosted runners.
 
 Today `cicd/install_mono_ep.sh` installs `g++-13` + `libdw-dev`, fetches CUTLASS/DeepJIT, and
 compiles `vendor/deepgemm` with `DG_FORCE_BUILD=1 --no-build-isolation` inside every Modal lane that
-needs it (`gpu_slow.sh` ×2, `cicd_blackwell.sh`; `cicd_cuda_kernels.sh` only does the `--no-deps`
+needs it (`gpu_slow.sh` ×2, `cicd_mono_ep_blackwell.sh`; `cicd_cuda_kernels.sh` only does the `--no-deps`
 install of `packages/mono-ep` and relies on the lane image). Replacement:
 
 | step | what | effort |
@@ -729,7 +729,7 @@ Verified (read from source, docs, or measured):
 Assumptions (not verified in this session):
 
 - The CUDA-kernels Modal lane obtains `deep_gemm` from its image rather than from
-  `install_mono_ep.sh` (no Dockerfile reference found; only `gpu_slow.sh` and `cicd_blackwell.sh`
+  `install_mono_ep.sh` (no Dockerfile reference found; only `gpu_slow.sh` and `cicd_mono_ep_blackwell.sh`
   call the script).
 - `manylinux_2_28` + GCC 13 + `std::format` passes the Hub's GLIBCXX <= 3.4.24 rule; if not, the
   host code uses `fmt` or `snprintf` for the JIT source formatting.
