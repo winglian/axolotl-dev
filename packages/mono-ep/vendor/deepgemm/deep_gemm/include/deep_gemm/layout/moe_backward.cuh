@@ -19,8 +19,12 @@ struct MoEBackwardBuffers {
     float *sx_col = nullptr, *sdy_col = nullptr, *sh_col = nullptr, *sdz_col = nullptr;
     uint32_t* expert_padded_counts = nullptr;
     SymBuffer<> dy_sf;
-    // NVFP4 backward: `[K / 64][pool rows]` UE4M3 scale words for the packed `qx/qdy/qdz` pools and
-    // the per-row dy/dz scales
+};
+
+// NVFP4 backward: `[K / 64][pool rows]` UE4M3 scale words for the packed `qx/qdy/qdz` pools and the
+// per-row dy/dz scales. A separate type so the kernels taking `MoEBackwardBuffers` keep their
+// parameter layout.
+struct MoEBackwardNvfp4Buffers : MoEBackwardBuffers {
     uint32_t *nv_sx = nullptr, *nv_sdy = nullptr, *nv_sdz = nullptr;
     float *nv_rdy = nullptr, *nv_rdz = nullptr;
     uint32_t nv_pool_rows = 0;

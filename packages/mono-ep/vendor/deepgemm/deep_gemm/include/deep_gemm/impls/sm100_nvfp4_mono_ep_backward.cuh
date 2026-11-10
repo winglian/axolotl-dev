@@ -77,7 +77,7 @@ sm100_nvfp4_mono_ep_backward_impl(void* y,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_dh_weights_sf,
                          const float* expert_scales,
                          const uint8_t* sm_locality_domains, __nv_bfloat16* saved_z,
-                         const __grid_constant__ layout::MoEBackwardBuffers backward) {
+                         const __grid_constant__ layout::MoEBackwardNvfp4Buffers backward) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     DG_STATIC_ASSERT(not kHasShared and kOwnMBlocks, "Backward requires owned routed blocks");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;

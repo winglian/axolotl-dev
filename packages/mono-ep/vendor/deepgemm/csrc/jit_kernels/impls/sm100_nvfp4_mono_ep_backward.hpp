@@ -186,12 +186,12 @@ static void instantiate() {{
 }}
 )", max_tokens, hidden, inner, experts * world, topk, kBlockK, ring_tokens, stages, pull, sms, world,
         phase_trace_ptr != 0 ? "true" : "false", options));
-    layout::MoEBackwardBuffers buffers{
+    layout::MoEBackwardNvfp4Buffers buffers{{
         layout::SymBuffer<>(dy_ptrs, rank), layout::SymBuffer<>(ds_ptrs, rank),
         reinterpret_cast<__nv_bfloat16*>(pools[0].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[1].data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(pools[2].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[3].data_ptr()),
         ds.data_ptr<float>(), reinterpret_cast<uint32_t*>(starts.data_ptr<int>()),
-        reinterpret_cast<uint32_t*>(counts.data_ptr<int>())};
+        reinterpret_cast<uint32_t*>(counts.data_ptr<int>())}};
     buffers.qx_pool = static_cast<uint8_t*>(fp4_pools[0].data_ptr());
     buffers.qdy_pool = static_cast<uint8_t*>(fp4_pools[1].data_ptr());
     buffers.qdz_pool = static_cast<uint8_t*>(fp4_pools[2].data_ptr());
