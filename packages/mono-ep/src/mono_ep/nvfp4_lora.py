@@ -12,10 +12,8 @@ from rank-``r`` grouped GEMMs on the BF16 pools. No base-weight gradients and
 no fp32 masters of the base.
 """
 
-import importlib
 import os
 import socket
-import sys
 import types
 from dataclasses import dataclass
 
@@ -28,17 +26,11 @@ POOL_BLOCK = 128
 
 
 def requant_modules():
-    """The packed requant kernels from the installed axolotl, or ``SONICMOE_DIR``
-    (a checkout of ``src/axolotl/integrations/kernels/libs/sonicmoe``)."""
-    path = os.environ.get("SONICMOE_DIR")
-    if path and "sonicmoe_lite" not in sys.modules:
-        pkg = types.ModuleType("sonicmoe_lite")
-        pkg.__path__ = [path]
-        sys.modules["sonicmoe_lite"] = pkg
-    name = "sonicmoe_lite" if path else "axolotl.integrations.kernels.libs.sonicmoe"
+    """The vendored packed requant kernel and references (``mono_ep.nvfp4_requant``)."""
+    from . import nvfp4_requant as pkg
+
     return types.SimpleNamespace(
-        requant=importlib.import_module(f"{name}.nvfp4_requant"),
-        triton_requant=importlib.import_module(f"{name}.triton_nvfp4_requant"),
+        requant=pkg.nvfp4_requant, triton_requant=pkg.triton_nvfp4_requant
     )
 
 

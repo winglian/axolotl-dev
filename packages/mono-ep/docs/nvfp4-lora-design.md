@@ -265,6 +265,17 @@ straight-through semantic the merge-aware path already has.
 
 ## 6. Requant cache and weight-cache epoch wiring
 
+Dependency direction (Wing, 2026-11-10): `packages/mono-ep` keeps no Axolotl
+import. The requant kernel, references and cache are a temporary copy in
+`mono_ep/nvfp4_requant/` taken from `features/nvfp4-requant-default` @
+227adde535; kernel-layout and transposed-output additions go on that copy
+(commits titled "NVFP4 requant: ..."), and a later follow-up replaces the
+Axolotl modules with imports from `mono_ep.nvfp4_requant`. The simpler
+step-keyed cache used by the kernel path lives in `mono_ep/nvfp4_lora.py`
+(`RequantCache` + `attach_post_step_hook`, invalidate-on-step); the vendored
+`nvfp4_requant_cache` (adapter version, step keys, side stream) is kept for the
+follow-up.
+
 - `nvfp4_lora` bypasses `weight_layouts` (the requant output already is the
   kernel layout). One `LayerRequant` per MoE layer builds `{w1, w2, w1t, w2t}`
   from the frozen base and the live adapters (`full_tensor()` on FSDP2

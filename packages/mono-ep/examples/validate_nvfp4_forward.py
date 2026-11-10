@@ -30,7 +30,9 @@ SCALING = 2.0
 
 
 def _sonicmoe():
-    """Import the NVFP4 helpers without executing the sonicmoe package ``__init__``."""
+    """Requant from the vendored ``mono_ep.nvfp4_requant``; fp4_cute and friends
+    from Axolotl's sonicmoe package (``SONICMOE_DIR`` or the installed axolotl)
+    without executing its ``__init__``."""
     path = os.environ.get("SONICMOE_DIR")
     if path and "sonicmoe_lite" not in sys.modules:
         pkg = types.ModuleType("sonicmoe_lite")
@@ -39,9 +41,11 @@ def _sonicmoe():
     name = "sonicmoe_lite" if path else "axolotl.integrations.kernels.libs.sonicmoe"
     import importlib
 
+    from mono_ep import nvfp4_requant as vendored
+
     return types.SimpleNamespace(
-        requant=importlib.import_module(f"{name}.nvfp4_requant"),
-        triton_requant=importlib.import_module(f"{name}.triton_nvfp4_requant"),
+        requant=vendored.nvfp4_requant,
+        triton_requant=vendored.triton_nvfp4_requant,
         quant=importlib.import_module(f"{name}.nvfp4_quant"),
         sf_layout=importlib.import_module(f"{name}.sf_layout"),
         name=name,
