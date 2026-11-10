@@ -17,7 +17,7 @@ from pathlib import Path
 
 import modal
 
-app = modal.App("axolotl-fsdp2-weight-cache")
+app = modal.App(os.environ.get("MONO_EP_MODAL_APP", "axolotl-fsdp2-weight-cache"))
 image = None
 if modal.is_local():
     from modal_validate import base_image

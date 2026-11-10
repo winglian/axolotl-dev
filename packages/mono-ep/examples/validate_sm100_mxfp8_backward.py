@@ -45,12 +45,32 @@ def dequantized(rows):
 
 
 def row_hash(rows, probe):
-    return rows[:, : probe.shape[0]].double() @ probe
+    """Exact integer hash of 16 BF16 values spread over the row (one per 32-column scale group)."""
+    columns = torch.arange(probe.shape[0], device=rows.device) * (
+        rows.shape[1] // probe.shape[0]
+    )
+    bits = rows[:, columns].contiguous().view(torch.int16).to(torch.int64) & 0xFFFF
+    return (bits * probe).sum(-1)
 
 
-def reference(x, dy, ids, scores, w1, w2, rank, local_experts):
-    """FP32 reference; returns dx, dscore, local dW1/dW2 and per (token, slot) h / dz of local experts."""
-    w1b, w2b = w1.bfloat16().float(), w2.bfloat16().float()
+def reference(x, dy, ids, scores, w1, w2, rank, local_experts, quantized=False):
+    """FP32 reference; returns dx, dscore, local dW1/dW2 and per (token, slot) h / dz of local experts.
+
+    ``quantized`` replays the MXFP8 kernel's quantization points exactly (x, dy and the weight forms
+    along their GEMM K, dz along 2I before dX), so its error measures the kernel, not the format.
+    """
+    if quantized:
+        x, dy = dequantized(x), dequantized(dy)
+        experts, two_i, hidden = w1.shape
+        w1f = dequantized(w1.reshape(-1, hidden)).float().view(w1.shape)
+        w2t = w2.transpose(1, 2).contiguous()
+        w2tf = dequantized(w2t.reshape(-1, hidden)).float().view(w2t.shape)
+        w1t = w1.transpose(1, 2).contiguous()
+        w1tf = dequantized(w1t.reshape(-1, two_i)).float().view(w1t.shape)
+    else:
+        w1f = w1.bfloat16().float()
+        w2tf = w2.bfloat16().float().transpose(1, 2)
+        w1tf = w1f.transpose(1, 2)
     dx = torch.zeros_like(x, dtype=torch.float32)
     ds = torch.zeros_like(scores)
     dw1 = torch.zeros(local_experts, *w1.shape[1:], device=x.device)
@@ -61,9 +81,9 @@ def reference(x, dy, ids, scores, w1, w2, rank, local_experts):
         if not rows.numel():
             continue
         xr, dyr = x[rows].float(), dy[rows].float()
-        z = (xr @ w1b[expert].T).bfloat16().float()
+        z = (xr @ w1f[expert].T).bfloat16().float()
         gate, up = z.chunk(2, dim=-1)
-        dh = (dyr @ w2b[expert]).bfloat16().float()
+        dh = (dyr @ w2tf[expert].T).bfloat16().float()
         sigmoid = gate.sigmoid()
         silu = gate * sigmoid
         s = scores[rows, slots, None]
@@ -71,7 +91,8 @@ def reference(x, dy, ids, scores, w1, w2, rank, local_experts):
         dz = torch.cat(
             (weighted * up * (sigmoid + silu * (1 - sigmoid)), weighted * silu), -1
         ).bfloat16()
-        dx.index_add_(0, rows, (dz.float() @ w1b[expert]).bfloat16().float())
+        dz_gemm = dequantized(dz) if quantized else dz
+        dx.index_add_(0, rows, (dz_gemm.float() @ w1tf[expert].T).bfloat16().float())
         ds[rows, slots] = (dh * silu * up).sum(-1)
         h = (silu * up * s).bfloat16()
         local = expert - rank * local_experts
@@ -81,6 +102,29 @@ def reference(x, dy, ids, scores, w1, w2, rank, local_experts):
             h_ref[local] = (rows, h)
             dz_ref[local] = (rows, dz)
     return dx, ds, dw1, dw2, h_ref, dz_ref
+
+
+def quantizer_parity(w1, w2):
+    """Compiled (default) vs Triton MXFP8 weight-form builders, bitwise."""
+    from mono_ep import weight_cache
+
+    out = {}
+    forms = {}
+    for flag in ("1", "0"):
+        os.environ["MONO_EP_SM100_MXFP8_COMPILED_QUANT"] = flag
+        weight_cache.invalidate_weight_caches()
+        forms[flag] = weight_cache.mxfp8_backward_weight_forms(w1, w2)
+    for name, a, b in zip(
+        weight_cache.MXFP8_BACKWARD_FORMS, forms["1"], forms["0"], strict=True
+    ):
+        out[name] = dict(
+            values=bool(torch.equal(a[0].view(torch.uint8), b[0].view(torch.uint8))),
+            scales=bool(torch.equal(a[1], b[1])),
+            scale_strides=list(a[1].stride()) == list(b[1].stride()),
+        )
+    os.environ.pop("MONO_EP_SM100_MXFP8_COMPILED_QUANT", None)
+    weight_cache.invalidate_weight_caches()
+    return out
 
 
 def run(args):
@@ -112,7 +156,9 @@ def run(args):
     w2_all = torch.randn(experts, HIDDEN, INNER, device="cuda") / INNER**0.5
     w1 = w1_all[rank * 16 : (rank + 1) * 16].contiguous()
     w2 = w2_all[rank * 16 : (rank + 1) * 16].contiguous()
-    probe = torch.randn(16, device="cuda", dtype=torch.float64)
+    parity = quantizer_parity(w1, w2)
+    print("MXPARITY " + json.dumps(parity), flush=True)
+    probe = torch.randint(1, 2**62, (16,), device="cuda", dtype=torch.int64) | 1
     records = []
     for routing in args.routings.split(","):
         torch.manual_seed(97 + rank)
@@ -138,6 +184,24 @@ def run(args):
         if world > 1:
             local = reference(x, dy, ids, scores, w1_all, w2_all, rank, 16)
             expected = (local[0], local[1], *expected[2:])
+        expected_q = None
+        if "mxfp8" in args.precisions:
+            expected_q = reference(
+                source_x,
+                source_dy,
+                source_ids,
+                source_scores,
+                w1_all,
+                w2_all,
+                rank,
+                16,
+                quantized=True,
+            )
+            if world > 1:
+                local = reference(
+                    x, dy, ids, scores, w1_all, w2_all, rank, 16, quantized=True
+                )
+                expected_q = (local[0], local[1], *expected_q[2:])
         deq_x, deq_dy = dequantized(source_x), dequantized(source_dy)
         for precision in args.precisions.split(","):
             os.environ[PRECISION_ENV] = precision
@@ -154,6 +218,14 @@ def run(args):
                 dw1=stats(dw1, expected[2]),
                 dw2=stats(dw2, expected[3]),
             )
+            errors_q = None
+            if precision == "mxfp8":
+                errors_q = dict(
+                    dx=stats(dx, expected_q[0]),
+                    dscore=stats(ds, expected_q[1]),
+                    dw1=stats(dw1, expected_q[2]),
+                    dw2=stats(dw2, expected_q[3]),
+                )
             # Pooled rows: map each pool row back to its source token by hashing the BF16 x pool row
             x_pool, dy_pool, h_pool, dz_pool = backend.pools[:4]
             src_x = deq_x if precision == "mxfp8" else source_x
@@ -162,6 +234,7 @@ def run(args):
             order = keys.argsort()
             sorted_keys = keys[order]
             h_actual, h_expected, dz_actual, dz_expected = [], [], [], []
+            hq_expected, dzq_expected = [], []
             transport_exact = True
             for local, (start, count) in enumerate(
                 zip(backend.starts.tolist(), backend.counts.tolist(), strict=True)
@@ -188,9 +261,23 @@ def run(args):
                 h_expected.append(h_ref[index])
                 dz_actual.append(dz_pool[start : start + count])
                 dz_expected.append(dz_ref[index])
+                if errors_q is not None:
+                    rows_q, hq_ref = expected_q[4][local]
+                    _, dzq_ref = expected_q[5][local]
+                    lookup_q = torch.full(
+                        (world * tokens,), -1, device="cuda", dtype=torch.long
+                    )
+                    lookup_q[rows_q] = torch.arange(rows_q.numel(), device="cuda")
+                    hq_expected.append(hq_ref[lookup_q[source_rows]])
+                    dzq_expected.append(dzq_ref[lookup_q[source_rows]])
             if h_actual:
                 errors["h"] = stats(torch.cat(h_actual), torch.cat(h_expected))
                 errors["dz"] = stats(torch.cat(dz_actual), torch.cat(dz_expected))
+                if errors_q is not None:
+                    errors_q["h"] = stats(torch.cat(h_actual), torch.cat(hq_expected))
+                    errors_q["dz"] = stats(
+                        torch.cat(dz_actual), torch.cat(dzq_expected)
+                    )
             counts = backend.counts
             used_pool_rows = int((((counts + 127) // 128) * 128).sum())
             ring_tokens = (
@@ -204,6 +291,7 @@ def run(args):
                 precision=precision,
                 tokens=tokens,
                 errors=errors,
+                errors_vs_quantized_operand_reference=errors_q,
                 transport_exact=transport_exact,
                 dx_reproducible=all(torch.equal(o[0], dx) for o in outputs),
                 finite=all(bool(torch.isfinite(t.float()).all()) for t in outputs[0]),

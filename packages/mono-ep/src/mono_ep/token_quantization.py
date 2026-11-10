@@ -3,6 +3,8 @@
 
 """Single-pass per-token E4M3 quantization with power-of-two scales."""
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -291,3 +293,29 @@ def quantize_persistent_mxfp8_into(x, q_out, s_out):
             enable_fp_fusion=False,
         )
     return q_out, s_out
+
+
+def _mx_rows(value):
+    """E4M3 values and UE8M0 exponents (int32) of rows along the last dim, bitwise as ``_quantize``."""
+    groups = value.float().unflatten(-1, (-1, 32))
+    amax = groups.abs().amax(-1).clamp_min(1.0e-4)
+    bits = (amax / 448.0).view(torch.int32)
+    exponent = (((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).int()).clamp(1, 254)
+    scale = (exponent << 23).view(torch.float32)
+    quantized = (groups / scale[..., None]).clamp(-448.0, 448.0)
+    return quantized.to(torch.float8_e4m3fn).flatten(-2), exponent
+
+
+def _mx_words(exponent):
+    """Pack four consecutive group exponents into one little-endian int32 word."""
+    e = exponent.unflatten(-1, (-1, 4))
+    return e[..., 0] | (e[..., 1] << 8) | (e[..., 2] << 16) | (e[..., 3] << 24)
+
+
+def compiled_mxfp8_enabled():
+    """``MONO_EP_SM100_MXFP8_COMPILED_QUANT``: build the MXFP8 backward weight forms with one
+    Inductor graph (``1``, default) or the Triton per-group kernel (``0``); both are bitwise identical."""
+    value = os.getenv("MONO_EP_SM100_MXFP8_COMPILED_QUANT", "1")
+    if value not in ("0", "1"):
+        raise ValueError("MONO_EP_SM100_MXFP8_COMPILED_QUANT must be 0 or 1")
+    return value == "1"

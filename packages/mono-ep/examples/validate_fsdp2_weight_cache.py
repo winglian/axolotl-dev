@@ -214,6 +214,19 @@ def run_case(args, case, mesh, flat, runner_factory, device):
             return tuple(store[n] for n in names)
 
         weight_cache.weight_layouts = frozen_layouts
+    original_mx_forms = getattr(weight_cache, "mxfp8_backward_weight_forms", None)
+    if case.get("freeze_mx"):
+        frozen_mx = {}
+
+        def frozen_mx_forms(w1, w2):
+            key = (w1.untyped_storage()._cdata, w2.untyped_storage()._cdata)
+            if key not in frozen_mx:
+                frozen_mx[key] = tuple(
+                    tuple(t.clone() for t in form) for form in original_mx_forms(w1, w2)
+                )
+            return frozen_mx[key]
+
+        weight_cache.mxfp8_backward_weight_forms = frozen_mx_forms
     ep, dp = mesh["ep"].size(), mesh["dp_shard"].size()
     local = EXPERTS // ep
     ep_rank, dp_rank = mesh["ep"].get_local_rank(), mesh["dp_shard"].get_local_rank()
@@ -316,6 +329,8 @@ def run_case(args, case, mesh, flat, runner_factory, device):
             if case.get("explicit_invalidate"):
                 weight_cache.invalidate_weight_caches()
     weight_cache.weight_layouts = original_layouts
+    if original_mx_forms is not None:
+        weight_cache.mxfp8_backward_weight_forms = original_mx_forms
     if hasattr(weight_cache, "set_weight_cache_epoch"):
         weight_cache.set_weight_cache_epoch(None)
     for k, v in saved_env.items():
@@ -377,6 +392,14 @@ def cases(weight_cache):
     hook_off = dict(env={"MONO_EP_WEIGHT_CACHE": "1"})
     return [
         detector,
+        dict(
+            name="detector_frozen_mxfp8_forms",
+            description="harness self-check: MXFP8 backward weight forms frozen at step 0 (must be stale)",
+            env={"MONO_EP_WEIGHT_CACHE": "1"},
+            global_hook=True,
+            freeze_mx=True,
+            expected="stale",
+        ),
         dict(
             name="round1_key_no_invalidate",
             description="round-1 key (MONO_EP_WEIGHT_CACHE_KEY=object), no invalidation, hook off",
@@ -476,6 +499,12 @@ def main():
     parser.add_argument("--tolerance", type=float, default=0.03)
     parser.add_argument("--only", default="")
     parser.add_argument(
+        "--precision",
+        choices=("bf16", "mxfp8"),
+        default="bf16",
+        help="MONO_EP_SM100_BACKWARD_PRECISION for every case",
+    )
+    parser.add_argument(
         "--reserved-sms",
         type=int,
         default=0,
@@ -483,6 +512,7 @@ def main():
     )
     args = parser.parse_args()
     fused = args.backend == "fused"
+    os.environ["MONO_EP_SM100_BACKWARD_PRECISION"] = args.precision
     rank = int(os.environ.get("LOCAL_RANK", "0"))
     if fused:
         torch.cuda.set_device(rank)
@@ -572,6 +602,7 @@ def main():
                     lr=args.lr,
                     tolerance=args.tolerance,
                     reserved_sms=args.reserved_sms,
+                    backward_precision=args.precision,
                     nccl_max_ctas=os.environ.get("NCCL_MAX_CTAS"),
                     cases=outputs,
                 )

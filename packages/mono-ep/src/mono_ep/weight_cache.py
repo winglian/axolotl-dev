@@ -404,7 +404,67 @@ def mxfp8_backward_weight_forms(w1, w2):
                 )
         return built
 
+    from .token_quantization import compiled_mxfp8_enabled
+
+    if compiled_mxfp8_enabled():
+        triton_build = build
+
+        def build(missing):
+            built = _compiled_mx_forms(w1, w2)
+            return (
+                dict(zip(MXFP8_BACKWARD_FORMS, built, strict=True))
+                if built
+                else triton_build(missing)
+            )
+
     if _mode() != "1":
         built = build(MXFP8_BACKWARD_FORMS)
         return tuple(built[name] for name in MXFP8_BACKWARD_FORMS)
     return cached_weight_forms(w1, w2, MXFP8_BACKWARD_FORMS, build)
+
+
+def _mx_weight_form(w):
+    """``prepare_persistent_mxfp8(w, weights=True)`` for ``[E, N, K]``: values, and the packed scale
+    words stored ``[E][K / 128][N]`` with N in UTCCP order, returned as an ``[E, N, K / 128]`` view."""
+    from .token_quantization import _mx_rows, _mx_words
+
+    experts, rows, _ = w.shape
+    values, exponent = _mx_rows(w)
+    words = _mx_words(exponent)
+    words = words.unflatten(1, (rows // 128, 4, 32)).transpose(2, 3).flatten(1, 3)
+    return values.contiguous(), words.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def _mx_forms(w1, w2):
+    g, n, k = w1.shape
+    half = n // 2
+    interleaved = torch.stack(
+        (
+            w1[:, :half].reshape(g, half // 8, 8, k),
+            w1[:, half:].reshape(g, half // 8, 8, k),
+        ),
+        2,
+    ).reshape(g, n, k)
+    return tuple(
+        _mx_weight_form(w)
+        for w in (interleaved, w2.transpose(1, 2), w1.transpose(1, 2))
+    )
+
+
+_COMPILED_MX: dict = {}
+
+
+def _compiled_mx_forms(w1, w2):
+    """All three MXFP8 forms from one Inductor graph (bitwise equal to the Triton builders)."""
+    function = _COMPILED_MX.get("fn")
+    if function is False:
+        return None
+    if function is None:
+        function = torch.compile(_mx_forms, dynamic=False)
+        _COMPILED_MX["fn"] = function
+    try:
+        return function(w1, w2)
+    except Exception:  # noqa: BLE001
+        _COMPILED_MX["fn"] = False
+        _STATS["compile_fallbacks"] += 1
+        return None

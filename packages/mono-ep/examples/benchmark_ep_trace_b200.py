@@ -199,6 +199,12 @@ def run(args):
         setattr(deep_gemm._C, NATIVE[d], wrap("native", originals[d]))
     deep_gemm.k_grouped_bf16_gemm_tn_contiguous = wrap("dw", original_wgrad)
     weight_cache.weight_layouts = wrap("layouts", original_layouts)
+    # MXFP8 backward (MONO_EP_SM100_BACKWARD_PRECISION=mxfp8): its own launcher and weight forms
+    original_mx = getattr(deep_gemm._C, "mxfp8_mono_ep_backward", None)
+    original_mx_forms = getattr(weight_cache, "mxfp8_backward_weight_forms", None)
+    if original_mx is not None:
+        deep_gemm._C.mxfp8_mono_ep_backward = wrap("native", original_mx)
+        weight_cache.mxfp8_backward_weight_forms = wrap("layouts", original_mx_forms)
 
     def bump():
         with torch.no_grad():
@@ -380,6 +386,9 @@ def run(args):
         setattr(deep_gemm._C, NATIVE[d], originals[d])
     deep_gemm.k_grouped_bf16_gemm_tn_contiguous = original_wgrad
     weight_cache.weight_layouts = original_layouts
+    if original_mx is not None:
+        deep_gemm._C.mxfp8_mono_ep_backward = original_mx
+        weight_cache.mxfp8_backward_weight_forms = original_mx_forms
     if rank == 0:
         print(
             "EPTRACE_JSON "

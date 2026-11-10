@@ -87,11 +87,13 @@ def _validate(world, args):
     info = _prepare(world)
     code, lines = _torchrun(world, "validate_sm100_mxfp8_backward.py", args)
     records = [json.loads(line[6:]) for line in lines if line.startswith("MXVAL ")]
+    parity = [json.loads(line[9:]) for line in lines if line.startswith("MXPARITY ")]
     jit = sorted(p.name for p in Path("/tmp/dg_jit_cache").glob("**/*") if p.is_dir())  # nosec B108
     return dict(
         **info,
         returncode=code,
         records=records,
+        quantizer_parity=parity,
         jit_kernels=jit[:50],
         tail="".join(lines[-80:]) if code else "",
     )
@@ -100,6 +102,27 @@ def _validate(world, args):
 @app.function(image=image, gpu="B200", cpu=16, memory=131072, timeout=5400)
 def validate_1(args):
     return _validate(1, args)
+
+
+def _trace(world, args):
+    info = _prepare(world)
+    code, lines = _torchrun(world, "benchmark_ep_trace_b200.py", args)
+    payload = [
+        json.loads(line[len("EPTRACE_JSON ") :])
+        for line in lines
+        if line.startswith("EPTRACE_JSON ")
+    ]
+    return dict(
+        **info,
+        returncode=code,
+        result=payload[-1] if payload else None,
+        tail="".join(lines[-80:]) if code else "",
+    )
+
+
+@app.function(image=image, gpu="B200", cpu=16, memory=131072, timeout=5400)
+def trace_1(args):
+    return _trace(1, args)
 
 
 @app.function(image=image, gpu="B200:2", cpu=32, memory=262144, timeout=5400)
@@ -112,6 +135,8 @@ def main(out: str, mode: str = "validate", world: int = 1, args: str = ""):
     parsed = args.split()
     if mode == "validate":
         result = (validate_1 if world == 1 else validate_2).remote(parsed)
+    elif mode == "trace" and world == 1:
+        result = trace_1.remote(parsed)
     else:
         raise ValueError(mode)
     result["modal_app_id"] = app.app_id

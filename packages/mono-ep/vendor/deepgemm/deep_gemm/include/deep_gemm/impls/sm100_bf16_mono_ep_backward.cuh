@@ -395,9 +395,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
-    constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
+    // MXFP8: the dispatch warps also stage and dequantize the pulled rows, so they take registers from the epilogue
+    constexpr uint32_t kNumDispatchRegisters = (kUseMoreEpilogueRegisters ? 48 : 96) + (kMXFP8 ? 32 : 0);
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 88;
-    constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 160;
+    constexpr uint32_t kNumEpilogueRegisters = (kUseMoreEpilogueRegisters ? 208 : 160) - (kMXFP8 ? 16 : 0);
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -632,13 +633,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             constexpr uint32_t kSFPoolRows = kNumRanks * kNumMaxTokensPerRank * kNumTopk + kNumExpertsPerRank * 128;
             const auto smem_x = pull_buffer.get_base_ptr();
             const auto smem_dy = math::advance_ptr(smem_x, kRowBytes);
-            const auto issue = [&](const PullRow& row, uint32_t& sf_word) {
-                if (cute::elect_one_sync()) {
-                    ptx::tma_load_1d(smem_x, row.src_x, pull_mbarrier, kRowBytes, kDispatchLoadHint);
-                    ptx::tma_load_1d(smem_dy, row.src_dy, pull_mbarrier, kRowBytes, kDispatchLoadHint);
-                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, 2 * kRowBytes);
-                }
-                __syncwarp();
+            const auto load_sf = [&](const PullRow& row, uint32_t& sf_word) {
                 if (lane_idx < kNumSFWords) {
                     sf_word = *sym_buffer.map(
                         buffer.input_sf_buffer.get_data_buffer(row.src_token_idx).template get_base_ptr<uint32_t>() + lane_idx, row.rank);
@@ -647,6 +642,15 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                         backward.dy_sf.template get_base_ptr<uint32_t*>() + static_cast<uint64_t>(row.src_token_idx) * kNumSFWords +
                         (lane_idx - kNumSFWords), row.rank);
                 }
+            };
+            const auto issue = [&](const PullRow& row, uint32_t& sf_word) {
+                if (cute::elect_one_sync()) {
+                    ptx::tma_load_1d(smem_x, row.src_x, pull_mbarrier, kRowBytes, kDispatchLoadHint);
+                    ptx::tma_load_1d(smem_dy, row.src_dy, pull_mbarrier, kRowBytes, kDispatchLoadHint);
+                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, 2 * kRowBytes);
+                }
+                __syncwarp();
+                load_sf(row, sf_word);
             };
             uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
             PullRow cur, next;
@@ -675,54 +679,80 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 if (cute::elect_one_sync()) {
                     ptx::tma_store_1d(backward.qx_pool + static_cast<uint64_t>(pool_token_idx) * kHidden, smem_x, kRowBytes);
+                    cute::tma_store_arrive();
                     ptx::tma_store_1d(backward.qdy_pool + static_cast<uint64_t>(pool_token_idx) * kHidden, smem_dy, kRowBytes);
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
 
-                // Scale words into the UTCCP-ordered (MN-major, 4 x 32 transposed) pools the GEMM loaders read
+                // Scale words into the UTCCP-ordered (MN-major, 4 x 32 transposed) pools the GEMM loaders read; they
+                // are written by the generic proxy and read by TMA
                 const uint32_t sf_row = (pool_token_idx / 128) * 128 + (pool_token_idx % 32) * 4 + (pool_token_idx % 128) / 32;
                 if (lane_idx < 2 * kNumSFWords) {
                     auto* sf_pool = reinterpret_cast<uint32_t*>(lane_idx < kNumSFWords ? backward.sx_pool : backward.sdy_pool);
                     sf_pool[static_cast<uint64_t>(lane_idx % kNumSFWords) * kSFPoolRows + sf_row] = cur_sf;
                 }
-
-                // Exact BF16 copies (E4M3 times a power of two) for the BF16 weight-gradient GEMMs; 8 values per lane
-                // and step keep the dispatch warps inside their register budget
-                #pragma unroll 1
-                for (uint32_t step = 0; step < 2 * kRowBytes / (8 * 32); ++ step) {
-                    const uint32_t op = step / (kRowBytes / (8 * 32));
-                    const uint32_t chunk = (step % (kRowBytes / (8 * 32))) * 32 + lane_idx;
-                    const uint32_t word = __shfl_sync(0xffffffff, cur_sf, op * kNumSFWords + chunk / 16);
-                    const float scale = __uint_as_float(((word >> (((chunk / 4) % 4) * 8)) & 0xffu) << 23);
-                    const auto packed = *reinterpret_cast<const uint2*>(
-                        static_cast<const uint8_t*>(op == 0 ? smem_x : smem_dy) + chunk * 8);
-                    uint32_t out[4];
-                    #pragma unroll
-                    for (uint32_t j = 0; j < 4; ++ j) {
-                        const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(
-                            static_cast<__nv_fp8x2_storage_t>(((j < 2 ? packed.x : packed.y) >> ((j % 2) * 16)) & 0xffffu), __NV_E4M3);
-                        const float2 value = __half22float2(*reinterpret_cast<const __half2*>(&raw));
-                        const auto bf16 = __float22bfloat162_rn(make_float2(value.x * scale, value.y * scale));
-                        out[j] = *reinterpret_cast<const uint32_t*>(&bf16);
-                    }
-                    *reinterpret_cast<uint4*>((op == 0 ? backward.x_pool : backward.dy_pool) +
-                        static_cast<uint64_t>(pool_token_idx) * kHidden + chunk * 8) = make_uint4(out[0], out[1], out[2], out[3]);
-                }
-
-                // The scale words were written by the generic proxy and are read by TMA
                 asm volatile("fence.proxy.async.global;" ::: "memory");
-                __syncwarp();
-                if (cute::elect_one_sync())
-                    cute::tma_store_wait<0>();
+
+                // Per operand: stage this lane's bytes in registers, hand that half of the buffer to the next row's
+                // load, then write exact BF16 copies (E4M3 times a power of two) for the BF16 weight-gradient GEMMs
+                constexpr uint32_t kNumChunksPerLane = kRowBytes / (16 * 32);
+                #pragma unroll 1
+                for (uint32_t op = 0; op < 2; ++ op) {
+                    const auto src = static_cast<const uint8_t*>(op == 0 ? smem_x : smem_dy);
+                    uint4 staged[kNumChunksPerLane];
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumChunksPerLane; ++ i)
+                        staged[i] = *reinterpret_cast<const uint4*>(src + (i * 32 + lane_idx) * 16);
+                    cutlass::arch::fence_view_async_shared();
+                    __syncwarp();
+                    if (has_next) {
+                        if (cute::elect_one_sync()) {
+                            if (op == 0) {
+                                cute::tma_store_wait<1>();
+                                ptx::tma_load_1d(smem_x, next.src_x, pull_mbarrier, kRowBytes, kDispatchLoadHint);
+                                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, 2 * kRowBytes);
+                            } else {
+                                cute::tma_store_wait<0>();
+                                ptx::tma_load_1d(smem_dy, next.src_dy, pull_mbarrier, kRowBytes, kDispatchLoadHint);
+                            }
+                        }
+                        __syncwarp();
+                    }
+                    auto* dst = (op == 0 ? backward.x_pool : backward.dy_pool) + static_cast<uint64_t>(pool_token_idx) * kHidden;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumChunksPerLane; ++ i) {
+                        const uint32_t chunk = i * 32 + lane_idx;
+                        const uint32_t word = __shfl_sync(0xffffffff, cur_sf, op * kNumSFWords + chunk / 8);
+                        const float scale = __uint_as_float(((word >> (((chunk / 2) % 4) * 8)) & 0xffu) << 23);
+                        const auto convert = [&](const uint32_t& packed) {
+                            uint32_t out[2];
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 2; ++ j) {
+                                const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(
+                                    static_cast<__nv_fp8x2_storage_t>((packed >> (j * 16)) & 0xffffu), __NV_E4M3);
+                                const float2 value = __half22float2(*reinterpret_cast<const __half2*>(&raw));
+                                const auto bf16 = __float22bfloat162_rn(make_float2(value.x * scale, value.y * scale));
+                                out[j] = *reinterpret_cast<const uint32_t*>(&bf16);
+                            }
+                            return make_uint2(out[0], out[1]);
+                        };
+                        auto* dst_vec = reinterpret_cast<uint2*>(dst + chunk * 16);
+                        dst_vec[0] = convert(staged[i].x);
+                        dst_vec[1] = convert(staged[i].y);
+                        dst_vec[2] = convert(staged[i].z);
+                        dst_vec[3] = convert(staged[i].w);
+                    }
+                }
                 __syncwarp();
                 if (has_next)
-                    issue(next, next_sf);
+                    load_sf(next, next_sf);
 
+                // Publish once the E4M3 rows are written (full completion, not only the shared-memory read)
                 if (cute::elect_one_sync()) {
-                    ptx::tma_store_wait<0>();
                     *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = cur.weight;
                     *workspace.get_token_src_metadata_ptr(pool_token_idx) = {cur.rank, cur.src_token_idx, cur.src_topk_idx};
+                    ptx::tma_store_wait<0>();
                     ptx::red_add_rel(
                         workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
                         cur.is_last_token ? BLOCK_M - (pool_token_idx % BLOCK_M) : 1u);
