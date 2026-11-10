@@ -35,6 +35,7 @@ repos:
             '--ini',
             '.bandit',
         ]
+        exclude: ^packages/mono-ep/(examples|tools)/
 -   repo: local
     hooks:
     -   id: check-cli-config-options
