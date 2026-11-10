@@ -95,21 +95,42 @@ adds are in [docs/trl-integration.md](docs/trl-integration.md).
 
 ## Benchmarks
 
-Qwen3-30B-A3B layer, expert parallel 8, 16,384 tokens per GPU, FP32 masters, `fullgraph`
-compiled, max-rank median ms over fifteen iterations; "2F+B" is the checkpointed layer step
-(forward, recomputed forward, backward), router and optimizer excluded.
+One MoE layer at expert parallel 8 (16,384 tokens per GPU, 128 experts, top-8, FP32 masters,
+`fullgraph` compiled), checkpointed layer step (forward, recomputed forward, backward) in
+max-rank median ms; router and optimizer excluded. Qwen3-30B-A3B is hidden 2048 /
+intermediate 768, Qwen3-235B-A22B hidden 4096 / intermediate 1536.
 
-| Hardware | Precision | Shape | Forward | Backward | 2F+B | prime-rl 2F+B (8xH200 FP8) |
-|---|---|---|---:|---:|---:|---:|
-| 8xH200 | blockwise FP8 | 30B-A3B | 3.277 | 6.601 | 12.317 | 15.9 |
-| 8xH200 | blockwise FP8 | 235B-A22B | 8.447 | 21.124 | 37.333 | 43.7 |
-| 8xH100 | blockwise FP8 | 30B-A3B | 3.385 | 7.036 | 12.998 | not matched hardware |
-| 8xB200 | BF16 | 30B-A3B | 2.112 | 4.138 | 7.659 | not matched precision |
+| | 8xH200 30B-A3B | 8xH200 235B-A22B | 8xH100 30B-A3B | 8xB200 30B-A3B |
+|---|---:|---:|---:|---:|
+| mono-ep (FP8 on Hopper, BF16 on B200) | 12.3 | 37.3 | 13.0 | 7.7 |
+| mono-ep, routed TFLOPS per GPU (% of dense peak)¹ | 402 (20%) | 530 (27%) | 380 (19%) | 646 (29%) |
+| Mega MoE, Prime Intellect's published prime-rl numbers (FP8) | 15.9 | 43.7 | | |
+| Mega MoE, routed TFLOPS per GPU (% of dense peak)¹ | 311 (16%) | 453 (23%) | | |
+| torch all-to-all + DeepGEMM FP8, Prime Intellect's published baseline | 39.3 | 71.9 | | |
+| DeepEP + SonicMoE (20 SMs, Axolotl default) | | | 21.5 | 22.1 |
+| DeepEP + SonicMoE (SM-tuned: 40 H100 / 64 B200) | | | 17.6 | 12.8 |
+| torch all-to-all + SonicMoE (Axolotl `torch` backend) | | | 20.9 | 14.4 |
+| torch all-to-all + grouped_mm | | | 129.7 | 89.7 |
+| NCCL all-to-all backward behind the same forward (same-run control) | 46.5 | 107.1 | 49.6 | 24.5 |
 
-The same-run NCCL all-to-all control takes 46.5 ms (8xH200, 30B) and 24.5 ms (8xB200).
-Forward/backward splits per tuning round, skewed routing, the controls, the Modal run of
-every row, the validators and what these numbers do not measure are in
-[docs/benchmarks.md](docs/benchmarks.md).
+The Mega MoE and published-baseline rows are Prime Intellect's own measurements on 8xH200
+with the same shapes, routing and FP8 precision, not reruns. The DeepEP and torch rows come
+from separate jobs with BF16 expert weights (SonicMoE's dtype) on the same shape, routing and
+timing method (`dispatch_sonicmoe_contract_deep_ep_h100.json`,
+`dispatch_sonicmoe_contract_deep_ep_b200.json`), so the Hopper columns compare FP8 mono-ep
+against BF16 baselines. The 20-SM row is Axolotl's `deep_ep` backend as shipped, with its
+barrier before every combine (without it: 21.1 / 21.8); the SM-tuned row is the fastest SM
+count found in a sweep, which on B200 was still improving at 64. Mixture of
+Kittens (MoK) targets SM100/SM103 at EP16-64 and has not been run on this contract.
+¹ Routed GEMM FLOPs divided by the whole measured layer time. A forward is 2 x tokens x
+top-k x 3 x hidden x intermediate, a backward twice that (input and weight gradients), and
+the checkpointed step is forward + recomputed forward + backward, four forwards in all.
+Using the whole time means dispatch, combine, quantization and the backward kernel's
+internal gate/up recompute count against it. Dense peaks: 1,979 TFLOPS FP8 on H100/H200,
+2,250 TFLOPS BF16 on B200.
+
+Forward/backward splits and their TFLOPS, skewed routing, the Modal run behind every number,
+the validators and what these numbers do not measure are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## How it works
 
@@ -145,7 +166,7 @@ revision and local modification; the themes and the vendor name mapping are in
 - [SonicMoE](https://github.com/bdepyzy/sonic-moe) (Apache-2.0), with
   [quack](https://github.com/Dao-AILab/quack) and the CUTLASS DSL: the local expert kernels
   the prototype measured against and the extracted FP8 functional path.
-- Prime Intellect's prime-rl fused MoE kernels: the op contract this package follows and the
+- Prime Intellect's Mega MoE kernels in prime-rl: the op contract this package follows and the
   published 8xH200 numbers used as the comparison target.
 
 ## License
