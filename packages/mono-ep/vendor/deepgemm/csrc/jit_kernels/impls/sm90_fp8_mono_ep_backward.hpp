@@ -224,6 +224,10 @@ static void fp8_mono_ep_backward_sm90(
     const char* dist_trace_selector = std::getenv("MONO_EP_SM90_FP8_DIST_TRACE");
     const bool dist_trace = dist_trace_selector != nullptr and std::string_view(dist_trace_selector) == "1";
     DG_HOST_ASSERT(not dist_trace or (phase_trace_ptr != 0 and world <= 8));
+    // Tail scheduling bits: 1 = per-tile dX claims in the last-wave window, taken by idle CTAs;
+    // 2 = partial M blocks claimed last inside that window. 0 keeps the original claim order.
+    const int tail_mode = env_mode("MONO_EP_SM90_FP8_TAIL_SCHEDULE", 0, 3);
+    DG_HOST_ASSERT((tail_mode & 2) == 0 or experts <= 32);
     const auto activation = select_mono_ep_activation(not compact_non_math);
     const bool fast_pair = activation.kind == 1 and activation.limit_bits == 0x7f7fffffu;
     // 0 = the original SwiGLU-backward loop; 1 = score held in a lane and shuffled per row, activation from
@@ -252,10 +256,11 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(overlap_epilogue == 0 or mainloop_mode == 0);
     // Trailing template arguments after kDistTrace; with every selector off nothing is appended, so the
     // instantiation text is unchanged.
-    const std::string activation_args = activation_loop == 0 and overlap_epilogue == 0 ? std::string() :
+    const std::string activation_args = activation_loop == 0 and overlap_epilogue == 0 and tail_mode == 0 ? std::string() :
         std::format(", {}u, 0x{:08x}u, 0x{:08x}u, {}u, {}u", activation.kind, activation.alpha_bits,
                     activation.limit_bits, activation_loop, activation_chunk) +
-        (overlap_epilogue != 0 ? std::format(", {}u", overlap_epilogue) : std::string());
+        (overlap_epilogue != 0 or tail_mode != 0 ? std::format(", {}u", overlap_epilogue) : std::string()) +
+        (tail_mode != 0 ? std::format(", {}u", tail_mode) : std::string());
     const std::string trailing_args = dist_trace or not activation_args.empty() ?
         std::string(dist_trace ? ", true" : ", false") + activation_args : std::string();
     // 2 = role-scoped setmaxnreg plus a split math region before the combine (removes C7507 and the
@@ -295,7 +300,8 @@ static void fp8_mono_ep_backward_sm90(
                 (activation_loop != 0 ? std::format("_actloop{}c{}", activation_loop, activation_chunk) +
                     (activation.is_default() ? std::string("_act0") : activation.tag()) : std::string()) +
                 (overlap_epilogue != 0 ? std::format("_overlap{:x}", overlap_epilogue) : std::string()),
-            split_combine_registers ? "_rolereg_split" : role_registers ? "_rolereg" : ""),
+            std::string(split_combine_registers ? "_rolereg_split" : role_registers ? "_rolereg" : "") +
+                (tail_mode != 0 ? std::format("_tail{}", tail_mode) : std::string())),
         std::format(R"({}{}
 #include <deep_gemm/impls/sm90_fp8_mono_ep_backward.cuh>
 static void instantiate() {{

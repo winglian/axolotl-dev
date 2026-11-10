@@ -20,6 +20,27 @@ def _median(values):
     return statistics.median(values) if values else None
 
 
+def cta_tail(h, ns_per_cycle):
+    """Per-CTA task-loop end (clock64 mark 4 mapped onto each CTA's globaltimer start), ms after kernel start."""
+    start = h[:, 0].min()
+    end = (h[:, 0] - start + (h[:, 4] - h[:, 1]) * ns_per_cycle) / 1e6
+    kernel_end = float((h[:, 18].max() - start) / 1e6)
+    q = end.sort().values
+    median, mean, last = float(q.median()), float(q.mean()), float(q[-1])
+    return dict(
+        first=float(q[0]),
+        p10=float(q[int(0.1 * (len(q) - 1))]),
+        median=median,
+        mean=mean,
+        p90=float(q[int(0.9 * (len(q) - 1))]),
+        last=last,
+        kernel_end=kernel_end,
+        tail_median_to_last=last - median,
+        tail_mean_to_last=last - mean,
+        spread_first_to_last=last - float(q[0]),
+    )
+
+
 def summarize_trace(trace):
     """Convert one iteration's raw per-CTA trace into milliseconds."""
     t = trace.double()
@@ -87,6 +108,7 @@ def summarize_trace(trace):
         "dispatch_rows_per_cta": h[:, 60],
     }
     summary = {
+        "cta_tail_ms": cta_tail(h, ns_per_cycle),
         "median_over_ctas_ms": {k: float(v.median()) for k, v in per_cta.items()},
         "mean_over_ctas_ms": {k: float(v.mean()) for k, v in per_cta.items()},
         "max_over_ctas_ms": {k: float(v.max()) for k, v in per_cta.items()},

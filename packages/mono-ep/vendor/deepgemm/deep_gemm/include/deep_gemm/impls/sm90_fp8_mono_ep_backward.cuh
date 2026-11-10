@@ -95,6 +95,7 @@ template <
     uint32_t kActivationLoop = 0,
     uint32_t kActivationChunk = 0,
     uint32_t kOverlapEpilogue = 0,
+    uint32_t kTailMode = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -133,6 +134,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                          const float* w1_scales, const float* w2t_scales, const float* w1t_scales) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     DG_STATIC_ASSERT(not kHasShared and kOwnMBlocks, "Backward requires owned routed blocks");
+    DG_STATIC_ASSERT(kTailMode <= 3 and kNumRingBlocks <= layout::MonoEPSignals::kNumMaxRingBlocks / 2, "Invalid tail mode");
     DG_STATIC_ASSERT(not kCacheDz or kCacheActivations, "dZ cache requires cached activation staging");
     DG_STATIC_ASSERT(not kVectorXdyPack or (kTransportFP8 and kCacheActivations),
                      "Vectorized x/dy pack reads the cached FP8 pools");
@@ -1122,6 +1124,10 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                     *workspace.get_l1_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
                     *workspace.get_l2_full_mask_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
                     *workspace.get_l2_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    if constexpr ((kTailMode & 1u) != 0) {
+                        *workspace.get_tail_dx_claim_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                        *workspace.get_tail_dz_ready_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    }
                 }
                 __syncwarp();
             }
@@ -1280,7 +1286,7 @@ sm90_fp8_mono_ep_backward_impl(void* y,
     } else if (not kCompactNonMath and warp_idx == kNumDispatchWarps + 2) {
     } else if (warp_idx == kNumDispatchWarps + (kCompactNonMath ? 2 : 3)) {
         if constexpr (kOwnMBlocks)
-            scheduler.template mainloop_owned<true>();
+            scheduler.template mainloop_owned<true, kTailMode>();
         else
             scheduler.mainloop(num_tokens, sm_locality_domains);
 #if DG_MonoEP_ROLE_SCOPED_REGISTERS
@@ -2524,6 +2530,12 @@ sm90_fp8_mono_ep_backward_impl(void* y,
                 if (epilogue_thread_idx == 0) {
                     L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
                     ptx::red_add(workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                    // The last recompute task of the block follows every other arrive of this thread
+                    if constexpr ((kTailMode & 1u) != 0) {
+                        if (task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
+                            task_info.n_cluster_idx + 1 == kIntermediateHidden / BLOCK_N)
+                            ptx::red_add_rel(workspace.get_tail_dz_ready_count_ptr(ring_block_idx), 1u);
+                    }
                 }
                 if (task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
                     task_info.n_cluster_idx + 1 == kIntermediateHidden / BLOCK_N) {

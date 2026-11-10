@@ -461,16 +461,103 @@ struct MonoEPScheduler {
         }
     }
 
-    template <bool kBackward = false>
+    // Tail window: the last claimed M blocks, at most one per ring slot so per-slot counters are unique.
+    static constexpr uint32_t kNumTailWindowBlocks = cute::min(kNumSMs, kNumRingBlocks);
+
+    // Claim index -> pool block inside the tail window: full blocks in pool order, then partial
+    // blocks by decreasing row count. The window spans at most one ring generation, so the dispatch
+    // order (pool order) can never wait on a block that is claimed later.
+    CUTLASS_DEVICE uint32_t get_tail_ordered_m_block(const uint32_t& claim_idx, const uint32_t& tail_begin) const {
+        DG_STATIC_ASSERT(kNumExpertsPerLane == 1, "Tail ordering keeps one expert per lane");
+        if (claim_idx < tail_begin)
+            return claim_idx;
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        const uint32_t count = lane_idx < kNumExpertsPerRank ? stored_num_tokens_per_expert[0] : 0;
+        const uint32_t num_blocks = math::ceil_div(count, BLOCK_M);
+        const uint32_t last = math::warp_inclusive_sum(num_blocks, lane_idx) - 1;
+        const uint32_t rows = count % BLOCK_M;
+        const bool partial = num_blocks > 0 and rows != 0 and last >= tail_begin;
+        const uint32_t partial_mask = __ballot_sync(0xffffffff, partial);
+        const uint32_t num_full = num_total_m_blocks - tail_begin - __popc(partial_mask);
+        const uint32_t j = claim_idx - tail_begin;
+        if (j < num_full) {
+            uint32_t p = tail_begin + j;
+            while (true) {
+                const uint32_t q = tail_begin + j + __popc(__ballot_sync(0xffffffff, partial and last <= p));
+                if (q == p) break;
+                p = q;
+            }
+            return p;
+        }
+        uint32_t rank = 0;
+        for (uint32_t mask = partial_mask; mask; mask &= mask - 1) {
+            const uint32_t other = __ffs(mask) - 1;
+            const uint32_t other_rows = __shfl_sync(0xffffffff, rows, other);
+            const uint32_t other_last = __shfl_sync(0xffffffff, last, other);
+            rank += other_rows > rows or (other_rows == rows and other_last < last);
+        }
+        const uint32_t owner = __ballot_sync(0xffffffff, partial and rank == j - num_full);
+        return __shfl_sync(0xffffffff, last, __ffs(owner) - 1);
+    }
+
+    // After the M blocks run out, take dX tiles of tail-window blocks whose dZ is complete. Readiness
+    // is the per-slot generation count, not the L2 full mask: before the previous generation's
+    // recompute starts, the mask already holds this generation's "full" value.
+    template <uint32_t kNumDxTiles>
+    CUTLASS_DEVICE void steal_tail_dx_tiles(const uint32_t& tail_begin, const uint32_t& lane_idx) {
+        uint32_t backoff_ns = 64;
+        while (true) {
+            task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+            bool any_pending = false;
+            uint32_t chosen = 0xffffffffu;
+            for (uint32_t base = tail_begin; base < num_total_m_blocks; base += 32) {
+                const uint32_t block = base + lane_idx;
+                bool pending = false, ready = false;
+                if (block < num_total_m_blocks) {
+                    const uint32_t ring = block % kNumRingBlocks;
+                    pending = ptx::ld_volatile(workspace.get_tail_dx_claim_count_ptr(ring)) < kNumDxTiles;
+                    // Relaxed: only selects the block; the dX A loader's acquire of the L2 full mask orders dZ.
+                    ready = pending and ptx::ld_volatile(workspace.get_tail_dz_ready_count_ptr(ring)) > block / kNumRingBlocks;
+                }
+                any_pending |= __any_sync(0xffffffff, pending);
+                const uint32_t ready_mask = __ballot_sync(0xffffffff, ready);
+                if (ready_mask) {
+                    chosen = base + __ffs(ready_mask) - 1;
+                    break;
+                }
+            }
+            if (chosen != 0xffffffffu) {
+                const uint32_t n = get_next_local_task_idx(workspace.get_tail_dx_claim_count_ptr(chosen % kNumRingBlocks), 0);
+                if (n < kNumDxTiles)
+                    publish_task(create_task(BlockPhase::BackwardDx, chosen, n, L2_SHAPE_N, L1_SHAPE_N), lane_idx);
+                backoff_ns = 64;
+                continue;
+            }
+            if (not any_pending)
+                break;
+            __nanosleep(backoff_ns);
+            backoff_ns = cute::min(backoff_ns * 2, 1024u);
+        }
+    }
+
+    // kTailMode bits (backward only): 1 = dX tiles of tail-window blocks are claimed per tile and
+    // idle CTAs take them; 2 = partial blocks are claimed last inside the tail window.
+    template <bool kBackward = false, uint32_t kTailMode = 0>
     CUTLASS_DEVICE void mainloop_owned() {
         DG_STATIC_ASSERT(not kHasShared, "Owned blocks currently require routed experts only");
+        DG_STATIC_ASSERT(kBackward or kTailMode == 0, "Tail scheduling is backward-only");
         const auto lane_idx = ptx::get_lane_idx();
         fetch_expert_recv_count();
+        const uint32_t tail_begin = num_total_m_blocks > kNumTailWindowBlocks ? num_total_m_blocks - kNumTailWindowBlocks : 0;
         while (true) {
             task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
             // Claim only M blocks; all N tiles stay on this CTA cluster.
-            const auto m_block_idx = get_next_local_task_idx(workspace.get_l1_task_count_ptr(), 0);
-            if (m_block_idx >= num_total_m_blocks) break;
+            const auto claim_idx = get_next_local_task_idx(workspace.get_l1_task_count_ptr(), 0);
+            if (claim_idx >= num_total_m_blocks) break;
+            const uint32_t m_block_idx = [&]() -> uint32_t {
+                if constexpr ((kTailMode & 2u) != 0) return get_tail_ordered_m_block(claim_idx, tail_begin);
+                else return claim_idx;
+            }();
             auto emit = [&](BlockPhase phase, uint32_t n, uint32_t shape_n, uint32_t shape_k) {
                 task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
                 publish_task(create_task(phase, m_block_idx, n, shape_n, shape_k), lane_idx);
@@ -484,8 +571,19 @@ struct MonoEPScheduler {
                     emit(BlockPhase::BackwardRecomputeLow, n, L1_SHAPE_N, L1_SHAPE_K);
                     emit(BlockPhase::BackwardRecomputeHigh, n, L1_SHAPE_N, L1_SHAPE_K);
                 }
-                for (uint32_t n = 0; n < kNumL2Clusters; ++n)
-                    emit(BlockPhase::BackwardDx, n, L2_SHAPE_N, L1_SHAPE_N);
+                if ((kTailMode & 1u) and m_block_idx >= tail_begin) {
+                    DG_STATIC_ASSERT(not (kTailMode & 1u) or kNumCTAsPerCluster == 1, "Tail dX claims are per CTA");
+                    const auto claim_ptr = workspace.get_tail_dx_claim_count_ptr(m_block_idx % kNumRingBlocks);
+                    while (true) {
+                        task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+                        const uint32_t n = get_next_local_task_idx(claim_ptr, 0);
+                        if (n >= kNumL2Clusters) break;
+                        publish_task(create_task(BlockPhase::BackwardDx, m_block_idx, n, L2_SHAPE_N, L1_SHAPE_N), lane_idx);
+                    }
+                } else {
+                    for (uint32_t n = 0; n < kNumL2Clusters; ++n)
+                        emit(BlockPhase::BackwardDx, n, L2_SHAPE_N, L1_SHAPE_N);
+                }
             } else {
                 for (uint32_t n = 0; n < kNumL1Clusters; ++n)
                     emit(BlockPhase::Linear1, n, L1_SHAPE_N, L1_SHAPE_K);
@@ -493,6 +591,8 @@ struct MonoEPScheduler {
                     emit(BlockPhase::Linear2, n, L2_SHAPE_N, L2_SHAPE_K);
             }
         }
+        if constexpr (kTailMode & 1u)
+            steal_tail_dx_tiles<kNumL2Clusters>(tail_begin, lane_idx);
         task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
         publish_task(task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0), lane_idx);
     }

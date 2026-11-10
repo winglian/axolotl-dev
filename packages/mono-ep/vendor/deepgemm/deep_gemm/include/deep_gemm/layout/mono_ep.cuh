@@ -222,6 +222,19 @@ struct Workspace {
         return signals->l1_empty_count + ring_block_idx;
     }
 
+    // Tail dX-tile claim counters live in the unused upper half of `l1_full_count`
+    CUTLASS_DEVICE
+    uint32_t* get_tail_dx_claim_count_ptr(const uint32_t& ring_block_idx = 0) const {
+        return signals->l1_full_count + MonoEPSignals::kNumMaxRingBlocks / 2 + ring_block_idx;
+    }
+
+    // Per-slot count of M blocks whose dZ is complete (release-incremented once per generation),
+    // in the unused upper half of `l1_empty_count`
+    CUTLASS_DEVICE
+    uint32_t* get_tail_dz_ready_count_ptr(const uint32_t& ring_block_idx = 0) const {
+        return signals->l1_empty_count + MonoEPSignals::kNumMaxRingBlocks / 2 + ring_block_idx;
+    }
+
     CUTLASS_DEVICE
     uint64_t* get_l2_full_mask_ptr(const uint32_t& ring_block_idx = 0) const {
         return signals->l2_full_mask + ring_block_idx;

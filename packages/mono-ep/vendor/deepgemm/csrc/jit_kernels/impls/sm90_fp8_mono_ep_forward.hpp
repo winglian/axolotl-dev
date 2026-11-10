@@ -147,13 +147,18 @@ static void fp8_mono_ep_forward_sm90(
     const char* dist_trace_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_DIST_TRACE");
     const bool dist_trace = dist_trace_selector != nullptr and std::string_view(dist_trace_selector) == "1";
     DG_HOST_ASSERT(not dist_trace or (phase_trace_ptr != 0 and world <= 8));
+    // Vector combine scatter: 1 resolves all destinations before the first store, 3 also stores local rows first.
+    const char* scatter_selector = std::getenv("MONO_EP_SM90_FP8_FORWARD_SCATTER_MODE");
+    const int scatter_mode = scatter_selector == nullptr or *scatter_selector == '\0' ? 0 : std::atoi(scatter_selector);
+    DG_HOST_ASSERT(scatter_mode == 0 or ((scatter_mode == 1 or scatter_mode == 3) and vector_scatter));
     const auto activation = select_mono_ep_activation(not compact_non_math);
     // Trailing template arguments after kDistTrace; the default SwiGLU appends nothing, so the instantiation
     // text is unchanged.
-    const std::string trailing_args = dist_trace or activation.kind != 0 ?
+    const std::string trailing_args = dist_trace or activation.kind != 0 or scatter_mode != 0 ?
         std::string(dist_trace ? ", true" : ", false") +
-            (activation.kind != 0 ? std::format(", {}u, 0x{:08x}u", activation.kind, activation.alpha_bits)
-                                  : std::string()) : std::string();
+            (activation.kind != 0 or scatter_mode != 0 ? std::format(", {}u, 0x{:08x}u", activation.kind, activation.alpha_bits)
+                                  : std::string()) +
+            (scatter_mode != 0 ? std::format(", {}u", scatter_mode) : std::string()) : std::string();
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
     const int block_threads = compact_non_math ? 384 : 512;
@@ -175,6 +180,7 @@ static void fp8_mono_ep_forward_sm90(
                 (vector_swiglu ? "_vecswiglu" : "") + (vector_hquant ? "_vechquant" : "") +
                 (swizzle_accum ? "_swizzleacc" : "") + (relaxed_spins ? "_relaxedspins" : "") +
                 (mainloop_mode != 0 ? std::format("_mainloop{}", mainloop_mode) : std::string()) +
+                (scatter_mode != 0 ? std::format("_scatter{}", scatter_mode) : std::string()) +
                 (role_registers_mode == 2 ? "_rolereg_split" : role_registers_mode == 1 ? "_rolereg" : "") +
                 activation.tag()),
         std::format(R"({}{}

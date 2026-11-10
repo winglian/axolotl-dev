@@ -79,6 +79,7 @@ template <
     bool kDistTrace = false,
     uint32_t kActivation = 0,
     uint32_t kActivationAlphaBits = mono_ep_act::kDefaultAlphaBits,
+    uint32_t kScatterMode = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1584,8 +1585,42 @@ sm90_fp8_mono_ep_forward_impl(void* y,
                 constexpr uint32_t kNumElemsPerChunk = sizeof(uint4) / sizeof(d_dtype_t);
                 DG_STATIC_ASSERT(32 % kChunksPerRow == 0 and BLOCK_M % kRowsPerPass == 0, "Invalid vector scatter");
                 const uint32_t chunk = epilogue_thread_idx % kChunksPerRow;
+                // kScatterMode bit 1: resolve every pass's destination before the first store (the metadata
+                // loads would otherwise wait behind the peer stores they may alias); bit 2 then stores the
+                // rows bound for this rank first.
+                DG_STATIC_ASSERT(kScatterMode < 4 and (kScatterMode == 0 or (kScatterMode & 1u)), "Invalid scatter mode");
+                if constexpr (kScatterMode != 0) {
+                    constexpr uint32_t kNumPasses = BLOCK_M / kRowsPerPass;
+                    uint4* dst_ptrs[kNumPasses];
+                    [[maybe_unused]] uint32_t remote_mask = 0;
+                    #pragma unroll
+                    for (uint32_t pass = 0; pass < kNumPasses; ++ pass) {
+                        const uint32_t row = pass * kRowsPerPass + epilogue_thread_idx / kChunksPerRow;
+                        dst_ptrs[pass] = nullptr;
+                        if (row < valid_m) {
+                            const auto src = task_info.is_shared() ?
+                                layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + row, kNumTopk) :
+                                *workspace.get_token_src_metadata_ptr(pool_m_idx + row);
+                            auto dst = buffer.combine_token_buffer.get_rank_buffer(src.topk_idx).get_data_buffer(src.token_idx);
+                            dst_ptrs[pass] = reinterpret_cast<uint4*>(sym_buffer.map(
+                                dst.template get_base_ptr<d_dtype_t>() + n_idx + chunk * kNumElemsPerChunk, src.rank_idx));
+                            if constexpr (kScatterMode & 2u)
+                                remote_mask |= (src.rank_idx != sym_buffer.rank_idx ? 1u : 0u) << pass;
+                        }
+                    }
+                    #pragma unroll
+                    for (uint32_t sweep = 0; sweep < ((kScatterMode & 2u) ? 2u : 1u); ++ sweep) {
+                        #pragma unroll
+                        for (uint32_t pass = 0; pass < kNumPasses and not (kDiagAblate & 36u); ++ pass) {
+                            const uint32_t row = pass * kRowsPerPass + epilogue_thread_idx / kChunksPerRow;
+                            const bool selected = (kScatterMode & 2u) ? ((remote_mask >> pass) & 1u) == sweep : true;
+                            if (dst_ptrs[pass] != nullptr and selected)
+                                *dst_ptrs[pass] = *reinterpret_cast<const uint4*>(smem_d_chunk(row, chunk * kNumElemsPerChunk));
+                        }
+                    }
+                }
                 #pragma unroll
-                for (uint32_t pass = 0; pass < BLOCK_M / kRowsPerPass and not (kDiagAblate & 36u); ++ pass) {
+                for (uint32_t pass = 0; pass < BLOCK_M / kRowsPerPass and not (kDiagAblate & 36u) and kScatterMode == 0; ++ pass) {
                     const uint32_t row = pass * kRowsPerPass + epilogue_thread_idx / kChunksPerRow;
                     if (row < valid_m) {
                         const auto src = task_info.is_shared() ?
