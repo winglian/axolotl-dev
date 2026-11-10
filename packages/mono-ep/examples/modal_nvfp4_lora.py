@@ -116,6 +116,20 @@ def fsdp2_training():
     return _run("validate_nvfp4_fsdp2.py", 4, {"NCCL_MAX_CTAS": "8"}, 3400)
 
 
+@app.function(image=image, gpu="B200:8", cpu=32, memory=262144, timeout=7200)
+def timing(cases: str = ""):
+    runs = {}
+    for case in (cases or "qwen30b,beam").split(","):
+        runs[case] = _run(
+            "benchmark_nvfp4_lora_b200.py", 8, {"NVFP4_BENCH_CASE": case}, 3000
+        )
+    return dict(
+        returncode=max(r["returncode"] for r in runs.values()),
+        result={k: r["result"] for k, r in runs.items()},
+        tail="\n".join(f"== {k}\n{r['tail']}" for k, r in runs.items()),
+    )
+
+
 @app.local_entrypoint()
 def main(job: str = "forward", out: str = "", cases: str = ""):
     if job == "forward":
@@ -124,6 +138,8 @@ def main(job: str = "forward", out: str = "", cases: str = ""):
         result = backward_parity.remote(cases)
     elif job == "fsdp2":
         result = fsdp2_training.remote()
+    elif job == "timing":
+        result = timing.remote(cases)
     else:
         raise ValueError(job)
     result["modal_app_id"] = app.app_id
