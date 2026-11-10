@@ -28,6 +28,13 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 TOKENS, HIDDEN, INNER, EXPERTS, TOPK = 16384, 2048, 768, 128, 8
+SHAPE_NAME = "qwen3_30b_a3b"
+# ``--shape``: the layer geometry, tokens per GPU x hidden x intermediate x total experts x top-k
+SHAPES = {
+    "qwen3_30b_a3b": (16384, 2048, 768, 128, 8),
+    "qwen3_235b_a22b": (16384, 4096, 1536, 128, 8),
+    "beam": (16384, 5120, 2560, 256, 8),
+}
 WARMUP, MEASURED = 5, 15
 SCOPES = ("forward", "backward", "checkpointed_layer")
 # (label, backend, local kernel, mono_ep runtime): the original four variants, the legacy
@@ -1371,6 +1378,7 @@ def run(
                     "torch_version": torch.__version__,
                     "world_size": world,
                     "expert_parallel_size": world,
+                    "shape": SHAPE_NAME,
                     "tokens_per_gpu": TOKENS,
                     "hidden": HIDDEN,
                     "intermediate": INNER,
@@ -1487,7 +1495,19 @@ if __name__ == "__main__":
         default=None,
         help="comma-separated variant labels to keep (default: all)",
     )
+    parser.add_argument(
+        "--shape",
+        default="qwen3_30b_a3b",
+        help=f"one of {sorted(SHAPES)} or 'name:TxHxIxExK' (tokens per GPU, hidden, "
+        "intermediate, total experts, top-k)",
+    )
     args = parser.parse_args()
+    if args.shape in SHAPES:
+        SHAPE_NAME = args.shape
+        TOKENS, HIDDEN, INNER, EXPERTS, TOPK = SHAPES[args.shape]
+    else:
+        SHAPE_NAME, _, dims = args.shape.partition(":")
+        TOKENS, HIDDEN, INNER, EXPERTS, TOPK = (int(v) for v in dims.split("x"))
     if not args.worker:
         parser.error("run under torch.distributed.run with --worker")
     GAP_CPU = args.gap_cpu

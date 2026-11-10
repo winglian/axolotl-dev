@@ -10,7 +10,7 @@ checkpointed 2F+B) are interleaved per iteration, order reversed every other
 iteration; 5 warmups then 15 samples. Reports max-rank and mean-rank medians,
 peak memory, and the per-step weight rebuild cost of each LoRA variant
 (requant of the merged forms; for the baseline also the BF16 dequant its
-backward uses). ``NVFP4_BENCH_CASE`` selects ``qwen30b`` or ``beam``."""
+backward uses). ``NVFP4_BENCH_CASE`` selects ``qwen30b``, ``qwen235b`` or ``beam``."""
 
 import importlib.util
 import json
@@ -30,6 +30,7 @@ from validate_nvfp4_forward import _sonicmoe, routing  # noqa: E402
 CASES = {
     # tokens per GPU, hidden, intermediate, global experts, top-k
     "qwen30b": dict(tokens=16384, hidden=2048, inter=768, experts=128, topk=8),
+    "qwen235b": dict(tokens=16384, hidden=4096, inter=1536, experts=128, topk=8),
     "beam": dict(tokens=8192, hidden=5120, inter=2560, experts=256, topk=8),
 }
 RANK, SCALING = 16, 2.0
