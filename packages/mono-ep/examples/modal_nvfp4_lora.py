@@ -111,12 +111,19 @@ def backward_parity(cases: str = ""):
     return _run("validate_nvfp4_backward.py", 1, env, 3400)
 
 
+@app.function(image=image, gpu="B200:4", cpu=16, memory=131072, timeout=3600)
+def fsdp2_training():
+    return _run("validate_nvfp4_fsdp2.py", 4, {"NCCL_MAX_CTAS": "8"}, 3400)
+
+
 @app.local_entrypoint()
 def main(job: str = "forward", out: str = "", cases: str = ""):
     if job == "forward":
         result = forward_parity.remote(cases)
     elif job == "backward":
         result = backward_parity.remote(cases)
+    elif job == "fsdp2":
+        result = fsdp2_training.remote()
     else:
         raise ValueError(job)
     result["modal_app_id"] = app.app_id
