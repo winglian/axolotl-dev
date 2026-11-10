@@ -38,10 +38,12 @@ Allocations (Modal app, commit, device asserted in-process before the first row)
 | 8xH200 | ap-8NiyZxNCgoy9sN6CVq0J7y | ef76fd6804 | preflight all-to-all 311.6 GB/s |
 | 8xH100 (`H100!`) | ap-QcAVGSp7VUaUBjZYPBHEiB | ef76fd6804 | slow NVLink, see below |
 | 8xB200 | ap-rtKAANKTJOx3UX04OFsnQs | 2d6ef94f60 | about 3% slow, see below |
+| 8xB200, NVFP4 rows | ap-0oxG5Q7sNY60DrAtVxUXlp | 5e210e1a3 (NVFP4 backward default 2051) | preflight all-to-all 317.1 GB/s |
 
 `ef76fd6804` differs from `2d6ef94f60` only in three timing harnesses (path subsets for the
 80 GB H100, the dispatch contract's fused-row description); the package sources and the JIT
-kernels are identical.
+kernels are identical. The NVFP4 rows ran after the NVFP4 backward's lean recompute tail became
+the default; that change touches only the SM100 NVFP4 backward kernel, so the other rows stand.
 
 ## 8xH200 against Mega MoE
 
@@ -215,17 +217,40 @@ in separate processes, so they carry run-to-run noise rather than a paired diffe
 
 `precision="nvfp4_lora"` (frozen NVFP4 experts with LoRA) on 8xB200 against the BF16
 persistent path and two NVFP4 floors with an all-to-all around them (the fp4_cute grouped GEMM
-and the cuDNN frontend grouped NVFP4 GEMM), ms. The rebuild column is the per-step merged-weight
-requant per layer (`MONO_EP_NVFP4_REQUANT`). The Beam case runs 8,192 tokens per GPU:
+and the cuDNN frontend grouped NVFP4 GEMM), all resident in one process, ms. The rebuild column
+is the per-step merged-weight requant per layer (`MONO_EP_NVFP4_REQUANT`). The Beam case runs
+8,192 tokens per GPU. Own allocation (ap-0oxG5Q7sNY60DrAtVxUXlp), run after the NVFP4 backward
+default changed:
 
 | Shape (tokens per GPU) | Routing | nvfp4_lora F / B / 2F+B | BF16 persistent 2F+B | fp4_cute + all-to-all 2F+B | cuDNN grouped + all-to-all 2F+B | rebuild: `cuda` / Triton / `cuda_fused` |
 |---|---|---|---|---|---|---|
-| 30B-A3B (16,384) | balanced | 2.09 / 3.99 / 7.95 | 7.55 | 30.66 | 28.34 | 0.35 / 0.89 / 0.31 |
-| 30B-A3B (16,384) | skewed | 2.76 / 6.34 / 11.67 | 9.95 | 38.56 | 35.54 |  |
-| 235B-A22B (16,384) | balanced | 3.97 / 9.16 / 16.80 | 20.65 | 63.28 | 53.26 | 0.91 / 2.76 / 0.74 |
-| 235B-A22B (16,384) | skewed | 5.40 / 14.20 / 24.39 | 27.54 | 75.65 | 67.73 |  |
-| Beam (8,192) | balanced | 2.98 / 7.84 / 13.49 | 23.88 | 41.71 | 36.76 | 3.25 / 10.25 / 2.51 |
-| Beam (8,192) | skewed | 3.85 / 11.20 / 18.75 | 31.66 | 55.98 | 48.86 |  |
+| 30B-A3B (16,384) | balanced | 2.08 / 3.97 / 7.90 | 7.56 | 30.47 | 28.03 | 0.35 / 0.87 / 0.31 |
+| 30B-A3B (16,384) | skewed | 2.79 / 6.35 / 11.70 | 10.00 | 38.24 | 35.15 |  |
+| 235B-A22B (16,384) | balanced | 4.03 / 9.22 / 17.12 | 21.08 | 63.69 | 52.94 | 0.90 / 2.75 / 0.74 |
+| 235B-A22B (16,384) | skewed | 5.60 / 13.99 / 24.69 | 29.01 | 75.11 | 66.88 |  |
+| Beam (8,192) | balanced | 3.05 / 7.88 / 13.61 | 24.39 | 41.73 | 36.46 | 3.23 / 10.24 / 2.50 |
+| Beam (8,192) | skewed | 4.20 / 11.92 / 20.09 | 32.17 | 55.61 | 48.40 |  |
+
+The lean recompute tail (NVFP4 backward options bit 2048, the default) against the previous
+default 3, each on a runtime built the same way in a process with only NVFP4 runtimes, ms:
+
+| Shape (tokens per GPU) | Routing | lean tail, options 2051 (default): B / 2F+B | options 3 (before): B / 2F+B | backward change |
+|---|---|---|---|---:|
+| 30B-A3B (16,384) | balanced | 3.94 / 7.93 | 3.97 / 7.94 | -0.7% |
+| 30B-A3B (16,384) | skewed | 6.26 / 11.47 | 6.25 / 11.48 | +0.3% |
+| 235B-A22B (16,384) | balanced | 7.13 / 14.25 | 7.55 / 14.73 | -5.6% |
+| 235B-A22B (16,384) | skewed | 10.22 / 19.56 | 10.86 / 20.19 | -5.8% |
+| Beam (8,192) | balanced | 5.86 / 11.03 | 6.19 / 11.31 | -5.4% |
+| Beam (8,192) | skewed | 8.35 / 15.00 | 8.74 / 15.38 | -4.4% |
+
+The NVFP4 path is sensitive to what else is resident: with the BF16 runtimes and the
+all-to-all baselines in the same process its 2F+B is slower at the larger shapes (balanced, ms):
+
+| Shape | nvfp4_lora 2F+B, NVFP4 runtimes only | nvfp4_lora 2F+B, with the BF16 runtimes and all-to-all baselines resident |
+|---|---:|---:|
+| 30B-A3B | 7.92 | 7.90 |
+| 235B-A22B | 14.27 | 17.12 |
+| Beam | 11.03 | 13.61 |
 
 ## Hopper backward GEMM roofline
 
@@ -259,7 +284,11 @@ The three backward GEMMs alone on one H100 (prepacked, balanced, blockwise FP8),
   ring wrap, and the forward FP32 reference on 2xH100; the in-kernel dW and MXFP8 validators
   on one and two B200s; the native backward on 2xB200.
 - The FSDP2 weight-cache contract test with optimizer steps on `dp_shard 2 x EP 2`, 4xH100 and
-  4xB200 (24 reserved SMs), and the NVFP4 FSDP2 contract on 4xB200.
+  4xB200 (24 reserved SMs), and the NVFP4 FSDP2 contract on 4xB200 (rerun on the lean-tail
+  default: three AdamW steps, cached merged weights equal a fresh requant every step).
+- The NVFP4 LoRA backward on the lean-tail default against an FP32 reference on one B200: dx
+  relative error 0.267 / 0.267 / 0.263 and dscore 0.246 / 0.245 / 0.245 (30B balanced, 30B
+  skewed, Beam), unchanged from the previous default.
 - The dispatch mode's gradients against the `torch` backend on 2xH100 (grouped_mm, ScatterMoE
   and SonicMoE, with and without LoRA, balanced and skewed): relative L2 0.0 after two
   optimizer steps.
