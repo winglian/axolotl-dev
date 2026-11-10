@@ -159,6 +159,10 @@ runtime.destroy()
   whose backward is the fixed layout's `peer_dispatch_backward` with the saved slots).
   The `int()` of the count is a graph break, so compact mode is not fullgraph-compilable
   (the torch backend has the same break); the fixed layout stays sync-free.
+- Bounded compact (`compact=True, bounded=True`, section 5.7): `forward_bounded(x, idx, w,
+  num_local_experts, local_fn, key, row_bound)` runs dispatch, the caller's local kernel and
+  combine without draining the stream on the count; the Axolotl seam takes this path when
+  the runtime has `bounded` set.
 - Both calls are `torch.library` custom ops (`mono_ep::peer_dispatch`, `mono_ep::peer_combine`)
   with fake implementations; their backwards (`mono_ep::peer_dispatch_backward`,
   `mono_ep::peer_combine_backward`) are the same two transfers with the payloads swapped:
@@ -715,3 +719,107 @@ SM subset alongside compute on another stream, which this serialized backend nev
 while the streamed transfers take the whole GPU for ~0.5-1 ms per op; the overlap of the next
 layer's gather in section 4 is the dispatch mode's own headroom, and a compute-overlapped
 DeepEP would be the baseline to beat after that.
+
+### 5.7 Bounded compact receive: removing the count stall (2026-11-10)
+
+Branch `features/mono-ep-compact-nostall` on `features/mono-ep-dispatch-overlap` @ cdb7325efd
+(the overlap round's own options are not merged; their measurements are in the untracked
+development log).
+Artifacts (untracked): `benchmarks/dispatch_sonicmoe_contract_nostall_{h100,b200}.json`,
+`dispatch_sonicmoe_contract_nostall_smoke_h100.json`,
+`dispatch_sonicmoe_contract_nostall_smoke_gapcpu_h100.json`.
+
+**Design.** `MonoEPDispatchRuntime(compact=True, bounded=True)` and `forward_bounded`
+(`peer_dispatch.dispatch_bounded_moe`):
+
+1. `peer_dispatch_publish` as before (publish, barrier, routing, device prefix sum).
+2. The routed count goes to pinned host memory with a non-blocking copy and an event
+   (`AsyncCount`); nothing waits on it yet.
+3. `mono_ep::peer_dispatch_pull_bounded` pulls into `bound` rows, a host int: the routed rows
+   first in receive-row order (the same kernel, now with an output-row `limit` so a short
+   bound can never write past the buffer), then `zero_tail` zeroes the rows past the count
+   it reads on device, with `-1` ids, zero weights and slot 0.
+4. The caller's local kernel runs on those `bound` rows; sentinel rows are dropped by every
+   local kernel.
+5. Only then the host reads the count (the copy finished long ago; the event wait does not
+   drain the queue) and the combine runs on `local_out[:count]` with `slots[:count]`; the
+   pull's backward slices the gradients to `count` before `peer_dispatch_backward`. Both
+   transfers are therefore byte-for-byte compact mode's.
+
+`bound = row_bound(mark)` with `mark` the layer's high-water routed count. Marks are kept per
+layer key (`id(experts)`) as `[frozen, pending]`; a call records its count in `pending`,
+and `frozen` takes the pending maximum only at a call made outside the autograd backward
+(`torch._C._current_graph_task_id() == -1`). A non-reentrant checkpoint recompute runs inside
+the backward, so it always sees the bound its forward had, and the saved-tensor shapes
+match. A layer's first call (no mark) takes the exact host count, as compact mode does; a
+count above the bound re-pulls the exact rows and re-runs the local kernel (safe: the peers'
+`x` stays published until this rank reaches the combine barrier), counted in
+`runtime.bound_overflows`. For SonicMoE the seam passes
+`row_bound(mark) = ep_padded_rows(mark + E_local) - E_local`: SonicMoE pads the received
+rows plus `_pad_expert_rows`' rows to its own bucket anyway, so the bound fills that bucket.
+The local kernel then sees the same padded row count as with the exact count (identical quack
+keys and tile configs), and overflows only happen when the count crosses a bucket, which
+would also have changed compact mode's shapes.
+
+**Numerics.** Bitwise vs compact on y, dx, dscore, dgate_up and ddown, both routings, on 8 x
+H100 and 8 x B200 (`retime_bitwise_failures` empty, with the expert weight gradients added
+to the gate for this row), at EP2 on 2 x H100, and in the FSDP2 dp_shard 2 x EP 4 check
+(grouped_mm, two AdamW steps; dense and expert gradients bitwise). CPU simulation tests cover
+the exact first call, a tight bound, a widened bound, an overflow, and an overflow under a
+checkpoint recompute (`tests/test_peer_dispatch.py`). No overflow in the contract runs
+(the routing is stationary within each phase; the marks are cleared at the routing switch).
+
+**Where the compact idle comes from.** A profiled compact step on 8 x H100 showed about 3.9 ms of
+idle. `_decomposition` now lists the idle gaps with the kernel
+before and after each one and its offset into the step. On both GPUs, compact and bounded
+rows have one large gap between two `Memcpy DtoD` events at offset 0.0 ms: the first two
+device events of the profiled step (the publish copies), before the host has any lead. It
+does not show up with host-op tracing enabled (2 x H100 `--gap-cpu` run: largest gap
+0.26 ms) and is not in the unprofiled timing: the profiling overhead (profiled wall minus
+timed 2F+B) is 4.58 ms for compact vs 3.41 ms for DeepEP on H100, a 1.2 ms difference
+against a 3.9 ms gap. The count stall itself is the gap after `Memcpy DtoH (Device ->
+Pageable)` before `_pull_rows`: ~0.2 ms per dispatch, ~0.4 ms per checkpointed step. The
+table splits that idle accordingly.
+
+**EP8 contract (same rows and allocation per GPU, 5 warmups, 15 samples, median max-rank
+ms; idle = mean over ranks of one profiled checkpointed 2F+B).** "Step-start" is the offset-0
+gap above; "stall idle" is the rest; "after count" is the part behind the device-to-host
+count. 8 x H100 (Modal `ap-u57jzYtyxSFbY5pHpZn9xj`, 0.33 GPU-h):
+
+| variant | 2F+B bal | 2F+B skew | idle total | step-start | stall idle | after count | sync |
+|---|---|---|---|---|---|---|---|
+| compact (before) | 19.22 | 22.23 | 4.92 | 3.91 | **1.02** | 0.39 | 0.85 |
+| **bounded** (after) | **18.72** | **21.36** | 3.15 | 2.59 | **0.56** | 0.03 | 1.79 |
+| DeepEP, 40 SMs | 17.57 | 20.40 | 0.21 | 0 | 0.21 | 0 | 0 |
+| DeepEP, 64 SMs | 17.24 | 20.02 | 0.21 | 0 | 0.21 | 0 | 0 |
+| torch all-to-all | 20.85 | 23.53 | 4.89 | 0 | 4.89 | 0.19 | 0 |
+
+8 x B200 (Modal `ap-O0F3PmsfwBnZTjWsCzB25T`, 0.40 GPU-h; no other session's B200 app was
+running):
+
+| variant | 2F+B bal | 2F+B skew | idle total | step-start | stall idle | after count | sync |
+|---|---|---|---|---|---|---|---|
+| compact (before) | 12.50 | 13.51 | 3.86 | 1.53 | **2.33** | 0.43 | 3.02 |
+| **bounded** (after) | **11.91** | **12.60** | 1.03 | 0.45 | **0.58** | 0.04 | 2.44 |
+| DeepEP, 40 SMs | 14.89 | 16.86 | 0.28 | 0 | 0.28 | 0 | 0 |
+| DeepEP, 64 SMs | 12.94 | 14.09 | 0.94 | 0 | 0.94 | 0 | 0 |
+| torch all-to-all | 14.51 | 15.31 | 6.32 | 0 | 6.32 | 0.07 | 0 |
+
+(Skewed stall idle: H100 1.02 -> 0.55 ms, B200 1.91 -> 0.49 ms. Idle, sync and the profiled
+walls are from the balanced routing; B200 profiled walls swing between rows.)
+
+**Verdict.** Removing the stall is worth 0.5 ms (balanced) / 0.9 ms (skewed) on H100 and
+0.6 / 0.9 ms on B200, and the dispatch mode's non-profiler idle is now at DeepEP's level
+(H100 0.56 vs 0.21 ms, B200 0.58 vs 0.94). B200 extends its lead: bounded is 8% ahead of
+DeepEP at 64 SMs balanced, 11% skewed. On H100 the gap to tuned DeepEP shrinks from 2.0 to
+1.5 ms (balanced) and 2.2 to 1.3 ms (skewed), but it was never mainly idle: part of the idle the
+bounded row no longer has reappears as barrier wait (sync 0.85 -> 1.79 ms, the ranks now
+reach the combine barrier earlier and wait for the slowest), and the remaining difference is
+sync + transport (7.90 ms exposed vs DeepEP's 6.94, whose waits sit inside its transfer
+kernels) and glue (4.21 vs 3.86 ms: routing gather, producer masks, `zero_tail`, the pad
+rows). Those, not the count, are the H100 targets now: fusing the routing remap and
+`producer_mask` into the pull / reduce launches (section 4) and a per-source gated combine
+that does not need every rank at one barrier.
+
+Config: `expert_parallel_mono_ep_bounded: true` next to `expert_parallel_mono_ep_compact: true`
+(dispatch mode).

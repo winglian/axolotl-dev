@@ -43,14 +43,12 @@ VARIANTS = (
     ("mono_ep+grouped_mm", "mono_ep", "grouped_mm", "streamed"),
     ("mono_ep_compact+sonicmoe", "mono_ep", "sonicmoe", "compact"),
     ("mono_ep_compact+grouped_mm", "mono_ep", "grouped_mm", "compact"),
-    ("mono_ep_bounded+sonicmoe", "mono_ep", "sonicmoe", "bounded"),
     ("mono_ep_fused", "mono_ep", None, "fused"),
 )
 RUNTIMES = {
     "legacy": {"transfer": "legacy", "compact": False},
     "streamed": {"transfer": "streamed", "compact": False},
     "compact": {"transfer": "streamed", "compact": True},
-    "bounded": {"transfer": "streamed", "compact": True, "bounded": True},
 }
 # the fused reference lines: FP8 (blockwise) on H100 with FP8 transport + combine, BF16 on B200
 FUSED_PRECISION = {"H100": "fp8", "B200": "bf16"}
@@ -78,7 +76,6 @@ PARITY_PAIRS = (
     ("mono_ep_compact+grouped_mm", "torch+grouped_mm"),
     ("mono_ep+sonicmoe", "mono_ep_legacy+sonicmoe"),
     ("mono_ep_compact+sonicmoe", "mono_ep_legacy+sonicmoe"),
-    ("mono_ep_bounded+sonicmoe", "mono_ep_compact+sonicmoe"),
 )
 # DeepEP rows (``--deep-ep``): axolotl's ``_DeepEPBackend`` (normal-mode intranode kernels,
 # K-wide rows, the plugin's buffer sizing and preset configs) around the same local kernels.
@@ -128,6 +125,61 @@ PROFILE_BUCKETS = (
 )
 
 
+# ``--retime``: the compact receive options next to the baselines, SonicMoE only, with
+# per-rank profiler decompositions. Options are runtime kwargs.
+RETIME_VARIANTS = (
+    ("torch+sonicmoe", "torch", "sonicmoe", None),
+    ("mono_ep+sonicmoe", "mono_ep", "sonicmoe", "streamed"),
+    ("mono_ep_compact+sonicmoe", "mono_ep", "sonicmoe", "compact"),
+    ("mono_ep_bounded+sonicmoe", "mono_ep", "sonicmoe", "bounded"),
+    ("mono_ep_fused", "mono_ep", None, "fused"),
+)
+RETIME_RUNTIMES = {
+    "streamed": {"transfer": "streamed", "compact": False},
+    "compact": {"transfer": "streamed", "compact": True},
+    "bounded": {"compact": True, "bounded": True},
+}
+# rows whose y / dx / dscore must be bitwise equal to the compact row (the serialized path)
+RETIME_BITWISE = ("mono_ep_bounded+sonicmoe",)
+# rows whose expert weight gradients must be bitwise equal to the compact row too
+RETIME_BITWISE_WEIGHTS = ("mono_ep_bounded+sonicmoe",)
+RETIME_DEEP_EP = (
+    ("deep_ep+sonicmoe", "deep_ep", "sonicmoe", "deep_ep"),
+    ("deep_ep_sms40+sonicmoe", "deep_ep", "sonicmoe", "deep_ep_sms40"),
+    ("deep_ep_sms64+sonicmoe", "deep_ep", "sonicmoe", "deep_ep_sms64"),
+)
+# profiler time buckets for the decomposition: every kernel interval is attributed to the
+# first bucket (in this priority) active at that instant, idle = no kernel at all
+# ``--gap-cpu``: profile host ops too and name the ones overlapping the largest idle gaps
+GAP_CPU = False
+DECOMPOSITION_BUCKETS = (
+    ("gemm", ("gemm", "quack", "cutlass", "cute", "sonic")),
+    (
+        "transport",
+        (
+            "_pull_rows",
+            "_push_rows",
+            "_reduce_slots",
+            "deep_ep",
+            "intranode",
+            "nccl",
+        ),
+    ),
+    ("sync", ("barrier",)),
+)
+
+
+# FSDP2 dp_shard x EP check (``--fsdp2``): a two-layer Qwen3-MoE (8 experts top-2, hidden
+# 256) with experts sharded over EP 4 and FSDP2 over dp_shard 2 (world 8), grouped_mm local
+# kernel, AdamW, two optimizer steps per runtime option against the compact runtime at the
+# same pre-step weights
+FSDP2_TOKENS, FSDP2_STEPS, FSDP2_EP = 64, 2, 4
+FSDP2_VARIANTS = ("compact", "bounded")
+# options expected to give bitwise gradients everywhere / everywhere but the expert weights
+FSDP2_BITWISE_ALL = ("bounded",)
+FSDP2_BITWISE_DENSE = ()
+
+
 def _skewed_routing(tokens, experts, topk, rank):
     """Exponentially decaying expert popularity in expert order (benchmark_ep8_trace.py)."""
     generator = torch.Generator(device="cuda").manual_seed(812 + rank)
@@ -146,7 +198,7 @@ def _routing(routing, rank):
     return torch.rand(TOKENS, EXPERTS, device="cuda").argsort(-1)[:, :TOPK].contiguous()
 
 
-def _prepare_sonicmoe(profile_set):
+def _prepare_sonicmoe(profile_set, tune=True):
     """Register axolotl's SonicMoE forward, seed the measured quack profiles for
     ``profile_set`` and apply the kernels plugin's quack policy (config defaults: pow2 key
     buckets, sweep on), in the plugin's order. The profiles bound every grouped key to its
@@ -181,7 +233,7 @@ def _prepare_sonicmoe(profile_set):
             profile.pop("gpu")
     seeded = apply_autotune_profiles(profiles)
     assert seeded > 0, "apply_autotune_profiles attached to no quack autotuners"
-    covered = install_quack_key_policy()
+    covered = install_quack_key_policy(tune=tune)
     assert covered > 0, "install_quack_key_policy covered no quack autotuners"
     return {
         "profile_set": profile_set,
@@ -508,28 +560,380 @@ def _profile_breakdown(label, step):
     }
 
 
-def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
+def _union(intervals):
+    total, end = 0.0, None
+    merged = []
+    for start, stop in sorted(intervals):
+        if end is None or start > end:
+            merged.append([start, stop])
+            end = stop
+        elif stop > end:
+            merged[-1][1] = stop
+            end = stop
+    for start, stop in merged:
+        total += stop - start
+    return total, merged
+
+
+def _subtract(merged, covered):
+    """Length of ``merged`` intervals not inside ``covered`` (both sorted, disjoint)."""
+    total, j = 0.0, 0
+    for start, stop in merged:
+        cursor = start
+        while j < len(covered) and covered[j][1] <= cursor:
+            j += 1
+        k = j
+        while k < len(covered) and covered[k][0] < stop:
+            if covered[k][0] > cursor:
+                total += covered[k][0] - cursor
+            cursor = max(cursor, covered[k][1])
+            k += 1
+        if cursor < stop:
+            total += stop - cursor
+    return total
+
+
+def _decomposition(label, step):
+    """One profiled step on every rank: wall (first kernel start to last kernel end),
+    exposed device time per bucket (gemm > transport > sync > glue priority, so overlapped
+    work counts once), idle, and the summed kernel time per bucket."""
+    from torch.profiler import ProfilerActivity, profile
+
+    activities = [ProfilerActivity.CUDA]
+    if GAP_CPU:
+        activities.append(ProfilerActivity.CPU)
+    with profile(activities=activities) as prof:
+        step()
+        torch.cuda.synchronize()
+    cpu_ops = []
+    spans = {name: [] for name, _ in DECOMPOSITION_BUCKETS}
+    spans["glue"] = []
+    summed = {name: 0.0 for name in spans}
+    named = []
+    for event in prof.events():
+        start, stop = event.time_range.start, event.time_range.end
+        if event.device_type != torch.autograd.DeviceType.CUDA:
+            if GAP_CPU and stop > start:
+                cpu_ops.append((start, stop, event.name))
+            continue
+        if stop <= start:
+            continue
+        named.append((start, stop, event.name))
+        lowered = event.name.lower()
+        bucket = next(
+            (
+                b
+                for b, needles in DECOMPOSITION_BUCKETS
+                if any(n in lowered for n in needles)
+            ),
+            "glue",
+        )
+        spans[bucket].append((start, stop))
+        summed[bucket] += (stop - start) / 1000.0
+    everything = [iv for ivs in spans.values() for iv in ivs]
+    if not everything:
+        return {"label": label, "empty": True}
+    wall = (max(e for _, e in everything) - min(s for s, _ in everything)) / 1000.0
+    busy, _ = _union(everything)
+    exposed, covered = {}, []
+    for name in ("gemm", "transport", "sync", "glue"):
+        _, merged = _union(spans[name])
+        exposed[name] = _subtract(merged, covered) / 1000.0
+        _, covered = _union([tuple(iv) for iv in covered] + spans[name])
+    return {
+        "label": label,
+        "wall_ms": wall,
+        "idle_ms": wall - busy / 1000.0,
+        "exposed_ms": exposed,
+        "summed_kernel_ms": summed,
+        "idle_gaps": _idle_gaps(named, cpu_ops=cpu_ops),
+    }
+
+
+def _idle_gaps(named, top=8, floor_us=20.0, cpu_ops=()):
+    """Where the device idled: every gap between consecutive busy spans, attributed to the
+    kernel that ended last before it (``after``) and the one that starts it (``before``);
+    total by ``after`` kernel (first 60 characters) and the largest gaps."""
+    gaps, end, last = [], None, None
+    origin = min((start for start, _, _ in named), default=0)
+    for start, stop, name in sorted(named):
+        if end is not None and start - end >= floor_us:
+            gaps.append(((start - end) / 1000.0, last, name, end, start))
+        if end is None or stop > end:
+            end, last = stop, name
+    by_after = {}
+    for ms, after, *_ in gaps:
+        by_after[after[:60]] = by_after.get(after[:60], 0.0) + ms
+    host = []
+    # --gap-cpu: the host ops overlapping the two largest gaps, by overlap
+    for ms, _, _, begin, finish in sorted(gaps, reverse=True)[:2]:
+        overlap = [
+            (min(stop, finish) - max(start, begin), stop - start, start - begin, name)
+            for start, stop, name in cpu_ops
+            if start < finish and stop > begin
+        ]
+        overlap.sort(reverse=True)
+        host.append(
+            {
+                "gap_ms": ms,
+                "ops": [
+                    {
+                        "overlap_ms": o / 1000.0,
+                        "op_ms": d / 1000.0,
+                        "starts_at_ms": a / 1000.0,
+                        "name": n[:100],
+                    }
+                    for o, d, a, n in overlap[:25]
+                ],
+            }
+        )
+    return {
+        "floor_us": floor_us,
+        "count": len(gaps),
+        "total_ms": sum(gap[0] for gap in gaps),
+        "by_after_ms": dict(sorted(by_after.items(), key=lambda kv: -kv[1])[:top]),
+        "largest": [
+            {
+                "ms": ms,
+                "at_ms": (begin - origin) / 1000.0,
+                "after": after[:80],
+                "before": before[:80],
+            }
+            for ms, after, before, begin, _ in sorted(gaps, reverse=True)[:top]
+        ],
+        "host_ops_in_largest": host,
+    }
+
+
+def _gather_decomposition(entry, world):
+    entries = [None] * world
+    dist.all_gather_object(entries, entry)
+    keys = ("gemm", "transport", "sync", "glue")
+    return {
+        "per_rank": entries,
+        "max_rank_wall_ms": max(e["wall_ms"] for e in entries),
+        "mean_exposed_ms": {
+            k: statistics.mean(e["exposed_ms"][k] for e in entries) for k in keys
+        },
+        "max_exposed_ms": {k: max(e["exposed_ms"][k] for e in entries) for k in keys},
+        "mean_idle_ms": statistics.mean(e["idle_ms"] for e in entries),
+        "mean_summed_kernel_ms": {
+            k: statistics.mean(e["summed_kernel_ms"][k] for e in entries) for k in keys
+        },
+    }
+
+
+def _fsdp2_checks(profile_set, options=FSDP2_VARIANTS[1:]):
+    from mono_ep import MonoEPDispatchRuntime
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+    from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    from axolotl.integrations.expert_parallel import experts_fn, torch_dispatch
+    from axolotl.integrations.expert_parallel.plugin import ExpertParallelPlugin
+    from axolotl.integrations.expert_parallel.shard import shard_expert_weights
+
+    world = dist.get_world_size()
+    ep = min(FSDP2_EP, world)
+    mesh = init_device_mesh(
+        "cuda", (world // ep, ep), mesh_dim_names=("dp_shard", "ep")
+    )
+    dense_mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("world",))
+    ep_group = mesh["ep"].get_group()
+    torch_dispatch.set_ep_group(ep_group)
+    experts_fn.set_backend("mono_ep")
+    experts_fn.set_mono_ep_mode("dispatch")
+    experts_fn.set_local_implementation("grouped_mm")
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
+
+    def train(option, starts=None):
+        torch.manual_seed(123)
+        config = Qwen3MoeConfig(
+            vocab_size=256,
+            hidden_size=256,
+            intermediate_size=512,
+            moe_intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            num_experts=8,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            use_cache=False,
+            hidden_act="silu",
+        )
+        config._experts_implementation = "expert_parallel"
+        config._attn_implementation = "sdpa"
+        model = Qwen3MoeForCausalLM(config).cuda().train()
+        assert shard_expert_weights(model, ep_group) == 2
+        kw = dict(RETIME_RUNTIMES[option])
+        runtime = MonoEPDispatchRuntime(
+            group=ep_group,
+            max_tokens_per_rank=FSDP2_TOKENS,
+            top_k=2,
+            hidden=256,
+            **kw,
+        )
+        experts_fn.set_mono_ep_runtime(runtime)
+        kwargs = {"mp_policy": policy, "reshard_after_forward": True}
+        ExpertParallelPlugin.fully_shard_experts(model, mesh["dp_shard"], kwargs)
+        for layer in model.model.layers:
+            fully_shard(layer, mesh=dense_mesh, **kwargs)
+        fully_shard(model, mesh=dense_mesh, **kwargs)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        grads, pre, losses = [], [], []
+        for step in range(FSDP2_STEPS):
+            if starts is not None:
+                with torch.no_grad():
+                    for name, parameter in model.named_parameters():
+                        parameter.to_local().copy_(starts[step][name])
+            pre.append(
+                {n: q.to_local().detach().clone() for n, q in model.named_parameters()}
+            )
+            optimizer.zero_grad(set_to_none=True)
+            generator = torch.Generator(device="cuda").manual_seed(
+                1000 + dist.get_rank() + 10 * step
+            )
+            tokens = torch.randint(
+                0, 256, (1, FSDP2_TOKENS), device="cuda", generator=generator
+            )
+            loss = model(input_ids=tokens, labels=tokens).loss
+            loss.backward()
+            losses.append(loss.item())
+            grads.append(
+                {
+                    n: q.grad.to_local().detach().clone()
+                    for n, q in model.named_parameters()
+                    if q.grad is not None
+                }
+            )
+            optimizer.step()
+        experts_fn.set_mono_ep_runtime(None)
+        del optimizer, model
+        torch.cuda.synchronize()
+        dist.barrier()
+        runtime.destroy()
+        return grads, pre, losses
+
+    reference, starts, ref_losses = train("compact")
+    report = {
+        "mesh": {"dp_shard": world // ep, "ep": ep},
+        "local_kernel": "grouped_mm",
+        "optimizer_steps": FSDP2_STEPS,
+        "tokens_per_rank": FSDP2_TOKENS,
+        "reference": "compact",
+        "reference_losses_rank0": ref_losses,
+        "options": {},
+    }
+    ok = True
+    for option in options:
+        grads, _, losses = train(option, starts)
+        worst = {"dense": 0.0, "experts": 0.0}
+        worst_name = {"dense": None, "experts": None}
+        bitwise = {"dense": True, "experts": True}
+        finite = True
+        for step_grads, step_ref in zip(grads, reference, strict=True):
+            for name, ref in step_ref.items():
+                got = step_grads[name]
+                kind = "experts" if ".experts." in name else "dense"
+                finite &= bool(torch.isfinite(got).all())
+                bitwise[kind] &= bool(torch.equal(got, ref))
+                rel = (got.float() - ref.float()).norm() / ref.float().norm().clamp_min(
+                    1e-12
+                )
+                if rel.item() > worst[kind]:
+                    worst[kind], worst_name[kind] = rel.item(), name
+        stats = torch.tensor(
+            [
+                float(not bitwise["dense"]),
+                float(not bitwise["experts"]),
+                worst["dense"],
+                worst["experts"],
+                float(not finite),
+            ],
+            device="cuda",
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.MAX)
+        entry = {
+            "bitwise_dense_all_ranks": stats[0].item() == 0.0,
+            "bitwise_experts_all_ranks": stats[1].item() == 0.0,
+            "max_rel_l2_dense": stats[2].item(),
+            "max_rel_l2_experts": stats[3].item(),
+            "finite": stats[4].item() == 0.0,
+            "losses_rank0": losses,
+            "worst_parameter_rank0": worst_name,
+        }
+        expected = entry["finite"]
+        if option in FSDP2_BITWISE_ALL:
+            expected &= (
+                entry["bitwise_dense_all_ranks"] and entry["bitwise_experts_all_ranks"]
+            )
+        if option in FSDP2_BITWISE_DENSE:
+            expected &= entry["bitwise_dense_all_ranks"]
+        entry["meets_expectation"] = expected
+        ok &= expected
+        report["options"][option] = entry
+        if dist.get_rank() == 0:
+            print(json.dumps({"fsdp2": option, **entry}), flush=True)
+    report["ok"] = ok
+    return report
+
+
+def run(
+    profile_set,
+    deep_ep=False,
+    deep_ep_num_sms_max=40,
+    retime=False,
+    smoke=False,
+    fsdp2=False,
+    only=None,
+):
+    """``only``: variant labels to keep (all when ``None``)."""
     from mono_ep import MonoEPDispatchRuntime
 
     from axolotl.integrations.expert_parallel import experts_fn, torch_dispatch
 
+    global WARMUP, MEASURED
+    if smoke:
+        WARMUP, MEASURED = 1, 2
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", rank))
     world = dist.get_world_size()
-    assert world == 8
+    assert world == 8 or smoke
     group = dist.group.WORLD
     torch_dispatch.set_ep_group(group)
     experts_fn.register_all()
-    quack_setup = _prepare_sonicmoe(profile_set)
+    quack_setup = _prepare_sonicmoe(profile_set, tune=not smoke)
     experts = _build_experts(group)
+    runtime_specs = dict(RETIME_RUNTIMES if retime else RUNTIMES)
+    if only is not None:
+        wanted = {
+            v[3] for v in (RETIME_VARIANTS if retime else VARIANTS) if v[0] in only
+        }
+        runtime_specs = {
+            name: kw
+            for name, kw in runtime_specs.items()
+            if name in wanted or name == "streamed"
+        }
     runtimes = {
         name: MonoEPDispatchRuntime(
-            group=group, max_tokens_per_rank=TOKENS, top_k=TOPK, hidden=HIDDEN, **kw
+            group=group,
+            max_tokens_per_rank=TOKENS,
+            top_k=TOPK,
+            hidden=HIDDEN,
+            **kw,
         )
-        for name, kw in RUNTIMES.items()
+        for name, kw in runtime_specs.items()
     }
     try:
+        if smoke:
+            raise RuntimeError("smoke run: fused row skipped")
+        if only is not None and "mono_ep_fused" not in only:
+            raise RuntimeError("fused row not selected")
         fused, fused_info = _build_fused_runtime(group, profile_set)
     except Exception as error:  # the stock images carry no vendored DeepGEMM build
         fused, fused_info = None, {"mode": "fused", "unavailable": repr(error)}
@@ -542,14 +946,49 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
             None,
             {"mode": "fused", "unavailable": "failed on another rank"},
         )
-    variants = [v for v in VARIANTS if v[3] != "fused" or fused is not None]
-    pairs = list(PARITY_PAIRS)
+    base_variants = RETIME_VARIANTS if retime else VARIANTS
+    variants = [
+        v
+        for v in base_variants
+        if (v[3] != "fused" or fused is not None)
+        and (v[3] is None or v[3] == "fused" or v[3] in runtime_specs)
+    ]
+    if retime:
+        baselines = (
+            "torch+sonicmoe",
+            "mono_ep+sonicmoe",
+            "mono_ep_compact+sonicmoe",
+            "mono_ep_fused",
+        )
+        pairs = [
+            (label, "mono_ep_compact+sonicmoe")
+            for label, *_ in variants
+            if label not in baselines
+        ]
+        pairs += [
+            ("mono_ep_compact+sonicmoe", "torch+sonicmoe"),
+            ("mono_ep_fused", "torch+sonicmoe"),
+        ]
+    else:
+        pairs = list(PARITY_PAIRS)
     deep_ep_buffer, deep_ep_info, deep_ep_default_num_sms = None, None, None
     if deep_ep:
         deep_ep_buffer, deep_ep_info = _setup_deep_ep(group, deep_ep_num_sms_max)
         deep_ep_default_num_sms = deep_ep_info["num_sms_default"]
-        variants.extend(DEEP_EP_VARIANTS)
-        pairs.extend(DEEP_EP_PARITY_PAIRS)
+        if retime:
+            for sms in (40, 64):
+                DEEP_EP_SETTINGS[f"deep_ep_sms{sms}"] = {
+                    "ep_barrier": False,
+                    "num_sms": sms,
+                }
+            variants.extend(RETIME_DEEP_EP)
+            pairs.append(("deep_ep+sonicmoe", "torch+sonicmoe"))
+            pairs.append(("mono_ep_compact+sonicmoe", "deep_ep+sonicmoe"))
+        else:
+            variants.extend(DEEP_EP_VARIANTS)
+            pairs.extend(DEEP_EP_PARITY_PAIRS)
+    if only is not None:
+        variants = [v for v in variants if v[0] in only]
 
     def parity_pairs_present():
         labels_present = {label for label, _, _, _ in variants}
@@ -567,7 +1006,7 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
             name: views[workspace.rank].nbytes
             for name, views in workspace.views.items()
         },
-        "runtimes_resident": list(RUNTIMES),
+        "runtimes_resident": list(runtime_specs),
     }
 
     torch.manual_seed(812 + rank)
@@ -605,6 +1044,13 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
         for tensor in grads_of:
             tensor.grad = None
         operation(x, ids, scores).backward(dy)
+
+    def checkpointed_step(ids):
+        for tensor in grads_of:
+            tensor.grad = None
+        checkpoint(
+            operation, x, ids, scores, use_reentrant=False, preserve_rng_state=False
+        ).backward(dy)
 
     def timed_fwd_bwd(ids, warmup, measured):
         """Median over iterations of the max-rank wall ms of one fwd+bwd."""
@@ -668,6 +1114,8 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
     results = {}
     autotune_warm_seconds = {}
     tolerance_checks = {}
+    bitwise_failures = []
+    invalid_outputs = []
     sweep_outcome = None
     transfer_rows = {}
     breakdowns = {}
@@ -685,7 +1133,7 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
         torch.cuda.synchronize()
         dist.barrier()
         autotune_warm_seconds[routing] = time.perf_counter() - started
-        if deep_ep:
+        if deep_ep and not retime:
             if routing == "balanced":
                 sweep_outcome = num_sms_sweep(ids)
             transfer_rows[routing] = _transfer_rows(deep_ep_buffer, ids, world)
@@ -699,6 +1147,19 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
                 dist.barrier()
                 breakdowns[routing][label] = _profile_breakdown(
                     label, functools.partial(fwd_bwd, ids)
+                )
+        if retime:
+            if deep_ep:
+                transfer_rows[routing] = _transfer_rows(deep_ep_buffer, ids, world)
+            breakdowns[routing] = {}
+            for label, backend, local, runtime_name in variants:
+                configure(backend, local, runtime_name)
+                checkpointed_step(ids)  # one unprofiled step after the switch
+                torch.cuda.synchronize()
+                dist.barrier()
+                breakdowns[routing][label] = _gather_decomposition(
+                    _decomposition(label, functools.partial(checkpointed_step, ids)),
+                    world,
                 )
 
         cases = [
@@ -765,13 +1226,27 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
                             "ddown": experts.down_proj.grad.clone(),
                         }
                     )
-                assert torch.isfinite(y).all()
+                # recorded, not asserted: one bad row must not lose the whole job
+                bad = [] if bool(torch.isfinite(y).all()) else ["y"]
                 if scope != "forward":
-                    for tensor in grads_of:
-                        assert (
-                            tensor.grad is not None
-                            and torch.isfinite(tensor.grad).all()
+                    bad += [
+                        name
+                        for name, tensor in zip(
+                            ("dx", "dscore", "dgate_up", "ddown"), grads_of, strict=True
                         )
+                        if tensor.grad is None
+                        or not bool(torch.isfinite(tensor.grad).all())
+                    ]
+                if bad:
+                    invalid_outputs.append(
+                        {
+                            "rank": rank,
+                            "routing": routing,
+                            "label": label,
+                            "iteration": iteration,
+                            "tensors": bad,
+                        }
+                    )
                 del y
         parity = {}
         for candidate, reference in parity_pairs:
@@ -795,6 +1270,17 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
                         "rel_norm_max_rank": stats[2].item(),
                     }
                 parity[f"{candidate}_vs_{reference}/{scope}"] = entry
+                if (
+                    retime
+                    and candidate in RETIME_BITWISE
+                    and reference == "mono_ep_compact+sonicmoe"
+                ):
+                    keys = ("y", "dx", "dscore")
+                    if candidate in RETIME_BITWISE_WEIGHTS:
+                        keys += ("dgate_up", "ddown")
+                    for key in keys:
+                        if key in entry and not entry[key]["bitwise_equal_all_ranks"]:
+                            bitwise_failures.append(f"{routing}/{candidate}/{key}")
                 if candidate.startswith("deep_ep") or reference.startswith("deep_ep"):
                     worst = max(v["rel_norm_max_rank"] for v in entry.values())
                     tolerance_checks[
@@ -844,8 +1330,23 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
     barriers = {
         name: runtime._dispatch.extra_barriers for name, runtime in runtimes.items()
     }
+    bound_overflows = {
+        name: runtime.bound_overflows
+        for name, runtime in runtimes.items()
+        if runtime.bounded
+    }
     for runtime in runtimes.values():
         runtime.destroy()
+    gathered_invalid = [None] * world
+    dist.all_gather_object(gathered_invalid, invalid_outputs[:50])
+    invalid_outputs = [entry for part in gathered_invalid for entry in part]
+    fsdp2_checks = None
+    if fsdp2:
+        experts_fn.set_mono_ep_runtime(None)
+        options = FSDP2_VARIANTS[1:]
+        if only is not None:
+            options = tuple(o for o in options if o in runtime_specs)
+        fsdp2_checks = _fsdp2_checks(profile_set, options)
     if fused is not None:
         fused.destroy()
     parity_failures = [
@@ -855,7 +1356,7 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
     def variant_info(backend, local, runtime_name):
         info = {"backend": backend, "local_kernel": local, "mono_ep_runtime": None}
         if backend == "mono_ep":
-            info["mono_ep_runtime"] = RUNTIMES.get(runtime_name, fused_info)
+            info["mono_ep_runtime"] = runtime_specs.get(runtime_name, fused_info)
         elif backend == "deep_ep":
             info["deep_ep"] = DEEP_EP_SETTINGS[runtime_name]
         return info
@@ -902,6 +1403,18 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
                         "routings": breakdowns,
                     },
                     "mono_ep_extra_barriers_per_runtime": barriers,
+                    "mono_ep_bound_overflows_rank0": bound_overflows,
+                    "retime": retime,
+                    "smoke": smoke,
+                    "runtime_options": runtime_specs if retime else None,
+                    "retime_bitwise_rows": RETIME_BITWISE if retime else None,
+                    "retime_bitwise_weight_rows": RETIME_BITWISE_WEIGHTS
+                    if retime
+                    else None,
+                    "selected_variants": None if only is None else sorted(only),
+                    "retime_bitwise_failures": bitwise_failures,
+                    "invalid_outputs": invalid_outputs,
+                    "fsdp2_dp_shard_x_ep": fsdp2_checks,
                     "scopes": SCOPES,
                     "checkpoint_scope": "torch_nonreentrant_2F_plus_B",
                     "router_in_timing": False,
@@ -929,6 +1442,10 @@ def run(profile_set, deep_ep=False, deep_ep_num_sms_max=40):
     dist.destroy_process_group()
     assert failed == 0, f"{failed} quack candidates failed across ranks"
     assert not parity_failures, f"DeepEP rows outside bf16 tolerance: {parity_failures}"
+    assert not bitwise_failures, f"rows not bitwise vs compact: {bitwise_failures}"
+    assert not invalid_outputs, f"non-finite or missing outputs: {invalid_outputs[:5]}"
+    if fsdp2_checks is not None:
+        assert fsdp2_checks["ok"], "FSDP2 dp_shard x EP check failed"
 
 
 if __name__ == "__main__":
@@ -946,11 +1463,40 @@ if __name__ == "__main__":
         default=40,
         help="largest num_sms in the DeepEP sweep (above 40 the buffer grows past the plugin default)",
     )
+    parser.add_argument(
+        "--retime",
+        action="store_true",
+        help="the compact receive rows (compact, bounded, DeepEP 20/40/64 SMs) with "
+        "per-rank profiler decompositions",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="any world size, 1+2 iterations, no fused row, no quack sweeps",
+    )
+    parser.add_argument(
+        "--fsdp2", action="store_true", help="add the FSDP2 dp_shard x EP check"
+    )
+    parser.add_argument(
+        "--gap-cpu",
+        action="store_true",
+        help="profile host ops in the decomposition and attribute the largest idle gaps",
+    )
+    parser.add_argument(
+        "--variants",
+        default=None,
+        help="comma-separated variant labels to keep (default: all)",
+    )
     args = parser.parse_args()
     if not args.worker:
         parser.error("run under torch.distributed.run with --worker")
+    GAP_CPU = args.gap_cpu
     run(
         args.profiles,
         deep_ep=args.deep_ep,
         deep_ep_num_sms_max=args.deep_ep_num_sms_max,
+        retime=args.retime,
+        smoke=args.smoke,
+        fsdp2=args.fsdp2,
+        only=None if args.variants is None else set(args.variants.split(",")),
     )

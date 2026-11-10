@@ -18,13 +18,27 @@ from pathlib import Path
 import modal
 
 ROOT = Path(__file__).resolve().parents[1]
-DEEP_EP = os.environ.get("MONO_EP_CONTRACT_DEEP_EP") == "1"
+# ``MONO_EP_CONTRACT_RETIME=1``: the compact receive rows (``--retime --fsdp2`` plus the
+# DeepEP rows at 20 / 40 / 64 SMs), written to ``dispatch_sonicmoe_contract_overlap_*``;
+# ``MONO_EP_CONTRACT_SMOKE=1`` runs the same code on two GPUs (``--smoke``, no DeepEP)
+RETIME = os.environ.get("MONO_EP_CONTRACT_RETIME") == "1"
+SMOKE = os.environ.get("MONO_EP_CONTRACT_SMOKE") == "1"
+# ``MONO_EP_CONTRACT_VARIANTS=a,b`` keeps only those variant labels and
+# ``MONO_EP_CONTRACT_TAG=name`` writes ``dispatch_sonicmoe_contract_<name>_*`` instead
+VARIANT_FILTER = os.environ.get("MONO_EP_CONTRACT_VARIANTS")
+TAG = os.environ.get("MONO_EP_CONTRACT_TAG")
+GAP_CPU = os.environ.get("MONO_EP_CONTRACT_GAP_CPU") == "1"
+DEEP_EP = os.environ.get("MONO_EP_CONTRACT_DEEP_EP") == "1" or (RETIME and not SMOKE)
 # v1.2.1: the commit docker/Dockerfile-cloud-blackwell-uv (by tag) and cicd/deep_ep.py pin;
 # DeepEP main needs CUDA 13.1, this tag builds on the images' CUDA 13.0 with the relocated
 # cuda/std headers on the include path
 DEEP_EP_COMMIT = "9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee"
 app = modal.App(
-    "axolotl-mono-ep-dispatch-sonicmoe-contract" + ("-deep-ep" if DEEP_EP else "")
+    "axolotl-mono-ep-dispatch-sonicmoe-contract"
+    + ("-overlap" if RETIME else "")
+    + ("-smoke" if SMOKE else "")
+    + (f"-{TAG}" if TAG else "")
+    + ("-deep-ep" if DEEP_EP and not RETIME else "")
 )
 
 
@@ -118,7 +132,16 @@ if DEEP_EP:
 blackwell_image = _with_sources(blackwell_image)
 
 
-def _run_worker(expected_gpu, deep_ep=False, deep_ep_num_sms_max=40):
+def _run_worker(
+    expected_gpu,
+    deep_ep=False,
+    deep_ep_num_sms_max=40,
+    gpus=8,
+    retime=False,
+    smoke=False,
+    variants=None,
+    gap_cpu=False,
+):
     import torch
 
     actual = torch.cuda.get_device_name()
@@ -131,7 +154,7 @@ def _run_worker(expected_gpu, deep_ep=False, deep_ep_num_sms_max=40):
         "-m",
         "torch.distributed.run",
         "--standalone",
-        "--nproc-per-node=8",
+        f"--nproc-per-node={gpus}",
         "/probe/contract.py",
         "--worker",
         "--profiles",
@@ -141,6 +164,10 @@ def _run_worker(expected_gpu, deep_ep=False, deep_ep_num_sms_max=40):
             if deep_ep
             else []
         ),
+        *(["--retime", "--fsdp2"] if retime or smoke else []),
+        *(["--smoke"] if smoke else []),
+        *(["--variants", variants] if variants else []),
+        *(["--gap-cpu"] if gap_cpu else []),
     ]
     lines = []
     with subprocess.Popen(  # nosec B603
@@ -168,30 +195,63 @@ def _run_worker(expected_gpu, deep_ep=False, deep_ep_num_sms_max=40):
     payload = json.loads(result[-1][len("RESULT ") :])
     payload["worker_returncode"] = returncode
     payload["wall_seconds"] = time.time() - started
-    payload["gpu_hours"] = 8 * payload["wall_seconds"] / 3600
+    payload["gpu_hours"] = gpus * payload["wall_seconds"] / 3600
     payload["modal_task_id"] = os.environ.get("MODAL_TASK_ID")
     return payload
 
 
 @app.function(image=hopper_image, gpu="H100!:8", cpu=32, memory=131072, timeout=5400)
-def contract_h100(deep_ep: bool = False, deep_ep_num_sms_max: int = 40):
-    return _run_worker("H100", deep_ep, deep_ep_num_sms_max)
+def contract_h100(
+    deep_ep: bool = False,
+    deep_ep_num_sms_max: int = 40,
+    retime: bool = False,
+    variants: str | None = None,
+):
+    return _run_worker(
+        "H100", deep_ep, deep_ep_num_sms_max, retime=retime, variants=variants
+    )
 
 
 @app.function(image=blackwell_image, gpu="B200:8", cpu=32, memory=131072, timeout=5400)
-def contract_b200(deep_ep: bool = False, deep_ep_num_sms_max: int = 40):
-    return _run_worker("B200", deep_ep, deep_ep_num_sms_max)
+def contract_b200(
+    deep_ep: bool = False,
+    deep_ep_num_sms_max: int = 40,
+    retime: bool = False,
+    variants: str | None = None,
+):
+    return _run_worker(
+        "B200", deep_ep, deep_ep_num_sms_max, retime=retime, variants=variants
+    )
+
+
+@app.function(image=hopper_image, gpu="H100!:2", cpu=16, memory=65536, timeout=2400)
+def contract_smoke_h100(variants: str | None = None, gap_cpu: bool = False):
+    return _run_worker("H100", gpus=2, smoke=True, variants=variants, gap_cpu=gap_cpu)
 
 
 @app.local_entrypoint()
 def main(gpu: str = "H100", deep_ep_num_sms_max: int = 40):
     """``--deep-ep-num-sms-max 64`` extends the DeepEP SM sweep past the plugin's 256 MiB
-    buffer (the H100 artifact ran the default 40)."""
-    function = {"H100": contract_h100, "B200": contract_b200}[gpu]
-    result = function.remote(deep_ep=DEEP_EP, deep_ep_num_sms_max=deep_ep_num_sms_max)
+    buffer (the H100 artifact ran the default 40); the retime always sizes it for 64."""
+    if SMOKE:
+        result = contract_smoke_h100.remote(variants=VARIANT_FILTER, gap_cpu=GAP_CPU)
+    else:
+        function = {"H100": contract_h100, "B200": contract_b200}[gpu]
+        result = function.remote(
+            deep_ep=DEEP_EP,
+            deep_ep_num_sms_max=64 if RETIME else deep_ep_num_sms_max,
+            retime=RETIME,
+            variants=VARIANT_FILTER,
+        )
     result["modal_app_id"] = app.app_id
     result["recorded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    suffix = "_deep_ep" if DEEP_EP else ""
+    suffix = "_deep_ep" if DEEP_EP and not RETIME else ""
+    if RETIME or SMOKE:
+        suffix = "_overlap_smoke" if SMOKE else "_overlap"
+    if TAG:
+        suffix = f"_{TAG}_smoke" if SMOKE else f"_{TAG}"
+    if GAP_CPU:
+        suffix += "_gapcpu"
     out = ROOT / f"benchmarks/dispatch_sonicmoe_contract{suffix}_{gpu.lower()}.json"
     out.write_text(json.dumps(result, indent=1) + "\n")
     print(f"wrote {out}")
