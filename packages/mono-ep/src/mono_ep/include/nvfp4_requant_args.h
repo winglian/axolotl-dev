@@ -17,15 +17,17 @@ struct Args {
     uint8_t* oq;           // u8 [E_local, N, K/2]
     uint8_t* os;           // u8 [E_local, N, K/16]
     uint8_t* osfa;         // u8 [E_local, RM, RK, 512] or null
-    uint8_t* oq_t;         // fused: u8 [E_local, K, N/2]
-    uint8_t* os_t;         // fused: u8 [E_local, K, N/16]
-    uint8_t* osfa_t;       // fused: u8 [E_local, RM_T, RK_T, 512] or null
+    const uint8_t* qt;     // paired: u8 [E, K, N/2] transposed base
+    const uint8_t* st;     // paired: u8 [E, K, N/16] its block scales
+    uint8_t* oq_t;         // fused / paired: u8 [E_local, K, N/2]
+    uint8_t* os_t;         // fused / paired: u8 [E_local, K, N/16]
+    uint8_t* osfa_t;       // fused / paired: u8 [E_local, RM_T, RK_T, 512] or null
     float scaling;
     int e0, e_local, n, k, r, r_pad, p, rows_per_proj;
     int rm, rk, rm_t, rk_t;
     int interleave;        // 0: concat rows; g > 0: gate/up interleave of granularity g
     int round_bf16, modelopt, reuse, ab_fp32;
-    int fused, ffma2;
+    int pair, ffma2;       // pair: 0 none, 1 fused, 2 paired
     int mode;              // 3: requant; 0: copy; 1: no delta; 2: no quantizer (bound probes)
     int k_splits;
 };

@@ -199,14 +199,38 @@ class Nvfp4LoraExperts:
         """Requant results for ``w1`` (interleaved rows), ``w2``, ``w1t``, ``w2t``
         from adapters ``a1 [E, r, H]``, ``b1 [E, 2I, r]``, ``a2 [E, r, I]``, ``b2 [E, H, r]``."""
         a1, b1, a2, b2 = (t.detach() for t in (a1, b1, a2, b2))
+        bf = lambda t: t.to(torch.bfloat16)  # noqa: E731
+        if self.backend == "cuda":
+            # each weight and its transposed base in one pass: the delta is computed once
+            pair = self.cuda_requant.requant_paired
+            r1, r1t = pair(
+                self.q1,
+                self.s1,
+                self.q1t,
+                self.s1t,
+                self.pts1,
+                bf(a1),
+                bf(b1),
+                self.scaling,
+                interleave=8,
+            )
+            r2, r2t = pair(
+                self.q2,
+                self.s2,
+                self.q2t,
+                self.s2t,
+                self.pts2,
+                bf(a2),
+                bf(b2),
+                self.scaling,
+            )
+            return r1, r2, r1t, r2t
         if self.backend == "cuda_fused":
-            bf = lambda t: t.to(torch.bfloat16)  # noqa: E731
-            r1, r1t = self.cuda_requant.requant_fused(
+            fused = self.cuda_requant.requant_fused
+            r1, r1t = fused(
                 self.q1, self.s1, self.pts1, bf(a1), bf(b1), self.scaling, interleave=8
             )
-            r2, r2t = self.cuda_requant.requant_fused(
-                self.q2, self.s2, self.pts2, bf(a2), bf(b2), self.scaling
-            )
+            r2, r2t = fused(self.q2, self.s2, self.pts2, bf(a2), bf(b2), self.scaling)
             return r1, r2, r1t, r2t
         r1 = self._requant(
             self.q1i, self.s1i, self.pts1, a1, b1.index_select(1, self.perm)

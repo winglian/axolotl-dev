@@ -68,6 +68,13 @@ def validate(cases: str = "", skip_small: bool = False):
     return dict(returncode=code, result=result, tail="".join(lines[-80:]))
 
 
+@app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=1800)
+def script(name: str):
+    env = {**os.environ, **ENV}
+    code, lines = _stream(["python", f"/probe/examples/{name}"], env, 1700)
+    return dict(returncode=code, result=None, tail="".join(lines[-80:]))
+
+
 def _parse_raw(text):
     rows = [line for line in text.splitlines() if line.startswith('"')]
     if len(rows) < 3:
@@ -112,6 +119,7 @@ def ncu(kernels: str = "triton,cuda,cuda_fused"):
         executable,
         "--target-processes", "all",
         "--replay-mode", "kernel",
+        "--clock-control", "none",
         "--kernel-name-base", "function",
         "--kernel-name", "regex:requant_kernel",
         "--launch-skip", str(len(kernels.split(","))),
@@ -151,6 +159,8 @@ def main(
 ):
     if job == "validate":
         result = validate.remote(cases, skip_small)
+    elif job.endswith(".py"):
+        result = script.remote(job)
     elif job == "ncu":
         result = ncu.remote(kernels)
     else:

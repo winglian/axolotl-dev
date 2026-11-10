@@ -161,6 +161,43 @@ def _same(x, y):
     return bool(torch.equal(x.view(torch.uint8), y.view(torch.uint8)))
 
 
+def _check_paired(q, s, pts, A, B, numerics, e0, e1, gen):
+    """``requant_paired`` against two Triton requants (normal, and a random
+    transposed base with ``B^T`` / ``A^T`` as its factors)."""
+    from mono_ep.nvfp4_requant import (
+        cuda_nvfp4_requant as cr,
+        triton_nvfp4_requant as tr,
+    )
+
+    E, N, k2 = q.shape
+    K = 2 * k2
+    r = A.shape[0] // E
+    qt, st, _ = _base(E, K, N, 1, gen)
+    a_nat = A.reshape(E, r, K)
+    b_nat = B.reshape(N, r, E).permute(2, 0, 1)
+    # the transposed form's rank-major factors: A' = B^T [E*r, N], B' = A^T [K, r*E]
+    a_t = b_nat.permute(0, 2, 1).reshape(E * r, N)
+    b_t = a_nat.permute(2, 1, 0).reshape(K, r * E)
+    tn = tr.requant_lora_packed(q, s, pts, A, B, 1.75, pts, e0, e1, numerics=numerics)
+    tt = tr.requant_lora_packed(
+        qt, st, pts, a_t, b_t, 1.75, pts, e0, e1, numerics=numerics
+    )
+    cn, ct = cr.requant_paired(
+        q, s, qt, st, pts, a_nat, b_nat, 1.75, e0, e1, numerics=numerics
+    )
+    return all(
+        _same(x, y)
+        for x, y in (
+            (tn.qdata, cn.qdata),
+            (tn.scale, cn.scale),
+            (tn.scale_atoms, cn.scale_atoms),
+            (tt.qdata, ct.qdata),
+            (tt.scale, ct.scale),
+            (tt.scale_atoms, ct.scale_atoms),
+        )
+    )
+
+
 def check_small_shapes():
     from mono_ep.nvfp4_requant import (
         cuda_nvfp4_requant as cr,
@@ -245,8 +282,28 @@ def check_small_shapes():
                                                     (t.qdata != c.qdata).sum()
                                                 ),
                                             )
+                                            if (
+                                                projections == 1
+                                                and N % 64 == 0
+                                                and not interleave
+                                            ):
+                                                row["paired_equal"] = _check_paired(
+                                                    q,
+                                                    s,
+                                                    pts,
+                                                    A,
+                                                    B,
+                                                    numerics,
+                                                    e0,
+                                                    e1,
+                                                    gen,
+                                                )
                                             rows.append(row)
-                                            if not ok or exact is False:
+                                            if (
+                                                not ok
+                                                or exact is False
+                                                or row.get("paired_equal") is False
+                                            ):
                                                 failures.append(row)
     return dict(cases=len(rows), failures=failures[:20], num_failures=len(failures))
 
@@ -309,7 +366,7 @@ def check_layer(name, case, gen):
     a1, b1, a2, b2 = adapters
     out = dict(case=name)
     t = layer.requant_all(*adapters)
-    layer.backend = "cuda"
+    layer.backend = "cuda"  # paired: w1 + w1t, w2 + w2t
     c = layer.requant_all(*adapters)
     forms = ("w1", "w2", "w1t", "w2t")
     out["cuda_vs_triton"] = {
@@ -428,7 +485,7 @@ def time_layer(layer, adapters):
     for ffma2 in (True, False):
         os.environ["MONO_EP_NVFP4_REQUANT_FFMA2"] = str(int(ffma2))
         layer.backend = "cuda"
-        res[f"cuda_4_forms_ms_ffma2_{int(ffma2)}"] = timed(
+        res[f"cuda_paired_4_forms_ms_ffma2_{int(ffma2)}"] = timed(
             lambda: layer.requant_all(*adapters)
         )
         layer.backend = "cuda_fused"
@@ -436,6 +493,12 @@ def time_layer(layer, adapters):
             lambda: layer.requant_all(*adapters)
         )
     os.environ.pop("MONO_EP_NVFP4_REQUANT_FFMA2")
+    res["cuda_unpaired_4_forms_ms"] = timed(
+        lambda: [
+            cr.requant_natural(v[0], v[1], v[2], v[3], v[4], layer.scaling, v[2])
+            for v in forms.values()
+        ]
+    )
     for mode in ("requant", "copy", "no_delta", "no_quantizer"):
         res[f"cuda_{mode}_per_form_ms"] = {
             k: timed(

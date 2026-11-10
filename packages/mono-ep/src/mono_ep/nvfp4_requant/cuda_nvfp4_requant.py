@@ -39,11 +39,12 @@ from .triton_nvfp4_requant import _pts_table
 __all__ = [
     "cuda_requant_available",
     "requant_fused",
+    "requant_paired",
     "requant_lora_packed_cuda",
     "requant_natural",
 ]
 
-TILE_M, TILE_K = 64, 256
+TILE_M, TILE_K = 64, 128
 MODES = {"requant": 3, "copy": 0, "no_delta": 1, "no_quantizer": 2}
 
 
@@ -159,6 +160,8 @@ def _base_params(q, s, dq_pts, a, b, scaling, fq_pts, numerics, e0, e_local, N, 
         modelopt=int(numerics.modelopt_compat),
         reuse=int(numerics.scale_mode == "reuse"),
         ab_fp32=int(a.dtype == torch.float32),
+        qt=0,
+        st=0,
         oq_t=0,
         os_t=0,
         osfa_t=0,
@@ -249,7 +252,7 @@ def requant_natural(
         rm=rm,
         rk=rk,
         interleave=int(interleave),
-        fused=0,
+        pair=0,
         ffma2=int(_ffma2_default() if ffma2 is None else ffma2),
         mode=MODES[mode],
         k_splits=_k_splits(N, K, e_local, q.device),
@@ -263,6 +266,137 @@ def requant_natural(
         numerics,
         e0,
         row_order="interleaved" if interleave else "concat",
+    )
+
+
+def _requant_pair(
+    pair,
+    q,
+    s,
+    pts,
+    a,
+    b,
+    scaling,
+    e0,
+    e1,
+    numerics,
+    write_atoms,
+    interleave,
+    ffma2,
+    qt=None,
+    st=None,
+):
+    q = q.view(torch.uint8).contiguous()
+    s = s.view(torch.uint8).contiguous()
+    a, b = a.contiguous(), b.contiguous()
+    E, N, K, r = _check_inputs(q, s, a, b)
+    assert N % TILE_M == 0, f"N={N} must be a multiple of {TILE_M}"
+    pts = pts.detach().to(torch.float32).reshape(E, -1).contiguous()
+    assert pts.shape[1] == 1, "the paired forms take one per-tensor scale per expert"
+    if interleave:
+        assert N % (2 * interleave) == 0, (N, interleave)
+    if qt is not None:
+        qt = qt.view(torch.uint8).contiguous()
+        st = st.view(torch.uint8).contiguous()
+        assert qt.shape == (E, K, N // 2) and st.shape == (E, K, N // SF_VEC_SIZE), (
+            tuple(qt.shape),
+            tuple(st.shape),
+        )
+    e1 = E if e1 is None else e1
+    e_local = e1 - e0
+    normal = RequantBuffers.allocate(e_local, N, K, q.device, with_atoms=write_atoms)
+    trans = RequantBuffers.allocate(e_local, K, N, q.device, with_atoms=write_atoms)
+    rm, rk = atom_grid(N, K // SF_VEC_SIZE)
+    rm_t, rk_t = atom_grid(K, N // SF_VEC_SIZE)
+    params = _base_params(q, s, pts, a, b, scaling, pts, numerics, e0, e_local, N, K, r)
+    params.update(
+        oq=normal.qdata.data_ptr(),
+        os=normal.scale.data_ptr(),
+        osfa=normal.atoms.data_ptr() if write_atoms else 0,
+        qt=qt.data_ptr() if qt is not None else 0,
+        st=st.data_ptr() if st is not None else 0,
+        oq_t=trans.qdata.data_ptr(),
+        os_t=trans.scale.data_ptr(),
+        osfa_t=trans.atoms.data_ptr() if write_atoms else 0,
+        p=1,
+        rows_per_proj=N,
+        rm=rm,
+        rk=rk,
+        rm_t=rm_t,
+        rk_t=rk_t,
+        interleave=int(interleave),
+        pair=pair,
+        ffma2=int(_ffma2_default() if ffma2 is None else ffma2),
+        mode=MODES["requant"],
+        k_splits=_k_splits(N, K, e_local, q.device),
+    )
+    _launch(params, q.device)
+    pts_local = pts[e0:e1].clone()
+    return (
+        RequantResult(
+            normal.qdata,
+            normal.scale.view(torch.float8_e4m3fn),
+            normal.atoms,
+            pts_local,
+            numerics,
+            e0,
+            row_order="interleaved" if interleave else "concat",
+        ),
+        RequantResult(
+            trans.qdata,
+            trans.scale.view(torch.float8_e4m3fn),
+            trans.atoms,
+            pts_local.clone(),
+            numerics,
+            e0,
+        ),
+    )
+
+
+def requant_paired(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    qdata_t: torch.Tensor,
+    scale_t: torch.Tensor,
+    pts: torch.Tensor,
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    scaling: float,
+    e0: int = 0,
+    e1: int | None = None,
+    *,
+    numerics: RequantNumerics | None = None,
+    write_atoms: bool = True,
+    interleave: int = 0,
+    ffma2: bool | None = None,
+) -> tuple[RequantResult, RequantResult]:
+    """Requant of a weight and of its separately stored transposed base in one pass.
+
+    Bytes equal two :func:`requant_natural` calls, ``(q, s, A, B)`` and
+    ``(q_t, s_t, B^T, A^T)``: the transposed delta is the same rank-order FMA
+    chain, so it is computed once. ``qdata_t [E, K, N/2]`` / ``scale_t`` is the
+    transposed base; one per-tensor scale per expert (``pts [E]``) serves both
+    forms; ``N % 64 == 0``.
+    """
+    numerics = numerics or RequantNumerics()
+    if numerics.delta_kernel != DELTA_KERNELS[0]:
+        raise NotImplementedError("the CUDA requant implements delta_kernel='ieee'")
+    return _requant_pair(
+        2,
+        qdata,
+        scale,
+        pts,
+        lora_a,
+        lora_b,
+        scaling,
+        e0,
+        e1,
+        numerics,
+        write_atoms,
+        interleave,
+        ffma2,
+        qdata_t,
+        scale_t,
     )
 
 
@@ -288,62 +422,20 @@ def requant_fused(
     scale, in natural (concat) row order. One per-tensor scale per expert
     (``pts [E]``); ``N % 64 == 0``.
     """
-    numerics = RequantNumerics()
-    q = qdata.view(torch.uint8).contiguous()
-    s = scale.view(torch.uint8).contiguous()
-    a, b = lora_a.contiguous(), lora_b.contiguous()
-    E, N, K, r = _check_inputs(q, s, a, b)
-    assert N % TILE_M == 0, f"N={N} must be a multiple of {TILE_M}"
-    pts = pts.detach().to(torch.float32).reshape(E, -1).contiguous()
-    assert pts.shape[1] == 1, "the fused requant takes one per-tensor scale per expert"
-    if interleave:
-        assert N % (2 * interleave) == 0, (N, interleave)
-    e1 = E if e1 is None else e1
-    e_local = e1 - e0
-    normal = RequantBuffers.allocate(e_local, N, K, q.device, with_atoms=write_atoms)
-    trans = RequantBuffers.allocate(e_local, K, N, q.device, with_atoms=write_atoms)
-    rm, rk = atom_grid(N, K // SF_VEC_SIZE)
-    rm_t, rk_t = atom_grid(K, N // SF_VEC_SIZE)
-    params = _base_params(q, s, pts, a, b, scaling, pts, numerics, e0, e_local, N, K, r)
-    params.update(
-        oq=normal.qdata.data_ptr(),
-        os=normal.scale.data_ptr(),
-        osfa=normal.atoms.data_ptr() if write_atoms else 0,
-        oq_t=trans.qdata.data_ptr(),
-        os_t=trans.scale.data_ptr(),
-        osfa_t=trans.atoms.data_ptr() if write_atoms else 0,
-        p=1,
-        rows_per_proj=N,
-        rm=rm,
-        rk=rk,
-        rm_t=rm_t,
-        rk_t=rk_t,
-        interleave=int(interleave),
-        fused=1,
-        ffma2=int(_ffma2_default() if ffma2 is None else ffma2),
-        mode=MODES["requant"],
-        k_splits=_k_splits(N, K, e_local, q.device),
-    )
-    _launch(params, q.device)
-    pts_local = pts[e0:e1].clone()
-    return (
-        RequantResult(
-            normal.qdata,
-            normal.scale.view(torch.float8_e4m3fn),
-            normal.atoms,
-            pts_local,
-            numerics,
-            e0,
-            row_order="interleaved" if interleave else "concat",
-        ),
-        RequantResult(
-            trans.qdata,
-            trans.scale.view(torch.float8_e4m3fn),
-            trans.atoms,
-            pts_local.clone(),
-            numerics,
-            e0,
-        ),
+    return _requant_pair(
+        1,
+        qdata,
+        scale,
+        pts,
+        lora_a,
+        lora_b,
+        scaling,
+        e0,
+        e1,
+        RequantNumerics(),
+        write_atoms,
+        interleave,
+        ffma2,
     )
 
 

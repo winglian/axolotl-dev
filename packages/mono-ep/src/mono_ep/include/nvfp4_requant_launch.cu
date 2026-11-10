@@ -11,15 +11,20 @@
 // E2M1 / E4M3 conversions use the SM100 cvt instructions, whose RNE and
 // saturation match the Triton kernel's software encoders on finite inputs.
 //
-// CTA tile: 64 rows x 256 K, looping over K. A thread owns 2 rows x 32 K
-// (one 16-byte code vector and two block scales per row); the 8 lanes of a
-// row group cover 128 contiguous code bytes. A is staged in shared memory as
-// fp32 with the 8 chunk lanes' float4s adjacent, so each LDS.128 is one
-// wavefront; B rows sit in shared memory with a padded stride.
+// CTA tile: 64 rows x 128 K, looping over K. A thread owns 2 rows x 16 K
+// (one block: 8 code bytes and one scale byte per row); the 8 lanes of a row
+// group cover 64 contiguous code bytes. A is staged in shared memory as fp32
+// with the 8 chunk lanes' float4s adjacent, so each LDS.128 is one wavefront,
+// double buffered: the next tile's A and codes are loaded into registers while
+// the current tile computes, so each K tile costs one barrier. B rows sit in
+// shared memory with a padded stride. The delta uses FFMA2 on column pairs
+// (still one rounding per FMA).
 //
-// FUSED additionally quantizes the same merged tile along the rows (blocks of
-// 16 rows per column) and stores it transposed, so the transposed form needs
-// neither a transposed base nor a second delta.
+// PAIR also emits the transposed form from the same tile, quantized in blocks
+// of 16 rows per column and stored transposed. Paired (exact): the transposed
+// base merged with the transposed delta, the bytes of a separate requant of
+// the transposed form, with the rank-r delta computed once for both. Fused
+// (numerics change): the merged tile itself, so no transposed base exists.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -33,13 +38,14 @@ namespace mono_ep_requant {
 
 constexpr int kThreads = 256;
 constexpr int kTileM = 64;
-constexpr int kTileK = 256;
-constexpr int kChunk = 32;
+constexpr int kTileK = 128;
+constexpr int kChunk = 16;
 constexpr int kChunkLanes = kTileK / kChunk;  // 8
+constexpr int kFused = 1, kPaired = 2;  // PAIR: transposed form from the merged tile / from a transposed base
 constexpr float kOneSixth = 0.16666667163372040f;  // fp32(1/6), torchao's reciprocal multiply
 
 struct SharedLayout {
-    static constexpr int kASize(int r_pad) { return r_pad * kTileK; }
+    static constexpr int kASize(int r_pad) { return 2 * r_pad * kTileK; }  // double buffered
     static constexpr int kBStride(int r_pad) { return r_pad + 1; }
 };
 
@@ -158,13 +164,52 @@ __device__ __forceinline__ void encode_block(const float* w, float sdec, float f
     }
 }
 
-template <int R_PAD, bool AB_FP32, bool ROUND_BF16, int MODE, bool FUSED, bool FFMA2>
+// Merges one 16-value block: w = round(round(v * sc) + scaling * delta), returns amax.
+template <bool ROUND_BF16>
+__device__ __forceinline__ float merge_block(uint32_t c0, uint32_t c1, float sc, float scaling,
+                                             const float2* delta, float* w) {
+    decode_e2m1x8(c0, w);
+    decode_e2m1x8(c1, w + 8);
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        // scalar _rn ops: the f32x2 multiply / add forms got contracted into an FMA here
+        float2 x = make_float2(__fmul_rn(w[2 * j], sc), __fmul_rn(w[2 * j + 1], sc));
+        if constexpr (ROUND_BF16) x = __bfloat1622float2(__floats2bfloat162_rn(x.x, x.y));
+        x.x = __fadd_rn(x.x, __fmul_rn(delta[j].x, scaling));
+        x.y = __fadd_rn(x.y, __fmul_rn(delta[j].y, scaling));
+        if constexpr (ROUND_BF16) x = __bfloat1622float2(__floats2bfloat162_rn(x.x, x.y));
+        w[2 * j] = x.x;
+        w[2 * j + 1] = x.y;
+        amax = fmaxf(amax, fmaxf(fabsf(x.x), fabsf(x.y)));
+    }
+    return amax;
+}
+
+// Quantizes one merged block to (8 code bytes, scale bits), fresh or on the reused base scale.
+__device__ __forceinline__ void quantize_block(const float* w, float amax, float fq, float inv_fq,
+                                               bool modelopt, bool reuse, float s_base,
+                                               uint32_t s_base_bits, uint32_t& c0, uint32_t& c1,
+                                               uint32_t& bits) {
+    float sdec;
+    block_scale(amax, fq, modelopt, bits, sdec);
+    if (reuse && !(amax > __fmul_rn(6.0f, __fmul_rn(fq, s_base)))) {
+        sdec = s_base;
+        bits = s_base_bits;
+    }
+    encode_block(w, sdec, fq, inv_fq, modelopt, c0, c1);
+}
+
+template <int R_PAD, bool AB_FP32, bool ROUND_BF16, int MODE, int PAIR, bool FFMA2>
 __global__ void __launch_bounds__(kThreads, 2) requant_kernel(const Args args) {
-    extern __shared__ __align__(16) float smem[];
-    float* a_s = smem;                                    // [R_PAD][8 q][8 lanes][4]
-    float* b_s = a_s + SharedLayout::kASize(R_PAD);       // [64][R_PAD + 1]
-    float* w_s = b_s + kTileM * SharedLayout::kBStride(R_PAD);  // FUSED: [64][256], 16-byte xor swizzle
     constexpr int kBStride = SharedLayout::kBStride(R_PAD);
+    constexpr int kVec = AB_FP32 ? 4 : 8;  // A elements per 16-byte load
+    constexpr int kStash = R_PAD * kTileK / kVec / kThreads;
+    constexpr int kABuf = R_PAD * kTileK;
+    extern __shared__ __align__(16) float smem[];
+    float* a_s = smem;                                    // 2 x [R_PAD][4 qd][8 lanes][4]
+    float* b_s = a_s + SharedLayout::kASize(R_PAD);       // [64][R_PAD + 1]
+    float* w_s = b_s + kTileM * kBStride;                 // PAIR: [64][128], 16-byte xor swizzle
 
     const int tid = threadIdx.x;
     const int warp = tid / 32, lane = tid % 32;
@@ -179,7 +224,6 @@ __global__ void __launch_bounds__(kThreads, 2) requant_kernel(const Args args) {
     row_local[0] = warp * 4 + group;
     row_local[1] = row_local[0] + 32;
 
-    // B tile once per CTA
     for (int i = tid; i < kTileM * R_PAD; i += kThreads) {
         const int rl = i / R_PAD, rr = i % R_PAD;
         const int n = n0 + rl;
@@ -213,57 +257,94 @@ __global__ void __launch_bounds__(kThreads, 2) requant_kernel(const Args args) {
     const int kt_begin = blockIdx.y * tiles_per_split;
     const int kt_end = min(k_tiles, kt_begin + tiles_per_split);
 
+    // Raw 16-byte A vectors of one K tile, held in registers until the buffer they go to is free.
+    auto load_a = [&](int k0, uint4 (&stash)[kStash]) {
+#pragma unroll
+        for (int s = 0; s < kStash; ++s) {
+            const int i = tid + s * kThreads;
+            const int rr = i / (kTileK / kVec), c = (i % (kTileK / kVec)) * kVec;
+            stash[s] = make_uint4(0, 0, 0, 0);
+            if (rr < R && k0 + c < K) {
+                const int64_t off = (static_cast<int64_t>(e) * R + rr) * K + k0 + c;
+                const char* base = static_cast<const char*>(args.a) + off * (AB_FP32 ? 4 : 2);
+                stash[s] = __ldg(reinterpret_cast<const uint4*>(base));
+            }
+        }
+    };
+    auto store_a = [&](float* buf, const uint4 (&stash)[kStash]) {
+#pragma unroll
+        for (int s = 0; s < kStash; ++s) {
+            const int i = tid + s * kThreads;
+            const int rr = i / (kTileK / kVec), c = (i % (kTileK / kVec)) * kVec;
+            float v[kVec];
+            if constexpr (AB_FP32) {
+                const float4 f = *reinterpret_cast<const float4*>(&stash[s]);
+                v[0] = f.x, v[1] = f.y, v[2] = f.z, v[3] = f.w;
+            } else {
+                const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&stash[s]);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __bfloat1622float2(p[j]);
+                    v[2 * j] = f.x, v[2 * j + 1] = f.y;
+                }
+            }
+            const int lane_c = c / kChunk, j = c % kChunk;
+#pragma unroll
+            for (int h = 0; h < kVec / 4; ++h)
+                *reinterpret_cast<float4*>(buf + ((rr * 4 + j / 4 + h) * kChunkLanes + lane_c) * 4) =
+                    make_float4(v[4 * h], v[4 * h + 1], v[4 * h + 2], v[4 * h + 3]);
+        }
+    };
+    auto load_codes = [&](int k0, uint2 (&codes)[2], uint32_t (&sbits)[2]) {
+        const int col = k0 + chunk * kChunk;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            codes[i] = make_uint2(0, 0);
+            sbits[i] = 0;
+            if (row_ok[i] && col < K) {
+                codes[i] = __ldg(reinterpret_cast<const uint2*>(args.q + src_row[i] * k2 + col / 2));
+                sbits[i] = __ldg(args.s + src_row[i] * sf_k + col / 16);
+            }
+        }
+    };
+
+    uint2 codes[2];
+    uint32_t sbits[2];
+    uint4 stash[kStash];
+    if (kt_begin < kt_end) {
+        load_codes(kt_begin * kTileK, codes, sbits);
+        if constexpr (MODE >= 2) {
+            load_a(kt_begin * kTileK, stash);
+            store_a(a_s, stash);
+        }
+    }
+    __syncthreads();
+
     for (int kt = kt_begin; kt < kt_end; ++kt) {
         const int k0 = kt * kTileK;
         const int col = k0 + chunk * kChunk;
         const bool col_ok = col < K;
-
-        uint4 codes[2];
-        uint32_t sbits[2];
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            codes[i] = make_uint4(0, 0, 0, 0);
-            sbits[i] = 0;
-            if (row_ok[i] && col_ok) {
-                codes[i] = *reinterpret_cast<const uint4*>(args.q + src_row[i] * k2 + col / 2);
-                sbits[i] = *reinterpret_cast<const uint16_t*>(args.s + src_row[i] * sf_k + col / 16);
+        const bool has_next = kt + 1 < kt_end;
+        const float* a_cur = a_s + ((kt - kt_begin) & 1) * kABuf;
+        // paired: this tile's transposed base (column k0 + tid % 128, 32 rows of N), loaded before the delta
+        const int half = tid / kTileK;
+        uint4 tcodes = make_uint4(0, 0, 0, 0);
+        uint32_t tsbits = 0;
+        if constexpr (PAIR == kPaired) {
+            const int kcol = k0 + tid % kTileK;
+            if (kcol < K) {
+                const int64_t trow = static_cast<int64_t>(e) * K + kcol;
+                const int nb = n0 + half * 32;
+                tcodes = __ldg(reinterpret_cast<const uint4*>(args.qt + trow * (N / 2) + nb / 2));
+                tsbits = __ldg(reinterpret_cast<const uint16_t*>(args.st + trow * (N / 16) + nb / 16));
             }
         }
-
-        __syncthreads();  // previous tile's readers of a_s / w_s are done
-        if constexpr (MODE >= 2) {
-            constexpr int kVec = AB_FP32 ? 4 : 8;
-            for (int i = tid; i < R_PAD * kTileK / kVec; i += kThreads) {
-                const int rr = i / (kTileK / kVec);
-                const int c = (i % (kTileK / kVec)) * kVec;  // column inside the tile
-                float v[kVec];
-#pragma unroll
-                for (int j = 0; j < kVec; ++j) v[j] = 0.0f;
-                if (rr < R && k0 + c < K) {
-                    const int64_t off = (static_cast<int64_t>(e) * R + rr) * K + k0 + c;
-                    if constexpr (AB_FP32) {
-                        const float4 t = *reinterpret_cast<const float4*>(static_cast<const float*>(args.a) + off);
-                        v[0] = t.x, v[1] = t.y, v[2] = t.z, v[3] = t.w;
-                    } else {
-                        const uint4 t = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(args.a) + off);
-                        const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&t);
-#pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            const float2 f = __bfloat1622float2(p[j]);
-                            v[2 * j] = f.x, v[2 * j + 1] = f.y;
-                        }
-                    }
-                }
-                const int lane_c = c / kChunk, j = c % kChunk;
-#pragma unroll
-                for (int h = 0; h < kVec / 4; ++h) {
-                    const int qd = j / 4 + h;
-                    *reinterpret_cast<float4*>(a_s + ((rr * 8 + qd) * kChunkLanes + lane_c) * 4) =
-                        make_float4(v[4 * h], v[4 * h + 1], v[4 * h + 2], v[4 * h + 3]);
-                }
-            }
+        uint2 next_codes[2];
+        uint32_t next_sbits[2];
+        if (has_next) {
+            load_codes(k0 + kTileK, next_codes, next_sbits);
+            if constexpr (MODE >= 2) load_a(k0 + kTileK, stash);
         }
-        __syncthreads();
 
         // rank-r delta: acc = fma(b_r, a_r, acc) for r = 0 .. R_PAD - 1, from +0
         float2 acc[2][kChunk / 2];
@@ -272,23 +353,19 @@ __global__ void __launch_bounds__(kThreads, 2) requant_kernel(const Args args) {
 #pragma unroll
             for (int j = 0; j < kChunk / 2; ++j) acc[i][j] = make_float2(0.0f, 0.0f);
         if constexpr (MODE >= 2) {
-#pragma unroll 4
+#pragma unroll
             for (int rr = 0; rr < R_PAD; ++rr) {
-                const float b0 = b_s[row_local[0] * kBStride + rr];
-                const float b1 = b_s[row_local[1] * kBStride + rr];
+                const float bs[2] = {b_s[row_local[0] * kBStride + rr], b_s[row_local[1] * kBStride + rr]};
 #pragma unroll
-                for (int qd = 0; qd < 8; ++qd) {
-                    const float4 a4 = *reinterpret_cast<const float4*>(a_s + ((rr * 8 + qd) * kChunkLanes + chunk) * 4);
+                for (int qd = 0; qd < 4; ++qd) {
+                    const float4 a4 = *reinterpret_cast<const float4*>(a_cur + ((rr * 4 + qd) * kChunkLanes + chunk) * 4);
                     const float2 lo = make_float2(a4.x, a4.y), hi = make_float2(a4.z, a4.w);
-                    if constexpr (FFMA2) {
-                        ffma2(acc[0][qd * 2], lo, b0);
-                        ffma2(acc[0][qd * 2 + 1], hi, b0);
-                        ffma2(acc[1][qd * 2], lo, b1);
-                        ffma2(acc[1][qd * 2 + 1], hi, b1);
-                    } else {
-                        const float bs[2] = {b0, b1};
 #pragma unroll
-                        for (int i = 0; i < 2; ++i) {
+                    for (int i = 0; i < 2; ++i) {
+                        if constexpr (FFMA2) {
+                            ffma2(acc[i][qd * 2], lo, bs[i]);
+                            ffma2(acc[i][qd * 2 + 1], hi, bs[i]);
+                        } else {
                             acc[i][qd * 2].x = __fmaf_rn(bs[i], lo.x, acc[i][qd * 2].x);
                             acc[i][qd * 2].y = __fmaf_rn(bs[i], lo.y, acc[i][qd * 2].y);
                             acc[i][qd * 2 + 1].x = __fmaf_rn(bs[i], hi.x, acc[i][qd * 2 + 1].x);
@@ -301,125 +378,119 @@ __global__ void __launch_bounds__(kThreads, 2) requant_kernel(const Args args) {
 
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            uint4 out = codes[i];
+            uint2 out = codes[i];
             uint32_t out_s = sbits[i];
             if constexpr (MODE != 0) {
-                const float2 sb = decode_e4m3x2(sbits[i]);
-                const float s_base[2] = {sb.x, sb.y};
-                const uint32_t words[4] = {codes[i].x, codes[i].y, codes[i].z, codes[i].w};
-                uint32_t res[4];
-                out_s = 0;
+                const float s_base = decode_e4m3x2(sbits[i]).x;
+                float w[16];
+                const float amax = merge_block<ROUND_BF16>(codes[i].x, codes[i].y, __fmul_rn(s_base, dq[i]),
+                                                           args.scaling, acc[i], w);
+                if constexpr (PAIR != 0) {
+                    // fused: the merged tile; paired: the raw delta, for the transposed form
 #pragma unroll
-                for (int blk = 0; blk < 2; ++blk) {
-                    const float sc = __fmul_rn(s_base[blk], dq[i]);
-                    float w[16];
-                    decode_e2m1x8(words[2 * blk], w);
-                    decode_e2m1x8(words[2 * blk + 1], w + 8);
-                    float amax = 0.0f;
-#pragma unroll
-                    for (int j = 0; j < 16; ++j) {
-                        float x = __fmul_rn(w[j], sc);
-                        if constexpr (ROUND_BF16) x = bf16_round(x);
-                        const float2 d = acc[i][blk * 8 + j / 2];
-                        x = __fadd_rn(x, __fmul_rn(j % 2 ? d.y : d.x, args.scaling));
-                        if constexpr (ROUND_BF16) x = bf16_round(x);
-                        w[j] = x;
-                        amax = fmaxf(amax, fabsf(x));
+                    for (int j4 = 0; j4 < 4; ++j4) {
+                        const int col4 = chunk * 4 + j4;
+                        const int phys = col4 ^ ((col4 >> 3) & 3);
+                        const float4 v = PAIR == kFused
+                            ? make_float4(w[4 * j4], w[4 * j4 + 1], w[4 * j4 + 2], w[4 * j4 + 3])
+                            : make_float4(acc[i][2 * j4].x, acc[i][2 * j4].y, acc[i][2 * j4 + 1].x, acc[i][2 * j4 + 1].y);
+                        *reinterpret_cast<float4*>(w_s + row_local[i] * kTileK + phys * 4) = v;
                     }
-                    if constexpr (FUSED) {
-                        // 16-byte column groups xor-swizzled by their chunk lane
-#pragma unroll
-                        for (int j4 = 0; j4 < 4; ++j4) {
-                            const int col4 = chunk * 8 + blk * 4 + j4;
-                            const int phys = (col4 & ~7) | ((col4 ^ (col4 >> 3)) & 7);
-                            *reinterpret_cast<float4*>(w_s + row_local[i] * kTileK + phys * 4) =
-                                make_float4(w[4 * j4], w[4 * j4 + 1], w[4 * j4 + 2], w[4 * j4 + 3]);
-                        }
-                    }
-                    if constexpr (MODE == 2) {
-                        // decode + delta only: keep the values live, skip the quantizer
-                        uint32_t h = __float_as_uint(amax);
-#pragma unroll
-                        for (int j = 0; j < 16; ++j) h ^= __float_as_uint(w[j]) >> (j & 7);
-                        res[2 * blk] = h;
-                        res[2 * blk + 1] = h >> 3;
-                        out_s |= (h & 0xFF) << (8 * blk);
-                        continue;
-                    }
-                    uint32_t bits;
-                    float sdec;
-                    block_scale(amax, fq[i], args.modelopt, bits, sdec);
-                    if (args.reuse) {
-                        const bool outgrown = amax > __fmul_rn(6.0f, __fmul_rn(fq[i], s_base[blk]));
-                        if (!outgrown) {
-                            sdec = s_base[blk];
-                            bits = (sbits[i] >> (8 * blk)) & 0xFF;
-                        }
-                    }
-                    encode_block(w, sdec, fq[i], inv_fq[i], args.modelopt, res[2 * blk], res[2 * blk + 1]);
-                    out_s |= bits << (8 * blk);
                 }
-                out = make_uint4(res[0], res[1], res[2], res[3]);
+                if constexpr (MODE == 2) {
+                    // decode + delta only: keep the values live, skip the quantizer
+                    uint32_t h = __float_as_uint(amax);
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) h ^= __float_as_uint(w[j]) >> (j & 7);
+                    out = make_uint2(h, h >> 3);
+                    out_s = h & 0xFF;
+                } else {
+                    quantize_block(w, amax, fq[i], inv_fq[i], args.modelopt, args.reuse, s_base, sbits[i],
+                                   out.x, out.y, out_s);
+                }
             }
             if (row_ok[i] && col_ok) {
-                *reinterpret_cast<uint4*>(args.oq + dst_row[i] * k2 + col / 2) = out;
-                *reinterpret_cast<uint16_t*>(args.os + dst_row[i] * sf_k + col / 16) =
-                    static_cast<uint16_t>(out_s);
+                *reinterpret_cast<uint2*>(args.oq + dst_row[i] * k2 + col / 2) = out;
+                args.os[dst_row[i] * sf_k + col / 16] = static_cast<uint8_t>(out_s);
                 if (args.osfa != nullptr) {
                     const int64_t drow = dst_row[i] - static_cast<int64_t>(local_e) * N;
-                    *reinterpret_cast<uint16_t*>(args.osfa + atom_base + atom_offset(drow, col / 16, args.rk)) =
-                        static_cast<uint16_t>(out_s);
+                    args.osfa[atom_base + atom_offset(drow, col / 16, args.rk)] = static_cast<uint8_t>(out_s);
                 }
             }
         }
 
-        if constexpr (FUSED) {
-            // Transposed form: column k0 + tid, 64 rows = 4 blocks along N, fresh torchao scales.
+        if constexpr (PAIR != 0) {
+            // Transposed form: column k0 + tid % 128, rows (tid / 128) * 32 .. + 32 = 2 blocks along N,
+            // on the expert's one per-tensor scale. Fused: fresh scales of the merged tile. Paired: the
+            // transposed base merged with the transposed delta, exactly as a separate requant of it.
             __syncthreads();
-            const int kcol = k0 + tid;
+            const int c = tid % kTileK;
+            const int kcol = k0 + c;
             if (kcol < K) {
                 const float fqt = args.fq_pts[e * args.p];
                 const float inv_fqt = __fdiv_rn(1.0f, fqt);
-                const int col4 = tid / 4;
-                const int phys = (col4 & ~7) | ((col4 ^ (col4 >> 3)) & 7);
-                uint32_t res[8];
+                const int col4 = c / 4;
+                const int phys = col4 ^ ((col4 >> 3) & 3);
+                const uint32_t tw[4] = {tcodes.x, tcodes.y, tcodes.z, tcodes.w};
+                uint32_t res[4];
                 uint32_t sw = 0;
 #pragma unroll
-                for (int blk = 0; blk < 4; ++blk) {
+                for (int blk = 0; blk < 2; ++blk) {
                     float w[16];
                     float amax = 0.0f;
+                    float s_base = 0.0f;
+                    uint32_t s_bits = 0;
+                    if constexpr (PAIR == kFused) {
 #pragma unroll
-                    for (int j = 0; j < 16; ++j) {
-                        w[j] = w_s[(blk * 16 + j) * kTileK + phys * 4 + tid % 4];
-                        amax = fmaxf(amax, fabsf(w[j]));
+                        for (int j = 0; j < 16; ++j) {
+                            w[j] = w_s[(half * 32 + blk * 16 + j) * kTileK + phys * 4 + c % 4];
+                            amax = fmaxf(amax, fabsf(w[j]));
+                        }
+                    } else {
+                        float2 d[8];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j)
+                            d[j] = make_float2(w_s[(half * 32 + blk * 16 + 2 * j) * kTileK + phys * 4 + c % 4],
+                                               w_s[(half * 32 + blk * 16 + 2 * j + 1) * kTileK + phys * 4 + c % 4]);
+                        s_bits = (tsbits >> (8 * blk)) & 0xFF;
+                        s_base = decode_e4m3x2(s_bits).x;
+                        amax = merge_block<ROUND_BF16>(tw[2 * blk], tw[2 * blk + 1],
+                                                       __fmul_rn(s_base, args.dq_pts[e * args.p]), args.scaling, d, w);
                     }
                     uint32_t bits;
-                    float sdec;
-                    block_scale(amax, fqt, false, bits, sdec);
-                    encode_block(w, sdec, fqt, inv_fqt, false, res[2 * blk], res[2 * blk + 1]);
+                    quantize_block(w, amax, fqt, inv_fqt, PAIR == kPaired && args.modelopt,
+                                   PAIR == kPaired && args.reuse, s_base, s_bits, res[2 * blk], res[2 * blk + 1], bits);
                     sw |= bits << (8 * blk);
                 }
-                const int nt = K;  // rows of the transposed form
-                const int64_t trow = static_cast<int64_t>(local_e) * nt + kcol;
-                const int tk2 = N / 2, tsf = N / 16;
-                uint4* dst = reinterpret_cast<uint4*>(args.oq_t + trow * tk2 + n0 / 2);
-                dst[0] = make_uint4(res[0], res[1], res[2], res[3]);
-                dst[1] = make_uint4(res[4], res[5], res[6], res[7]);
-                *reinterpret_cast<uint32_t*>(args.os_t + trow * tsf + n0 / 16) = sw;
+                const int64_t trow = static_cast<int64_t>(local_e) * K + kcol;
+                const int nb = n0 + half * 32;
+                *reinterpret_cast<uint4*>(args.oq_t + trow * (N / 2) + nb / 2) = make_uint4(res[0], res[1], res[2], res[3]);
+                *reinterpret_cast<uint16_t*>(args.os_t + trow * (N / 16) + nb / 16) = static_cast<uint16_t>(sw);
                 if (args.osfa_t != nullptr) {
                     const int64_t tbase = static_cast<int64_t>(local_e) * args.rm_t * args.rk_t * 512;
-                    *reinterpret_cast<uint32_t*>(args.osfa_t + tbase + atom_offset(kcol, n0 / 16, args.rk_t)) = sw;
+                    *reinterpret_cast<uint16_t*>(args.osfa_t + tbase + atom_offset(kcol, nb / 16, args.rk_t)) =
+                        static_cast<uint16_t>(sw);
                 }
             }
         }
+
+        if (has_next) {
+            if constexpr (MODE >= 2) store_a(a_s + ((kt + 1 - kt_begin) & 1) * kABuf, stash);
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                codes[i] = next_codes[i];
+                sbits[i] = next_sbits[i];
+            }
+        }
+        __syncthreads();  // next A buffer written; this tile's readers of the other buffer and w_s done
     }
 }
 
-template <int R_PAD, bool AB_FP32, bool ROUND_BF16, int MODE, bool FUSED, bool FFMA2>
+template <int R_PAD, bool AB_FP32, bool ROUND_BF16, int MODE, int PAIR, bool FFMA2>
 int launch_typed(const Args& args, cudaStream_t stream) {
-    auto kernel = requant_kernel<R_PAD, AB_FP32, ROUND_BF16, MODE, FUSED, FFMA2>;
+    auto kernel = requant_kernel<R_PAD, AB_FP32, ROUND_BF16, MODE, PAIR, FFMA2>;
     const size_t smem = sizeof(float) *
-        (SharedLayout::kASize(R_PAD) + kTileM * SharedLayout::kBStride(R_PAD) + (FUSED ? kTileM * kTileK : 0));
+        (SharedLayout::kASize(R_PAD) + kTileM * SharedLayout::kBStride(R_PAD) + (PAIR ? kTileM * kTileK : 0));
     auto error = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
     if (error != cudaSuccess) return static_cast<int>(error);
     const dim3 grid((args.n + kTileM - 1) / kTileM, args.k_splits, args.e_local);
@@ -429,20 +500,25 @@ int launch_typed(const Args& args, cudaStream_t stream) {
 
 template <int R_PAD, bool AB_FP32>
 int launch_rank(const Args& args, cudaStream_t stream) {
-    if (args.fused) {
+    if (args.pair == kFused) {
         if (!args.round_bf16) return -2;
-        return args.ffma2 ? launch_typed<R_PAD, AB_FP32, true, 3, true, true>(args, stream)
-                          : launch_typed<R_PAD, AB_FP32, true, 3, true, false>(args, stream);
+        return args.ffma2 ? launch_typed<R_PAD, AB_FP32, true, 3, kFused, true>(args, stream)
+                          : launch_typed<R_PAD, AB_FP32, true, 3, kFused, false>(args, stream);
     }
-    if (!args.round_bf16) return launch_typed<R_PAD, AB_FP32, false, 3, false, false>(args, stream);
+    if (args.pair == kPaired) {
+        if (!args.round_bf16) return launch_typed<R_PAD, AB_FP32, false, 3, kPaired, true>(args, stream);
+        return args.ffma2 ? launch_typed<R_PAD, AB_FP32, true, 3, kPaired, true>(args, stream)
+                          : launch_typed<R_PAD, AB_FP32, true, 3, kPaired, false>(args, stream);
+    }
+    if (!args.round_bf16) return launch_typed<R_PAD, AB_FP32, false, 3, 0, false>(args, stream);
     if (args.mode == 3)
-        return args.ffma2 ? launch_typed<R_PAD, AB_FP32, true, 3, false, true>(args, stream)
-                          : launch_typed<R_PAD, AB_FP32, true, 3, false, false>(args, stream);
+        return args.ffma2 ? launch_typed<R_PAD, AB_FP32, true, 3, 0, true>(args, stream)
+                          : launch_typed<R_PAD, AB_FP32, true, 3, 0, false>(args, stream);
     if constexpr (R_PAD == 16 && !AB_FP32) {
         switch (args.mode) {
-            case 0: return launch_typed<16, false, true, 0, false, false>(args, stream);
-            case 1: return launch_typed<16, false, true, 1, false, false>(args, stream);
-            case 2: return launch_typed<16, false, true, 2, false, false>(args, stream);
+            case 0: return launch_typed<16, false, true, 0, 0, false>(args, stream);
+            case 1: return launch_typed<16, false, true, 1, 0, false>(args, stream);
+            case 2: return launch_typed<16, false, true, 2, 0, false>(args, stream);
         }
     }
     return -3;

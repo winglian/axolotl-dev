@@ -29,6 +29,8 @@ int launch(pybind11::dict d, uintptr_t stream) {
     a.oq = ptr<uint8_t>(u("oq"));
     a.os = ptr<uint8_t>(u("os"));
     a.osfa = ptr<uint8_t>(u("osfa"));
+    a.qt = ptr<const uint8_t>(u("qt"));
+    a.st = ptr<const uint8_t>(u("st"));
     a.oq_t = ptr<uint8_t>(u("oq_t"));
     a.os_t = ptr<uint8_t>(u("os_t"));
     a.osfa_t = ptr<uint8_t>(u("osfa_t"));
@@ -50,7 +52,7 @@ int launch(pybind11::dict d, uintptr_t stream) {
     a.modelopt = i("modelopt");
     a.reuse = i("reuse");
     a.ab_fp32 = i("ab_fp32");
-    a.fused = i("fused");
+    a.pair = i("pair");
     a.ffma2 = i("ffma2");
     a.mode = i("mode");
     a.k_splits = i("k_splits");
