@@ -74,6 +74,7 @@ def validate(inflight: bool = False, training: bool = False):
         except ProcessLookupError:
             pass
 
+    assert process.stdout is not None
     timer = threading.Timer(1700, terminate)
     timer.start()
     try:

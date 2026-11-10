@@ -7,7 +7,10 @@ import hashlib
 import importlib.util
 from pathlib import Path
 
-root = Path(importlib.util.find_spec("triton_dist").origin).parent
+spec = importlib.util.find_spec("triton_dist")
+if spec is None or spec.origin is None:
+    raise ModuleNotFoundError("triton_dist is not installed")
+root = Path(spec.origin).parent
 path = root / "kernels/nvidia/swiglu.py"
 source = path.read_text()
 expected = "7b35a846f2756ac2077e9f806b26dfa140f7dc3278a532245ea03372de2ac798"
