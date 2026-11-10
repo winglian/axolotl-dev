@@ -16,6 +16,7 @@
 #include "../jit_kernels/impls/sm100_bf16_mono_ep_backward.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mono_ep.hpp"
 #include "../jit_kernels/impls/sm100_nvfp4_mono_ep.hpp"
+#include "../jit_kernels/impls/sm100_nvfp4_mono_ep_backward.hpp"
 #include "locality_domain.hpp"
 
 namespace deep_gemm::mega {
@@ -591,6 +592,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("bf16_mono_ep", &bf16_mono_ep);
     m.def("nvfp4_mono_ep", &nvfp4_mono_ep);
     m.def("bf16_mono_ep_backward", &bf16_mono_ep_backward);
+    m.def("nvfp4_mono_ep_backward", &nvfp4_mono_ep_backward);
     m.def("bf16_mono_ep_backward_sm90", &bf16_mono_ep_backward_sm90);
     m.def("fp8_mono_ep_backward_sm90", &fp8_mono_ep_backward_sm90,
           py::arg("dx"), py::arg("ds"), py::arg("w1"), py::arg("w2t"), py::arg("w1t"),

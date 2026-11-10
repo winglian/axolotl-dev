@@ -105,10 +105,18 @@ def forward_parity(cases: str = ""):
     return _run("validate_nvfp4_forward.py", 1, env, 3400)
 
 
+@app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=3600)
+def backward_parity(cases: str = ""):
+    env = {"NVFP4_CASES": cases} if cases else {}
+    return _run("validate_nvfp4_backward.py", 1, env, 3400)
+
+
 @app.local_entrypoint()
 def main(job: str = "forward", out: str = "", cases: str = ""):
     if job == "forward":
         result = forward_parity.remote(cases)
+    elif job == "backward":
+        result = backward_parity.remote(cases)
     else:
         raise ValueError(job)
     result["modal_app_id"] = app.app_id

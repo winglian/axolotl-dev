@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from .runtime import PersistentMoE
 
 DEFAULT_RESERVED_SMS = 16
-PRECISIONS = ("auto", "bf16", "mxfp8", "fp8", "fp8_bwd")
+PRECISIONS = ("auto", "bf16", "mxfp8", "fp8", "fp8_bwd", "nvfp4_lora")
 MODES = ("auto", "fused", "dispatch")
 FORWARD_OP = "mono_ep::persistent_forward"
 BACKWARD_OP = "mono_ep::persistent_backward"
@@ -35,11 +35,17 @@ COUNT_TO_HOST_OP = "mono_ep::peer_count_to_host"
 HIDDEN_MULTIPLE = 256
 INTERMEDIATE_MULTIPLE = 128
 
-_COMPUTE_DTYPES = {"bf16": "bf16", "mxfp8": "mxfp8", "fp8": "blockwise"}
+_COMPUTE_DTYPES = {
+    "bf16": "bf16",
+    "mxfp8": "mxfp8",
+    "fp8": "blockwise",
+    "nvfp4_lora": "nvfp4_lora",
+}
 _NATIVE_BACKWARD = {
     (9, "bf16"): "bf16_mono_ep_backward_sm90",
     (10, "bf16"): "bf16_mono_ep_backward",
     (9, "fp8"): "fp8_mono_ep_backward_sm90",
+    (10, "nvfp4_lora"): "nvfp4_mono_ep_backward",
 }
 
 
@@ -76,6 +82,13 @@ def unsupported_reason(
         return "precision mxfp8 requires SM100"
     if resolved == "fp8" and major != 9:
         return "precision fp8 (blockwise E4M3) requires SM90"
+    if resolved == "nvfp4_lora":
+        if major != 10:
+            return "precision nvfp4_lora (frozen packed NVFP4 experts + LoRA) requires SM100"
+        if hidden % 256 or intermediate % 256:
+            return (
+                "precision nvfp4_lora requires hidden and intermediate multiples of 256"
+            )
     if hidden % HIDDEN_MULTIPLE:
         return f"hidden size {hidden} is not a multiple of {HIDDEN_MULTIPLE}"
     if intermediate % INTERMEDIATE_MULTIPLE:
@@ -382,6 +395,11 @@ class MonoEPRuntime:
             and _single_host(group)
             else "nccl"
         )
+        if resolved == "nvfp4_lora" and backward_backend != "native":
+            raise ValueError(
+                "mono_ep: precision nvfp4_lora needs the SM100 NVFP4 native backward "
+                "(rebuild vendored DeepGEMM; single host only)"
+            )
         physical = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
@@ -398,7 +416,10 @@ class MonoEPRuntime:
                 intermediate,
                 compute_dtype=_COMPUTE_DTYPES[resolved],
                 retain_activations=False,
-                backward_backend=backward_backend,
+                # The LoRA path owns its backward workspace (see nvfp4_lora.py).
+                backward_backend="nccl"
+                if resolved == "nvfp4_lora"
+                else backward_backend,
                 reserved_sms=reserved_sms,
             )
         except BaseException:
@@ -441,6 +462,40 @@ class MonoEPRuntime:
 
     __call__ = forward
 
+    def forward_lora(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        lora_a1: torch.Tensor,
+        lora_b1: torch.Tensor,
+        lora_a2: torch.Tensor,
+        lora_b2: torch.Tensor,
+        experts,
+        cache,
+    ) -> torch.Tensor:
+        """``precision="nvfp4_lora"``: frozen packed NVFP4 experts (``experts``, a
+        :class:`mono_ep.nvfp4_lora.Nvfp4LoraExperts`) plus adapters ``A1 [E_local, r, H]``,
+        ``B1 [E_local, 2I, r]`` (gate rows then up rows), ``A2 [E_local, r, I]``,
+        ``B2 [E_local, H, r]``; ``cache`` is the :class:`mono_ep.nvfp4_lora.RequantCache`
+        the optimizer's post-step hook invalidates."""
+        if self._moe is None:
+            raise RuntimeError("mono_ep runtime used after destroy()")
+        from .nvfp4_lora import nvfp4_lora_moe
+
+        return nvfp4_lora_moe(
+            x.contiguous(),
+            topk_idx.contiguous(),
+            topk_weights.contiguous(),
+            lora_a1,
+            lora_b1,
+            lora_a2,
+            lora_b2,
+            self._moe,
+            experts,
+            cache,
+        )
+
     def destroy(self) -> None:
         """Release the workspace; call only after every graph using it has finished."""
         if self._moe is None:
@@ -451,6 +506,7 @@ class MonoEPRuntime:
         for buffer in (
             self._moe.buffer,
             getattr(self._moe._peer_backward, "buffer", None),
+            getattr(getattr(self._moe, "_nvfp4_backward", None), "buffer", None),
         ):
             if buffer is not None:
                 buffer.destroy()
