@@ -18,7 +18,9 @@ import modal
 app = modal.App("axolotl-mono-ep-nvfp4-requant")
 image = None
 if modal.is_local():
-    from modal_nvfp4_lora import image
+    from modal_nvfp4_lora import ROOT, image as lora_image
+
+    image = lora_image.add_local_dir(ROOT / "tests", "/probe/tests")
 
 ENV = {"PYTHONPATH": "/probe/src", "PYTHONUNBUFFERED": "1", "OMP_NUM_THREADS": "1"}
 SECTIONS = (
@@ -73,6 +75,14 @@ def script(name: str):
     env = {**os.environ, **ENV}
     code, lines = _stream(["python", f"/probe/examples/{name}"], env, 1700)
     return dict(returncode=code, result=None, tail="".join(lines[-80:]))
+
+
+@app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=1800)
+def pytest_run(path: str):
+    env = {**os.environ, **ENV}
+    cmd = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", f"/probe/{path}"]
+    code, lines = _stream(cmd, env, 1700)
+    return dict(returncode=code, result=None, tail="".join(lines[-40:]))
 
 
 def _parse_raw(text):
@@ -159,6 +169,8 @@ def main(
 ):
     if job == "validate":
         result = validate.remote(cases, skip_small)
+    elif job.startswith("tests/"):
+        result = pytest_run.remote(job)
     elif job.endswith(".py"):
         result = script.remote(job)
     elif job == "ncu":

@@ -12,6 +12,7 @@ from rank-``r`` grouped GEMMs on the BF16 pools. No base-weight gradients and
 no fp32 masters of the base.
 """
 
+import functools
 import os
 import socket
 import types
@@ -42,10 +43,11 @@ def requant_modules():
 
 
 def requant_backend(backend=None):
-    """``triton`` (default), ``cuda`` (same bytes, SM100 conversions) or
-    ``cuda_fused`` (transposed forms quantized from the merged tile: a numerics
-    change); ``MONO_EP_NVFP4_REQUANT`` when not given."""
-    backend = backend or os.environ.get("MONO_EP_NVFP4_REQUANT", "triton")
+    """``cuda`` (default: SM100 kernel, the Triton kernel's bytes), ``triton``
+    (the vendored Triton kernel) or ``cuda_fused`` (transposed forms quantized
+    from the merged tile: a numerics change); ``MONO_EP_NVFP4_REQUANT`` when
+    not given."""
+    backend = backend or os.environ.get("MONO_EP_NVFP4_REQUANT", "cuda")
     if backend not in REQUANT_BACKENDS:
         raise ValueError(f"requant backend must be one of {REQUANT_BACKENDS}")
     return backend
@@ -122,8 +124,6 @@ class Nvfp4LoraExperts:
         self.s1 = s1.view(torch.float8_e4m3fn).contiguous()
         self.q2 = q2.view(torch.uint8).contiguous()
         self.s2 = s2.view(torch.float8_e4m3fn).contiguous()
-        self.q1i = self.q1.index_select(1, self.perm).contiguous()
-        self.s1i = self.s1.index_select(1, self.perm).contiguous()
         # Transposed bases for the backward's K-major operands (dequant -> transpose -> quantize, same scales);
         # the fused requant builds those forms from the merged tile and needs none
         if self.backend != "cuda_fused":
@@ -145,6 +145,15 @@ class Nvfp4LoraExperts:
         bwd[:, 3] = self.pts2
         bwd[:, 4] = self.pts1
         self.scales_forward, self.scales_backward = fwd, bwd
+
+    @functools.cached_property
+    def q1i(self):
+        """``q1`` in interleaved rows, for the Triton requant only (the CUDA kernels interleave on store)."""
+        return self.q1.index_select(1, self.perm).contiguous()
+
+    @functools.cached_property
+    def s1i(self):
+        return self.s1.index_select(1, self.perm).contiguous()
 
     def _transposed(self, q, s, pts):
         e, n, k2 = q.shape

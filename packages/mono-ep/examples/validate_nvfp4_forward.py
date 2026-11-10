@@ -166,7 +166,9 @@ def run_case(name, experts, hidden, inter, topk, tokens, skew, sm, device):
     a2 = torch.randn(experts * RANK, inter, device=device, generator=gen) / inter**0.5
     b2 = torch.randn(hidden, RANK * experts, device=device, generator=gen) * 0.02
     # MONO_EP_NVFP4_REQUANT picks the kernel; the forward forms are the same bytes for cuda and cuda_fused
-    backend = os.environ.get("MONO_EP_NVFP4_REQUANT", "triton")
+    from mono_ep.nvfp4_lora import requant_backend
+
+    backend = requant_backend()
     requant_lora_packed = (
         triton_requant.requant_lora_packed
         if backend == "triton"

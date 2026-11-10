@@ -333,8 +333,26 @@ def main():
 
     # Per-step rebuilds, timed on their own (the training flow runs them in the optimizer post-step hook)
     rebuilds = {}
+
+    def merged_with(backend):
+        # every requant kernel on the same layer; cuda_fused needs no transposed base
+        current, layer.backend = layer.backend, backend
+        try:
+            return layer.merged(*adapters)
+        finally:
+            layer.backend = current
+
+    backends = [layer.backend] + [
+        b
+        for b in ("triton", "cuda", "cuda_fused")
+        if b != layer.backend and (b == "cuda_fused" or hasattr(layer, "q1t"))
+    ]
     for name, fn in (
         ("nvfp4_lora/requant_4_forms", lambda: layer.merged(*adapters)),
+        *(
+            (f"nvfp4_lora/requant_4_forms[{b}]", lambda b=b: merged_with(b))
+            for b in backends[1:]
+        ),
         (
             "fp4_cute_a2a/requant_2_forms_plus_bf16_dequant",
             lambda: a2a.rebuild(*adapters),

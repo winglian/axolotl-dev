@@ -299,6 +299,14 @@ step-keyed cache used by the kernel path lives in `mono_ep/nvfp4_lora.py`
 `nvfp4_requant_cache` (adapter version, step keys, side stream) is kept for the
 follow-up.
 
+The rebuild runs the SM100 CUDA kernel `include/nvfp4_requant_launch.cu`
+(`nvfp4_requant.cuda_nvfp4_requant`) by default: the Triton kernel's bytes
+with hardware E2M1 / E4M3 conversions, each weight and its transposed base in
+one paired pass. `MONO_EP_NVFP4_REQUANT=triton` keeps the vendored Triton
+kernel; `cuda_fused` builds w1t / w2t from the merged tile instead of from
+transposed bases (more accurate backward, different bytes, no transposed base
+in memory). See the experiment log, "CUDA NVFP4 requant".
+
 - `nvfp4_lora` bypasses `weight_layouts` (the requant output already is the
   kernel layout). One `LayerRequant` per MoE layer builds `{w1, w2, w1t, w2t}`
   from the frozen base and the live adapters (`full_tensor()` on FSDP2
