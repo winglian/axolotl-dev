@@ -3562,8 +3562,8 @@ spills plus runtimecorrectness. Production native unchanged during experiments.
 
 ### Pause and restart handoff (2026-11-09)
 
-User requested pause after matched H100 results. See HANDOFF-2026-11-09.md
-for scope, frozen snapshots, completed diagnostics, failures, and pending work.
+User requested pause after matched H100 results. See the hand-off note
+(HANDOFF-2026-11-09.md, kept untracked beside the benchmark artifacts) for scope, frozen snapshots, completed diagnostics, failures, and pending work.
 Do not launch further optimization/diagnostics before user resumes.
 Modal H100 requests can automatically upgrade to H200: first four paired jobs
 were H200, preserved as h200_auto_upgrade_* artifacts. Strict comparison uses
@@ -3579,4 +3579,4 @@ See benchmarks/hopper_comparison_20261109.md for full native/control F/B/F+B/AC
 max/mean-rank tables and H100/H200 deltas. Native AC max-rank medians:
 v1 59.816, v6 48.539, trap-v6 49.116, v7 48.412 ms. H100 overhead2.5–3.8%;
 NCCL control overhead6.5–7.2%. Both hardware labels verified in artifacts.
-Handoff finalized in HANDOFF-2026-11-09.md; do not resume automatically.
+Handoff finalized in that hand-off note; do not resume automatically.
