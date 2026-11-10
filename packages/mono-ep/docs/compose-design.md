@@ -523,3 +523,195 @@ layout is for SonicMoE and for fullgraph compilation. Against the current fused 
 gap is the local kernel's forward and the two backward GEMMs plus the three serialized
 transfers, no longer the transfer kernels, and section 4 lists what is left on the transfer
 side (overlap of the next layer's gather, FP8 transport, fusing the routing remaps).
+
+### 5.5 DeepEP baseline in the EP8 contract (2026-11-10)
+
+The question behind this rerun: do the streamed and compact dispatch modes with SonicMoE beat
+DeepEP with SonicMoE? DeepEP had never been timed in this program, so the contract script grew
+`--deep-ep` rows that run axolotl's own `_DeepEPBackend` (`experts_fn.py`, normal-mode intranode
+kernels, K-wide rows: one row per (token, destination rank) with the top-k ids and weights on
+the row, `get_dispatch_layout` per forward) around the same local kernels, in the same
+allocation, scopes, routings, warmups and samples as every other row. The Modal driver adds the
+DeepEP layer only under `MONO_EP_CONTRACT_DEEP_EP=1`, so the 5.4 images and artifacts are
+untouched; the new artifacts are `benchmarks/dispatch_sonicmoe_contract_deep_ep_{h100,b200}.json`.
+
+**Build.** DeepEP `9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee` (tag v1.2.1, the commit
+`docker/Dockerfile-cloud-blackwell-uv` and `cicd/deep_ep.py` pin), package version
+`1.2.1+9af0e0d`. NVSHMEM comes from torch's `nvidia-nvshmem-cu13` wheel, **3.4.5**, which
+DeepEP's `setup.py` finds on its own (`cpp_links_nvshmem: libnvshmem_host.so.3`, the internode
+and low-latency kernels are compiled in but unused here). Flags: `TORCH_CUDA_ARCH_LIST=9.0`
+(Hopper layer) / `10.0` (the Blackwell cloud image's own build), `MAX_JOBS=16`,
+`CFLAGS/CXXFLAGS/NVCC_PREPEND_FLAGS=-I/usr/local/cuda/include/cccl` (CUDA 13.0 moved
+`cuda/std`), and setup.py's own `-O3 -rdc=true --ptxas-options=--register-usage-level=10
+-DDISABLE_AGGRESSIVE_PTX_INSTRS -std=c++20`; wheel via `python setup.py bdist_wheel` (the
+tag's build backend fails under `pip install .`). The Hopper layer built in 45 s on the Modal
+builder (image `im-WuNsHfm3JwbMVvPIOFROFH`); the Blackwell image
+(`axolotlai/axolotl-cloud-uv:main-py3.14-cu130-2.14.1-blackwell`) already ships the same
+commit built for sm_100, so its layer is an import check (`im-LX8azkx0s5OX2y2WJMtPmL`). No
+Blackwell-specific revision was needed: v1.2.1 builds and runs on sm_100 (the parity below is
+from that build); the one revision constraint is the other way round, DeepEP main needs CUDA
+13.1 and these images are CUDA 13.0.
+
+**Backend settings (axolotl defaults, reported from the job).** `deep_ep.Buffer(group=WORLD,
+num_nvl_bytes=256 MiB, num_rdma_bytes=0, low_latency_mode=False)` from `configure_buffer` with
+the `ExpertParallelArgs` defaults; `Buffer.get_dispatch_config(8) = Config(Buffer.num_sms, 6,
+256, 6, 128)` and `get_combine_config(8) = Config(Buffer.num_sms, 4, 256, 6, 128)`;
+`Buffer.num_sms` = **20**, DeepEP's class default, since the plugin never calls
+`set_num_sms`; `dispatch` / `combine` with `async_finish=False`,
+`allocate_on_comm_stream=False`, `expert_alignment=1`, no `num_worst_tokens`, no
+`previous_event`. The buffer-size hint of the 8-rank dispatch preset at hidden 2048 is 126 MB
+for 20 SMs and grows 6.3 MB per SM pair (252 MB at 40 SMs, 403 MB at 64), so the plugin's 256
+MiB buffer admits at most 40 SMs. Two knobs were run both ways:
+
+- `barrier_ep` (a `torch.cuda.synchronize` + NCCL barrier before every combine and
+  backward-of-dispatch, the plugin's autotune-skew guard): `deep_ep` rows run with
+  `AXOLOTL_EP_NO_BARRIER=1`, the `deep_ep_barrier` row is the backend as shipped. It costs
+  2% on H100 (below the 5% bar), so the kernel-only row is the comparison line.
+- `num_sms`: a 3+10-iteration fwd+bwd sweep on balanced routing (recorded under
+  `deep_ep_num_sms_sweep`), and because the best value moved the default by more than 5% the
+  job added a full `deep_ep_sms<N>+sonicmoe` row. On H100 the sweep stopped at 40 (the buffer
+  bound above); the B200 job was run with `--deep-ep-num-sms-max 64`, which sizes the buffer
+  to the largest hint instead (the kernels address the buffer per channel, so the default
+  rows do not see the larger allocation; both sizes are in the artifact).
+
+8 x H100 80GB (Modal `ap-ML4Jf7M3m03WlwFVGclzL6`, 0.50 GPU-h, 225 s), median max-rank ms,
+balanced / skewed routing:
+
+| variant | F bal | B bal | 2F+B bal | F skew | B skew | 2F+B skew |
+|---|---|---|---|---|---|---|
+| torch all-to-all + SonicMoE (control) | 6.71 | 8.23 | 20.88 | 7.46 | 9.62 | 23.76 |
+| **DeepEP + SonicMoE, 20 SMs (kernels only)** | 7.09 | 9.28 | 21.09 | 8.37 | 11.22 | 25.30 |
+| DeepEP + SonicMoE, 20 SMs, as shipped (`barrier_ep`) | 7.27 | 9.41 | 21.48 | 8.54 | 11.36 | 25.68 |
+| **DeepEP + SonicMoE, 40 SMs (kernels only)** | 5.61 | 7.72 | 17.56 | 6.50 | 9.24 | 20.73 |
+| dispatch, legacy transfers + SonicMoE | 12.74 | 14.93 | 40.28 | 12.34 | 14.76 | 38.76 |
+| dispatch, streamed + SonicMoE | 6.37 | 8.61 | 20.77 | 7.22 | 9.97 | 23.88 |
+| dispatch, streamed compact + SonicMoE | 5.89 | 7.91 | 19.30 | 6.76 | 9.41 | 22.53 |
+| torch all-to-all + grouped_mm | 35.79 | 58.96 | 129.68 | 41.25 | 68.19 | 149.80 |
+| DeepEP + grouped_mm, 20 SMs (kernels only) | 36.28 | 60.42 | 123.97 | 42.19 | 70.06 | 144.25 |
+| dispatch, legacy transfers + grouped_mm | 55.70 | 90.37 | 201.43 | 55.31 | 90.15 | 200.29 |
+| dispatch, streamed + grouped_mm | 49.53 | 84.02 | 182.42 | 50.48 | 85.42 | 185.72 |
+| dispatch, streamed compact + grouped_mm | 35.09 | 58.76 | 128.37 | 40.60 | 67.96 | 148.61 |
+| fused mono_ep, base build (5.4 (b), fp8 on H100) | 4.73 | 9.74 | 18.55 | 5.70 | 11.97 | 22.64 |
+
+H100 `num_sms` sweep (fwd+bwd, balanced, median max-rank ms): 20 SMs 16.15, 24 SMs 15.06,
+32 SMs 13.63, 40 SMs 13.15 (0.81x of the default).
+
+8 x B200 (Modal `ap-1frtFOq9kwibpsjjWsMTtR`, 0.54 GPU-h, 242 s; DeepEP buffer sized to the
+64-SM hint, 403 MB, for the extended sweep), median max-rank ms, balanced / skewed routing:
+
+| variant | F bal | B bal | 2F+B bal | F skew | B skew | 2F+B skew |
+|---|---|---|---|---|---|---|
+| torch all-to-all + SonicMoE (control) | 4.89 | 4.90 | 14.35 | 5.10 | 5.64 | 15.33 |
+| **DeepEP + SonicMoE, 20 SMs (kernels only)** | 8.22 | 9.06 | 21.75 | 9.32 | 10.46 | 24.82 |
+| DeepEP + SonicMoE, 20 SMs, as shipped (`barrier_ep`) | 8.44 | 9.25 | 22.13 | 9.52 | 10.66 | 25.24 |
+| **DeepEP + SonicMoE, 64 SMs (kernels only)** | 4.44 | 5.10 | 12.80 | 4.94 | 5.94 | 14.00 |
+| dispatch, legacy transfers + SonicMoE | 8.38 | 9.48 | 25.58 | 8.30 | 9.56 | 25.58 |
+| dispatch, streamed + SonicMoE | 4.43 | 4.82 | 12.60 | 4.53 | 5.44 | 13.61 |
+| dispatch, streamed compact + SonicMoE | 4.19 | 4.32 | 12.42 | 4.48 | 5.03 | 13.31 |
+| torch all-to-all + grouped_mm | 24.56 | 41.18 | 89.74 | 28.28 | 47.49 | 103.55 |
+| DeepEP + grouped_mm, 20 SMs (kernels only) | 28.69 | 45.20 | 95.44 | 33.11 | 52.31 | 110.31 |
+| dispatch, legacy transfers + grouped_mm | 38.46 | 62.81 | 139.09 | 38.52 | 63.11 | 139.44 |
+| dispatch, streamed + grouped_mm | 33.94 | 58.25 | 125.56 | 34.50 | 59.08 | 127.53 |
+| dispatch, streamed compact + grouped_mm | 24.02 | 40.47 | 87.96 | 27.71 | 46.89 | 101.83 |
+| fused mono_ep, base build (5.4 (b), bf16 on B200) | 2.41 | 6.50 | 10.89 | 2.88 | 8.23 | 13.50 |
+
+B200 `num_sms` sweep (fwd+bwd, balanced, median max-rank ms): 20 SMs 17.12, 24 SMs 15.21,
+32 SMs 12.75, 40 SMs 11.37, 48 SMs 10.34, 64 SMs 9.38 (0.55x of the default, and still
+falling at the last point; the B200 has 148 SMs). The 5.4 rows reproduce within 0.3 ms on
+both GPUs (streamed 12.60 vs 12.57, compact 12.42 vs 12.32, torch 14.35 vs 14.16 on B200;
+20.77 / 19.30 / 20.88 vs 21.07 / 20.68 / 22.55 on H100), so the DeepEP rows can be read
+against either table.
+
+**Rows and bytes per direction.** From DeepEP's dispatch layout on the actual routing (the
+`transfer_rows` field), per rank:
+
+| routing | K-wide rows received (total / remote) | remote rows min / max over ranks | fixed-layout rows (streamed compute) | K-duplicated slots (fused only) | NVLink payload per direction per rank |
+|---|---|---|---|---|---|
+| balanced | 87453 / 76530 | 76401 / 76882 | 131072 | 131072 | 298.9 MiB |
+| skewed | 86527 / 75689 | 63087 / 88548 | 131072 | 131072 | 295.7 MiB |
+
+The payload rows are the same for DeepEP, streamed and compact: DeepEP moves one K-wide row per
+(token, destination rank), and both dispatch-mode transfers mask unrouted rows at the load
+(`peer_stream._pull_rows` / `_push_rows`), so the fixed layout costs the streamed mode compute
+rows (131072 vs ~87k) and memory, not bytes on the wire; the K-duplicated layout belongs to the
+fused runtime alone. Each of dispatch (x), combine (y), backward-of-combine (dy) and
+backward-of-dispatch (dx partials) moves that payload once in BF16, so a checkpointed 2F+B
+step moves 6 x 298.9 MiB = 1.75 GiB per rank over NVLink in every one of these rows.
+Metadata differs slightly: DeepEP ships 8 int64 ids + 8 fp32 weights + a source index per
+routed row (7.3 MiB per dispatch), mono-ep's `collect_routing` reads every peer's full
+capacity-row `idx` / `w` slabs (10.5 MiB per dispatch) and pushes fp32 top-k weight grads per
+routed row in the backward. With equal bytes, per-byte and per-layer rankings coincide; in
+ms per GiB moved (2F+B, balanced / skewed), H100: DeepEP 20 SMs 12.04 / 14.61, DeepEP 40 SMs
+10.03 / 11.98, streamed 11.86 / 13.78, compact 11.02 / 13.00, torch 11.92 / 13.72;
+B200: DeepEP 20 SMs 12.42 / 14.33, DeepEP 64 SMs 7.31 / 8.09, streamed 7.19 / 7.85, compact
+7.09 / 7.68, torch 8.19 / 8.85.
+
+**Ratios, checkpointed 2F+B, balanced / skewed:**
+
+| | H100 | B200 |
+|---|---|---|
+| torch all-to-all + SonicMoE vs DeepEP 20 SMs | 0.99x / 0.94x | 0.66x / 0.62x |
+| streamed + SonicMoE vs DeepEP 20 SMs | 0.98x / 0.94x | 0.58x / 0.55x |
+| compact + SonicMoE vs DeepEP 20 SMs | 0.92x / 0.89x | 0.57x / 0.54x |
+| DeepEP as shipped (`barrier_ep`) vs DeepEP 20 SMs | 1.02x / 1.02x | 1.02x / 1.02x |
+| DeepEP best SM count vs DeepEP 20 SMs | 0.83x / 0.82x (40 SMs) | 0.59x / 0.56x (64 SMs) |
+| compact + SonicMoE vs DeepEP best SM count | 1.10x / 1.09x | 0.97x / 0.95x |
+| streamed + SonicMoE vs DeepEP best SM count | 1.18x / 1.15x | 0.98x / 0.97x |
+| DeepEP + grouped_mm vs torch + grouped_mm | 0.96x / 0.96x | 1.06x / 1.07x |
+| compact + grouped_mm vs DeepEP + grouped_mm | 1.04x / 1.03x | 0.92x / 0.92x |
+
+**What DeepEP's SM reservation does to the SonicMoE compute: nothing, in this path.** The
+backend runs dispatch, the local kernel and combine serially on one stream, so DeepEP's
+`num_sms` is never contending with the GEMMs. The profiler breakdown (one fwd+bwd per row
+after the warm, self device time on rank 0, `profiler_breakdown_rank0`) puts the quack GEMM
+kernels at 5.42-5.43 ms balanced / 7.06-7.12 ms skewed on H100 in every SonicMoE row (torch,
+streamed, compact, DeepEP with and without the barrier), the same kernels at the same
+timings. What the reservation does bound is DeepEP's own transfer kernels: at 20 SMs
+`intranode::dispatch` is 1.63 ms per call and `intranode::combine` 2.12 ms per call on H100
+(~190 / ~150 GB/s per rank one way for 299 MiB; the H100 NVLink one-way nominal is 450 GB/s),
+against 0.98 ms per `_pull_rows` and ~0.9 ms per full-width `_push_rows` for the streamed
+transfers; doubling the SM budget to 40 recovers 3 ms of the 16 ms fwd+bwd. On B200 the gap
+is wider: the GEMM bucket is 2.69-2.78 ms in every SonicMoE row, DeepEP's dispatch is 2.57 ms
+and its combine 3.58 ms per call at 20 SMs (~120 / ~90 GB/s per rank one way against a 900
+GB/s one-way nominal), `_pull_rows` 0.46 ms and a full-width `_push_rows` ~0.44 ms (about 0.7
+of nominal, the 5.3 microbench figure), and the SM sweep halves DeepEP's fwd+bwd from 17.1 ms
+at 20 SMs to 9.4 ms at 64 without flattening. DeepEP's normal kernels move bytes from a fixed
+SM subset, so on a GPU whose NVLink is twice as fast per SM they need proportionally more SMs
+to fill the link; the streamed transfers launch `4 * SMs` programs and fill it by default.
+(The torch row's NCCL kernels spin while waiting for peers, so their 15 / 10 ms of device time
+is not a transfer cost; the `deep_ep_barrier` row's 6.6 ms in `notify_dispatch` on H100 is the
+rank's wait after the host barrier, and the 2.4 ms in the symmetric-memory `barrier_kernel` of
+the B200 dispatch-mode rows is the same kind of wait.) The 64-SM row was not profiled (the
+breakdown covers the fixed list of five rows).
+
+**Parity (both GPUs, both routings, `deep_ep_parity_tolerance`, bound rel-L2 1e-2, no
+failures).** DeepEP + SonicMoE and DeepEP + grouped_mm against torch + the same local kernel:
+`dscore`, `dgate_up`, `ddown` bitwise, `y` / `dx` rel-L2 3.37e-03 (balanced) / 3.39e-03
+(skewed), the FP32-combine-vs-BF16-`index_add_` difference of 5.1. The compact dispatch mode
+is **bitwise equal to DeepEP** on `y`, `dx`, `dscore`, `dgate_up` and `ddown` (both sum the
+per-rank partials in FP32 in rank order and round once), as are the barrier and 40-SM DeepEP
+rows against the 20-SM one. Quack candidates failed: 0; `_enter` extra barriers: 0; mean-rank
+and max-rank 2F+B medians within 0.02 ms for the torch, DeepEP and compact rows. The peak
+memory column of these runs is not comparable to 5.4: the three dispatch workspaces, the fused
+runtime and the DeepEP buffer are resident throughout, so every row reads ~17 GiB above its 5.4
+(a) figure; the relative ordering (fixed-layout rows +9.8 GiB, grouped_mm rows +19 GiB) is unchanged.
+
+**Reading.** Against the DeepEP configuration axolotl ships (20 SMs, 256 MiB buffer,
+`barrier_ep`), both dispatch modes with SonicMoE win on both GPUs: on H100 DeepEP ties torch
+all-to-all and the streamed mode and the compact mode is 8-11% faster; on B200 DeepEP is
+1.5-1.6x slower than torch and 1.7-1.9x slower than streamed / compact. That configuration is not
+DeepEP's ceiling, because its normal kernels scale with `num_sms`: at 40 SMs (the most the
+plugin's buffer admits) DeepEP + SonicMoE is the fastest composed row on H100, 10% ahead of
+compact and 18% ahead of streamed; on B200 even 64 SMs (a buffer 1.5x the plugin default)
+only brings DeepEP to within 2-3% of streamed and 3-5% behind compact, with the sweep still
+improving. Same bytes on the wire and bitwise-identical results throughout. So: against DeepEP
+as shipped, compact and streamed beat it everywhere; against DeepEP tuned, they lose by ~10% on
+H100 and keep a 3-5% (compact) / 2-3% (streamed) lead on B200 at 64 SMs that a larger SM budget
+would probably close. Two follow-ups fall out for the plugin regardless of the dispatch mode:
+expose `num_sms` (`Buffer.set_num_sms`) and size `expert_parallel_num_nvl_bytes` from the
+config's hint, since the shipped 20 SMs leave 17-44% of the DeepEP layer time on the table.
+The structural difference that remains is that DeepEP's kernels are built to run on a reserved
+SM subset alongside compute on another stream, which this serialized backend never exploits,
+while the streamed transfers take the whole GPU for ~0.5-1 ms per op; the overlap of the next
+layer's gather in section 4 is the dispatch mode's own headroom, and a compute-overlapped
+DeepEP would be the baseline to beat after that.
