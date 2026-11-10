@@ -191,6 +191,10 @@ sm100_nvfp4_mono_ep_backward_impl(void* y,
     constexpr auto kDispatchLoadHint = (kOptions & 256u) ?
         cute::TMA::CacheHintSm100::EVICT_NORMAL : cute::TMA::CacheHintSm100::EVICT_FIRST;
     DG_STATIC_ASSERT(not kEvictFirstHStores or kStagedPoolStores, "Evict-first h stores need the staged stores");
+    // 2048: lean recompute tail. The per-task fence only has to order this CTA's h/dz stores before the completer
+    // handshake, so Dh / recompute tasks skip it and each CTA fences once at the block's last recompute tile and
+    // adds all its recompute tiles to the L1 empty count there (the ring and completer only read the full count).
+    constexpr bool kLeanRecomputeTail = kOptions & 2048u;
 
     // Dispatch pull geometry: whole x and dy rows in one buffer per warp, or (opt-in, frees pipeline stages at wide
     // hidden) two slots of one x chunk and one dy chunk each, double-buffered. Every chunk holds whole 64-element groups.
@@ -1564,15 +1568,25 @@ sm100_nvfp4_mono_ep_backward_impl(void* y,
                     ptx::tcgen05_before_thread_sync();
                     shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                 }
-                __threadfence();
-                asm volatile("fence.proxy.async.global;" ::: "memory");
+                constexpr uint32_t kNumInnerClusters = kIntermediateHidden / (2 * BLOCK_N);
+                const bool is_last_recompute = task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
+                    task_info.n_cluster_idx + 1 == kNumInnerClusters;
+                if (not kLeanRecomputeTail or is_last_recompute) {
+                    __threadfence();
+                    asm volatile("fence.proxy.async.global;" ::: "memory");
+                }
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (not is_dh) {
-                    if (epilogue_warp_idx == 0 and cute::elect_one_sync())
-                        ptx::red_add(workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        if constexpr (kLeanRecomputeTail) {
+                            if (is_last_recompute)
+                                ptx::red_add(workspace.get_l1_empty_count_ptr(ring_block_idx), 2u * kNumInnerClusters);
+                        } else {
+                            ptx::red_add(workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                        }
+                    }
                     completed_n_blocks ^= 1ull << n_block_idx;
-                    if (task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
-                        task_info.n_cluster_idx + 1 == kIntermediateHidden / (2 * BLOCK_N)) {
+                    if (is_last_recompute) {
                         trace_dscore_partial = trace_clock();
                         for (uint32_t row = epilogue_thread_idx; row < valid_m; row += kNumEpilogueThreads) {
                             const auto src = *workspace.get_token_src_metadata_ptr(pool_m_idx + row);

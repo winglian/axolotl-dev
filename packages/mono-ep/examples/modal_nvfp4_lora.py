@@ -90,6 +90,8 @@ def _overlay_headers():
 def _run(script, nproc, extra_env, timeout):
     _overlay_headers()
     out = "/tmp/result.json"  # nosec B108
+    # A failed case must not return the previous case's file
+    Path(out).unlink(missing_ok=True)
     env = {**os.environ, **ENV, **extra_env, "NVFP4_OUT": out}
     cmd = [
         "python",
@@ -116,39 +118,41 @@ def _run(script, nproc, extra_env, timeout):
     return dict(returncode=proc.returncode, result=result, tail="".join(lines[-80:]))
 
 
-def _requant_env(requant):
-    """``MONO_EP_NVFP4_REQUANT`` for the remote run (the requant kernel selector)."""
-    return {"MONO_EP_NVFP4_REQUANT": requant} if requant else {}
+def _requant_env(requant, env=""):
+    """``MONO_EP_NVFP4_REQUANT`` (the requant kernel selector) plus ``K=V,K2=V2`` opt-in
+    knobs from the command line for the remote run."""
+    extra = dict(kv.split("=", 1) for kv in env.split(",") if kv)
+    return extra | ({"MONO_EP_NVFP4_REQUANT": requant} if requant else {})
 
 
 @app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=3600)
-def forward_parity(cases: str = "", requant: str = ""):
-    env = _requant_env(requant) | ({"NVFP4_CASES": cases} if cases else {})
+def forward_parity(cases: str = "", requant: str = "", env: str = ""):
+    env = _requant_env(requant, env) | ({"NVFP4_CASES": cases} if cases else {})
     return _run("validate_nvfp4_forward.py", 1, env, 3400)
 
 
 @app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=3600)
-def backward_parity(cases: str = "", requant: str = ""):
-    env = _requant_env(requant) | ({"NVFP4_CASES": cases} if cases else {})
+def backward_parity(cases: str = "", requant: str = "", env: str = ""):
+    env = _requant_env(requant, env) | ({"NVFP4_CASES": cases} if cases else {})
     return _run("validate_nvfp4_backward.py", 1, env, 3400)
 
 
 @app.function(image=image, gpu="B200:4", cpu=16, memory=131072, timeout=3600)
-def fsdp2_training(requant: str = ""):
+def fsdp2_training(requant: str = "", env: str = ""):
     return _run(
         "validate_nvfp4_fsdp2.py",
         4,
-        {"NCCL_MAX_CTAS": "8"} | _requant_env(requant),
+        {"NCCL_MAX_CTAS": "8"} | _requant_env(requant, env),
         3400,
     )
 
 
 @app.function(image=image, gpu="B200:8", cpu=32, memory=262144, timeout=7200)
-def timing(cases: str = "", requant: str = ""):
+def timing(cases: str = "", requant: str = "", env: str = ""):
     runs = {}
     for case in (cases or "qwen30b,beam").split(","):
-        env = {"NVFP4_BENCH_CASE": case} | _requant_env(requant)
-        runs[case] = _run("benchmark_nvfp4_lora_b200.py", 8, env, 3000)
+        case_env = {"NVFP4_BENCH_CASE": case} | _requant_env(requant, env)
+        runs[case] = _run("benchmark_nvfp4_lora_b200.py", 8, case_env, 3000)
     return dict(
         returncode=max(r["returncode"] for r in runs.values()),
         result={k: r["result"] for k, r in runs.items()},
@@ -157,15 +161,15 @@ def timing(cases: str = "", requant: str = ""):
 
 
 @app.function(image=cudnn_image, gpu="B200:8", cpu=32, memory=262144, timeout=7200)
-def timing_cudnn(cases: str = "", requant: str = ""):
+def timing_cudnn(cases: str = "", requant: str = "", env: str = ""):
     """``timing`` plus the ``cudnn_grouped_a2a`` variant (the runner adds it when the
     cuDNN frontend is importable)."""
-    return timing.local(cases, requant)
+    return timing.local(cases, requant, env)
 
 
 @app.function(image=image, gpu="B200", cpu=8, memory=65536, timeout=7200)
-def profile(cases: str = "", requant: str = ""):
-    env = _requant_env(requant) | ({"NVFP4_CASES": cases} if cases else {})
+def profile(cases: str = "", requant: str = "", env: str = ""):
+    env = _requant_env(requant, env) | ({"NVFP4_CASES": cases} if cases else {})
     return _run("profile_nvfp4_lora_b200.py", 1, env, 7000)
 
 
@@ -271,19 +275,25 @@ def ncu(cases: str = ""):
 
 
 @app.local_entrypoint()
-def main(job: str = "forward", out: str = "", cases: str = "", requant: str = ""):
+def main(
+    job: str = "forward",
+    out: str = "",
+    cases: str = "",
+    requant: str = "",
+    env: str = "",
+):
     if job == "forward":
-        result = forward_parity.remote(cases, requant)
+        result = forward_parity.remote(cases, requant, env)
     elif job == "backward":
-        result = backward_parity.remote(cases, requant)
+        result = backward_parity.remote(cases, requant, env)
     elif job == "fsdp2":
-        result = fsdp2_training.remote(requant)
+        result = fsdp2_training.remote(requant, env)
     elif job == "timing":
-        result = timing.remote(cases, requant)
+        result = timing.remote(cases, requant, env)
     elif job == "profile":
-        result = profile.remote(cases, requant)
+        result = profile.remote(cases, requant, env)
     elif job == "timing_cudnn":
-        result = timing_cudnn.remote(cases, requant)
+        result = timing_cudnn.remote(cases, requant, env)
     elif job == "ncu":
         result = ncu.remote(cases)
     elif job == "cudnn":

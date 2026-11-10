@@ -26,6 +26,7 @@ from torch.autograd.function import once_differentiable
 from .persistent_backward import owned_backward_ring_tokens
 
 POOL_BLOCK = 128
+OPTIONS_ENV = "MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS"
 
 
 REQUANT_BACKENDS = ("triton", "cuda", "cuda_fused")
@@ -310,10 +311,13 @@ def attach_post_step_hook(optimizer, cache):
 class Nvfp4PersistentBackward:
     """Native SM100 NVFP4 backward: own BF16 symmetric buffer for the dy exchange,
     BF16 pools (x, dy, h, dz), packed FP4 pools with scale words (x, dy, dz) and
-    the per-row dy/dz scales."""
+    the per-row dy/dz scales. ``options`` (default: the launcher's) pins the
+    kernel options bitmask for this instance."""
 
-    def __init__(self, runtime):
+    def __init__(self, runtime, options=None):
         import deep_gemm
+
+        self.options = options
 
         if runtime.compute_dtype != "nvfp4_lora":
             raise ValueError(
@@ -415,6 +419,25 @@ class Nvfp4PersistentBackward:
         self.buffer.topk_weights[:tokens].copy_(scores)
         dx = torch.empty_like(x)
         ds = torch.empty_like(scores, dtype=torch.float32)
+        # The launcher reads the options from the environment at every call
+        saved = os.environ.get(OPTIONS_ENV)
+        if self.options is not None:
+            os.environ[OPTIONS_ENV] = str(self.options)
+        try:
+            self._launch(dx, ds, merged)
+        finally:
+            if self.options is not None:
+                if saved is None:
+                    os.environ.pop(OPTIONS_ENV)
+                else:
+                    os.environ[OPTIONS_ENV] = saved
+        self.finished = torch.cuda.Event()
+        self.finished.record(stream)
+        return dx, ds
+
+    def _launch(self, dx, ds, merged):
+        import deep_gemm
+
         deep_gemm._C.nvfp4_mono_ep_backward(
             dx,
             ds,
@@ -442,9 +465,6 @@ class Nvfp4PersistentBackward:
             self.buffer.l1_acts.shape[0],
             self.runtime.topk,
         )
-        self.finished = torch.cuda.Event()
-        self.finished.record(stream)
-        return dx, ds
 
 
 def padded_offsets(starts, counts):

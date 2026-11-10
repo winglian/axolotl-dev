@@ -140,7 +140,9 @@ static void nvfp4_mono_ep_backward(
     const char* options_selector = std::getenv("MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS");
     const uint32_t options = options_selector == nullptr ? kDefaultNvfp4BackwardOptions :
         static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10));
-    DG_HOST_ASSERT((options & ~3u) == 0);
+    // Opt-in bit beyond the defaults: 2048 lean recompute tail. This bitmask is the NVFP4 backward's own; it is
+    // separate from the SM100 BF16 backward's options (where 512 is in-kernel dW and 2048 the MXFP8 backward).
+    DG_HOST_ASSERT((options & ~(3u | 2048u)) == 0);
     // Exact `SharedStorage` size of the kernel for `n` TMA/UMMA stages (asserted by the kernel at run time)
     const auto exact_smem_for_pull = [&](const int& n, const int& pull) {
         const int pull_slots = pull == whole_row_pull ? 1 : 2;
