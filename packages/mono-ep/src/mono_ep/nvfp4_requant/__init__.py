@@ -12,7 +12,12 @@ until then, kernel-layout and transposed-output additions land here, not in
 Axolotl.
 """
 
-from . import nvfp4_requant, nvfp4_requant_cache, triton_nvfp4_requant
+from . import (
+    cuda_nvfp4_requant,
+    nvfp4_requant,
+    nvfp4_requant_cache,
+    triton_nvfp4_requant,
+)
 from .nvfp4_requant import (
     RequantBuffers,
     RequantNumerics,
@@ -31,6 +36,7 @@ __all__ = [
     "RequantNumerics",
     "RequantResult",
     "attach_post_step_hook",
+    "cuda_nvfp4_requant",
     "dequantize_nvfp4_packed_ref",
     "nvfp4_requant",
     "nvfp4_requant_cache",

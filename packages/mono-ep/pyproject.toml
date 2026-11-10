@@ -29,4 +29,4 @@ testpaths = ["tests"]
 markers = ["gpu: requires a CUDA GPU", "gpu_blackwell: requires Hopper or Blackwell", "slow: extended kernel compilation or validation"]
 
 [tool.setuptools.package-data]
-mono_ep = ["include/*.cuh", "include/*.cpp", "include/*.cu"]
+mono_ep = ["include/*.cuh", "include/*.h", "include/*.cpp", "include/*.cu"]

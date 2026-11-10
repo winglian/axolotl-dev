@@ -27,13 +27,28 @@ from .persistent_backward import owned_backward_ring_tokens
 POOL_BLOCK = 128
 
 
+REQUANT_BACKENDS = ("triton", "cuda", "cuda_fused")
+
+
 def requant_modules():
-    """The vendored packed requant kernel and references (``mono_ep.nvfp4_requant``)."""
+    """The vendored packed requant kernels and references (``mono_ep.nvfp4_requant``)."""
     from . import nvfp4_requant as pkg
 
     return types.SimpleNamespace(
-        requant=pkg.nvfp4_requant, triton_requant=pkg.triton_nvfp4_requant
+        requant=pkg.nvfp4_requant,
+        triton_requant=pkg.triton_nvfp4_requant,
+        cuda_requant=pkg.cuda_nvfp4_requant,
     )
+
+
+def requant_backend(backend=None):
+    """``triton`` (default), ``cuda`` (same bytes, SM100 conversions) or
+    ``cuda_fused`` (transposed forms quantized from the merged tile: a numerics
+    change); ``MONO_EP_NVFP4_REQUANT`` when not given."""
+    backend = backend or os.environ.get("MONO_EP_NVFP4_REQUANT", "triton")
+    if backend not in REQUANT_BACKENDS:
+        raise ValueError(f"requant backend must be one of {REQUANT_BACKENDS}")
+    return backend
 
 
 def interleave_perm(n2, device):
@@ -76,11 +91,26 @@ class Nvfp4LoraExperts:
     ``input_scale`` is the checkpoint's ``(pts_x, pts_h)`` pair for the static
     activation quantization of the forward (``(1, 1)`` for weight-only exports).
     The dy and dz operands of the backward are scaled per row by the kernel.
+    ``backend`` picks the requant kernel (:func:`requant_backend`).
     """
 
-    def __init__(self, q1, s1, pts1, q2, s2, pts2, *, scaling, input_scale=(1.0, 1.0)):
+    def __init__(
+        self,
+        q1,
+        s1,
+        pts1,
+        q2,
+        s2,
+        pts2,
+        *,
+        scaling,
+        input_scale=(1.0, 1.0),
+        backend=None,
+    ):
         mods = requant_modules()
         self.requant, self.triton_requant = mods.requant, mods.triton_requant
+        self.cuda_requant = mods.cuda_requant
+        self.backend = requant_backend(backend)
         self.scaling = float(scaling)
         self.experts, n1, k1 = q1.shape
         self.hidden, self.inter = 2 * k1, n1 // 2
@@ -94,9 +124,11 @@ class Nvfp4LoraExperts:
         self.s2 = s2.view(torch.float8_e4m3fn).contiguous()
         self.q1i = self.q1.index_select(1, self.perm).contiguous()
         self.s1i = self.s1.index_select(1, self.perm).contiguous()
-        # Transposed bases for the backward's K-major operands (dequant -> transpose -> quantize, same scales)
-        self.q1t, self.s1t = self._transposed(self.q1, self.s1, self.pts1)
-        self.q2t, self.s2t = self._transposed(self.q2, self.s2, self.pts2)
+        # Transposed bases for the backward's K-major operands (dequant -> transpose -> quantize, same scales);
+        # the fused requant builds those forms from the merged tile and needs none
+        if self.backend != "cuda_fused":
+            self.q1t, self.s1t = self._transposed(self.q1, self.s1, self.pts1)
+            self.q2t, self.s2t = self._transposed(self.q2, self.s2, self.pts2)
         pts_x, pts_h = (float(v) for v in input_scale)
         fwd = torch.zeros(self.experts, 8, device=device, dtype=torch.float32)
         fwd[:, 0] = 1.0 / (6.0 * pts_x)
@@ -141,6 +173,16 @@ class Nvfp4LoraExperts:
         ).view(e, n, 2 * k2)
 
     def _requant(self, q, s, pts, lora_a, lora_b):
+        if self.backend != "triton":
+            return self.cuda_requant.requant_natural(
+                q,
+                s,
+                pts,
+                lora_a.to(torch.bfloat16),
+                lora_b.to(torch.bfloat16),
+                self.scaling,
+                pts,
+            )
         e, r = lora_a.shape[:2]
         a = lora_a.reshape(e * r, lora_a.shape[2]).to(torch.bfloat16).contiguous()
         b = (
@@ -157,6 +199,15 @@ class Nvfp4LoraExperts:
         """Requant results for ``w1`` (interleaved rows), ``w2``, ``w1t``, ``w2t``
         from adapters ``a1 [E, r, H]``, ``b1 [E, 2I, r]``, ``a2 [E, r, I]``, ``b2 [E, H, r]``."""
         a1, b1, a2, b2 = (t.detach() for t in (a1, b1, a2, b2))
+        if self.backend == "cuda_fused":
+            bf = lambda t: t.to(torch.bfloat16)  # noqa: E731
+            r1, r1t = self.cuda_requant.requant_fused(
+                self.q1, self.s1, self.pts1, bf(a1), bf(b1), self.scaling, interleave=8
+            )
+            r2, r2t = self.cuda_requant.requant_fused(
+                self.q2, self.s2, self.pts2, bf(a2), bf(b2), self.scaling
+            )
+            return r1, r2, r1t, r2t
         r1 = self._requant(
             self.q1i, self.s1i, self.pts1, a1, b1.index_select(1, self.perm)
         )
