@@ -85,13 +85,17 @@ def nvfp4_lora_package(mono_ep_package, monkeypatch):
     contract and an experts class recording its constructor arguments."""
 
     class RequantCache:
-        def __init__(self):
+        def __init__(self, mode=None):
+            self.mode = mode or "layer"
             self.version = 0
             self.entries = {}
 
         def invalidate(self):
             self.version += 1
             self.entries.clear()
+
+        def stats(self):
+            return dict(mode=self.mode, version=self.version)
 
     class Nvfp4LoraExperts:
         instances = []
@@ -106,6 +110,9 @@ def nvfp4_lora_package(mono_ep_package, monkeypatch):
             self.experts, n1, k1 = q1.shape
             self.hidden, self.inter = 2 * k1, n1 // 2
             Nvfp4LoraExperts.instances.append(self)
+
+        def transposed_base_bytes(self):
+            return 0
 
     module = types.ModuleType("mono_ep.nvfp4_lora")
     module.RequantCache = RequantCache

@@ -6,7 +6,9 @@ rank), out of FSDP's hands; per MoE layer a :class:`mono_ep.nvfp4_lora.Nvfp4Lora
 reuses their packed bytes and scales in place. Every optimizer step invalidates the
 :class:`mono_ep.nvfp4_lora.RequantCache`, so the next forward requantizes the merged
 weights from the updated adapter (gradient accumulation reuses them; FSDP2 adapters are
-unsharded when the forward reads them).
+unsharded when the forward reads them). ``expert_parallel_mono_ep_nvfp4_merged_cache``
+picks whether the cache holds every layer's forms across the step (``all``) or builds each
+layer's forms just in time and keeps the last two layers (``layer``, the default).
 """
 
 from __future__ import annotations
@@ -282,11 +284,20 @@ class Nvfp4LoraState:
         if len(self.layers) == 1:
             LOG.info(
                 f"nvfp4_lora: first MoE layer built ({num_experts} local experts, "
-                f"hidden {entry.hidden}, intermediate {entry.inter}); the transposed base "
-                f"adds {added / 2**20:.0f} MiB per layer, the merged cache about "
-                f"{2 * added / 2**20:.0f} MiB more per layer"
+                f"hidden {entry.hidden}, intermediate {entry.inter}, requant backend "
+                f"{entry.backend}, merged cache {self.cache.mode}); the layer adds "
+                f"{added / 2**20:.0f} MiB besides the packed base"
+                + (
+                    " (a stored transposed base)"
+                    if entry.transposed_base_bytes()
+                    else ""
+                )
             )
         return entry
+
+    def stats(self) -> dict:
+        """Requant-cache counters (builds per kind, hits, evictions, resident bytes)."""
+        return self.cache.stats()
 
 
 _STATE: Nvfp4LoraState | None = None

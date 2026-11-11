@@ -265,8 +265,25 @@ def main():
                 )
             optimizer.step()
         if state is not None:
-            # one rebuild per layer and step: micro-batches and recomputes reuse the merged weights
-            assert builds == [LAYERS * (step + 1) for step in range(STEPS)], builds
+            if state.cache.mode == "all":
+                # one rebuild per layer and step: micro-batches and recomputes reuse the merged weights
+                assert builds == [LAYERS * (step + 1) for step in range(STEPS)], builds
+            else:
+                # just in time: the forward, the checkpoint recompute and the backward of every
+                # layer each build their forms, per micro-batch; the recompute of the last
+                # `capacity` layers of a micro-batch still finds its forward forms in the LRU
+                forward_per_micro = LAYERS + max(LAYERS - state.cache.capacity, 0)
+                per_step = (forward_per_micro + LAYERS) * MICRO
+                assert builds == [per_step * (step + 1) for step in range(STEPS)], (
+                    builds
+                )
+                assert (
+                    state.cache.forward_builds == forward_per_micro * MICRO * STEPS
+                ), state.stats()
+                assert state.cache.backward_builds == LAYERS * MICRO * STEPS, (
+                    state.stats()
+                )
+                assert state.cache.max_entries <= 2, state.stats()
             assert state.cache.version == STEPS
         moved = {
             n: _relative(p.to_local().detach(), starts[n]) for n, p in adapters.items()

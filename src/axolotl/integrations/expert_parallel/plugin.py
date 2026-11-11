@@ -871,6 +871,9 @@ class ExpertParallelPlugin(BasePlugin):
         os.environ["MONO_EP_STORED_CONTEXT"] = (
             getattr(cfg, "expert_parallel_mono_ep_stored_context", None) or "auto"
         )
+        os.environ["MONO_EP_NVFP4_MERGED_CACHE"] = (
+            getattr(cfg, "expert_parallel_mono_ep_nvfp4_merged_cache", None) or "layer"
+        )
         tokens = self._mono_ep_tokens_per_rank(cfg)
         alignment = MonoEPRuntime.token_alignment()
         tokens = -(-tokens // alignment) * alignment

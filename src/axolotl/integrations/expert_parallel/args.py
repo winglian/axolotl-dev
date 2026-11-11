@@ -84,6 +84,13 @@ class ExpertParallelArgs(BaseModel):
     It only acts when the fused op is recomputed, i.e. activation checkpointing without
     ``selective`` (which saves the fused op's output instead)."""
 
+    expert_parallel_mono_ep_nvfp4_merged_cache: Literal["layer", "all"] = "layer"
+    """``nvfp4_lora`` precision: when the merged NVFP4 expert weights (frozen base plus the
+    current adapter) are requantized (exported as ``MONO_EP_NVFP4_MERGED_CACHE``). ``layer``
+    builds one layer's forms right before its forward and again before its backward and keeps
+    only the last two layers' forms resident; ``all`` builds every layer's forms once per
+    optimizer step and holds them across the step (more memory, fewer requant launches)."""
+
     expert_parallel_num_nvl_bytes: int = 256 << 20
 
     expert_parallel_num_rdma_bytes: int = 0
