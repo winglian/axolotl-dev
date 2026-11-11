@@ -207,11 +207,11 @@ def requant_k_blocks(pool, starts, ends, scale_words=None):
 
 
 def _requant_config(cols):
-    """``MONO_EP_SM100_REQUANT_CONFIG`` = ``col_blocks,num_warps,reciprocal[,persistent]``; default ``1,2,1``
+    """``MONO_EP_SM100_REQUANT_CONFIG`` = ``col_blocks,num_warps,reciprocal[,persistent]`` (``/`` also separates); default ``1,2,1``
     (bitwise equal to the original ``1,4,0`` and a third faster). ``persistent`` > 0 launches that many programs
     per SM, striding over the used row blocks."""
     value = os.getenv("MONO_EP_SM100_REQUANT_CONFIG", "1,2,1")
-    fields = [int(v) for v in value.split(",")]
+    fields = [int(v) for v in value.replace("/", ",").split(",")]
     col_blocks, num_warps, reciprocal = fields[:3]
     persistent = fields[3] if len(fields) > 3 else 0
     if (cols // 128) % col_blocks:
