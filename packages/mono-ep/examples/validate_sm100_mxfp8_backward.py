@@ -9,8 +9,10 @@ Runs under ``torchrun`` on one or two B200s. For balanced and skewed routing it 
 dW against one FP32 reference computed from the original BF16 activations and FP32 masters
 (BF16 rounding at z, dh, dz, h and the partial dx as the kernel stores them). The MXFP8 x/dy
 pool rows are also checked bitwise against the dequantized host quantization of the source
-rows, so the transport is exact. Errors: relative L2, relative L1 (sum |d| / sum |ref|, the
-metric of mixture-of-kittens' ``check_correctness``) and max |d|.
+rows, so the transport is exact. Under ``MONO_EP_SM100_DW_PRECISION=mxfp8`` the BF16 x / dy / dz
+pools stay unwritten, and the row checks read the dequantized E4M3 pools instead. Errors:
+relative L2, relative L1 (sum |d| / sum |ref|, the metric of mixture-of-kittens'
+``check_correctness``) and max |d|.
 """
 
 import argparse
@@ -41,6 +43,16 @@ def dequantized(rows):
     q, s = prepare_persistent_mxfp8(rows.contiguous())
     exp = s.view(torch.uint8).view(rows.shape[0], -1).float()
     scale = torch.exp2(exp - 127.0).repeat_interleave(32, dim=1)
+    return (q.float() * scale).bfloat16()
+
+
+def dequantized_pool(q, words):
+    """BF16 rows of a backward E4M3 pool from its packed ``[C / 128, scale rows]`` UE8M0 words."""
+    rows, cols = q.shape
+    r = torch.arange(rows, device=q.device)
+    sf_rows = r // 128 * 128 + r % 32 * 4 + r % 128 // 32
+    exp = words[:, sf_rows].t().contiguous().view(torch.uint8).view(rows, cols // 32)
+    scale = torch.exp2(exp.float() - 127.0).repeat_interleave(32, dim=1)
     return (q.float() * scale).bfloat16()
 
 
@@ -128,6 +140,7 @@ def quantizer_parity(w1, w2):
 
 
 def run(args):
+    from mono_ep.dw import dw_precision
     from mono_ep.runtime import PersistentMoE
 
     rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -228,6 +241,14 @@ def run(args):
                 )
             # Pooled rows: map each pool row back to its source token by hashing the BF16 x pool row
             x_pool, dy_pool, h_pool, dz_pool = backend.pools[:4]
+            if precision == "mxfp8" and dw_precision() == "mxfp8":
+                # MXFP8 dW leaves the BF16 x / dy / dz pools unwritten (option bit 8192)
+                qx, qdy, qdz, sx, sdy, sdz = backend._mx_resources().pools
+                x_pool, dy_pool, dz_pool = (
+                    dequantized_pool(qx, sx),
+                    dequantized_pool(qdy, sdy),
+                    dequantized_pool(qdz, sdz),
+                )
             src_x = deq_x if precision == "mxfp8" else source_x
             src_dy = deq_dy if precision == "mxfp8" else source_dy
             keys = row_hash(src_x, probe)
