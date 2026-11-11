@@ -64,6 +64,13 @@ class TestMonoEPValidation:
         )
         assert cfg.expert_parallel_mono_ep_bounded
 
+    def test_workspace_bound_key(self, min_base_cfg):
+        assert _validate(min_base_cfg).expert_parallel_mono_ep_workspace_bound == "auto"
+        cfg = _validate(min_base_cfg, expert_parallel_mono_ep_workspace_bound="max")
+        assert cfg.expert_parallel_mono_ep_workspace_bound == "max"
+        with pytest.raises(ValueError):
+            _validate(min_base_cfg, expert_parallel_mono_ep_workspace_bound="small")
+
     def test_warns_dispatch_chunks_ignored(self, min_base_cfg, warnings):
         _validate(min_base_cfg, expert_parallel_dispatch_chunks=2)
         assert "dispatch_chunks is ignored" in warnings()

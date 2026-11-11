@@ -52,6 +52,7 @@ expert_parallel_size: 8
 expert_parallel_backend: mono_ep
 expert_parallel_mono_ep_mode: auto       # fused | dispatch
 expert_parallel_mono_ep_precision: auto  # fused mode: bf16 | mxfp8 | fp8 | fp8_bwd
+expert_parallel_mono_ep_workspace_bound: auto  # fused mode, SM100: auto | max
 fsdp_version: 2
 fsdp_config:
   state_dict_type: FULL_STATE_DICT

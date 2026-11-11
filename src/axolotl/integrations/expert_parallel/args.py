@@ -63,6 +63,12 @@ class ExpertParallelArgs(BaseModel):
     BF16 forward with blockwise FP8 backward. Master weights stay in their own dtype. The
     dispatch mode moves BF16 rows and leaves compute precision to the local kernel."""
 
+    expert_parallel_mono_ep_workspace_bound: Literal["auto", "max"] = "auto"
+    """Fused mode on SM100: size the backward's per-rank row pools from the rows each layer's
+    forward actually routed to this rank (exported as ``MONO_EP_WORKSPACE_BOUND``). ``auto``
+    starts at 1.25 x tokens x top-k and grows on demand, so no tuning is needed; ``max``
+    restores the worst-case sizing (every token of every rank routed here)."""
+
     expert_parallel_num_nvl_bytes: int = 256 << 20
 
     expert_parallel_num_rdma_bytes: int = 0

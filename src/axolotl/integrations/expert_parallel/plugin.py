@@ -827,6 +827,9 @@ class ExpertParallelPlugin(BasePlugin):
             )
         if self.__dict__.get("_mono_ep_runtime") is not None:
             return
+        os.environ["MONO_EP_WORKSPACE_BOUND"] = (
+            getattr(cfg, "expert_parallel_mono_ep_workspace_bound", None) or "auto"
+        )
         tokens = self._mono_ep_tokens_per_rank(cfg)
         alignment = MonoEPRuntime.token_alignment()
         tokens = -(-tokens // alignment) * alignment
