@@ -299,7 +299,7 @@ static void mxfp8_mono_ep_backward(
     DG_HOST_ASSERT(dy_ptrs.size() == world and ds_ptrs.size() == world and dy_sf_ptrs.size() == world);
     DG_HOST_ASSERT(max_tokens > 0 and tokens <= max_tokens and ring_tokens > 0 and ring_tokens % 128 == 0);
     DG_HOST_ASSERT(topk > 0 and topk <= 32 and 32 % topk == 0);
-    DG_HOST_ASSERT(experts > 0 and inner > 0 and hidden % 512 == 0 and hidden <= 2048 and inner % 256 == 0);
+    DG_HOST_ASSERT(experts > 0 and inner > 0 and hidden % 512 == 0 and inner % 256 == 0);
     DG_HOST_ASSERT(w1.size(1) == 2 * inner and dx.size(1) == hidden);
     DG_HOST_ASSERT(w2t.size(0) == experts and w2t.size(1) == inner and w2t.size(2) == hidden);
     DG_HOST_ASSERT(w1t.size(0) == experts and w1t.size(1) == hidden and w1t.size(2) == 2 * inner);

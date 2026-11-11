@@ -650,28 +650,36 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             return true;
         };
         if constexpr (kMXFP8) {
-            // E4M3 x and dy rows (one NVLink round trip per routed row) plus one packed UE8M0 word per 128 columns,
-            // fetched by one lane each; the next row's load is issued as soon as this row's buffer has been read.
+            // E4M3 x and dy rows (one NVLink round trip per routed row) plus one packed UE8M0 word per 128 columns;
+            // lane l fetches x and dy words l + 32 w. The next row's load is issued as soon as this row's buffer has
+            // been read.
             constexpr uint32_t kRowBytes = kHidden;
             constexpr uint32_t kNumSFWords = kHidden / 128;
-            DG_STATIC_ASSERT(kHidden % 512 == 0 and 2 * kNumSFWords <= 32, "MXFP8 transport needs hidden % 512 == 0 and hidden <= 2048");
+            constexpr uint32_t kSFWordsPerLane = math::constexpr_ceil_div(kNumSFWords, 32u);
+            DG_STATIC_ASSERT(kHidden % 512 == 0, "MXFP8 transport needs hidden % 512 == 0");
             DG_STATIC_ASSERT(kNumBytesPerPull == 2 * kRowBytes, "The MXFP8 pull buffer holds one x and one dy row");
             DG_STATIC_ASSERT(not (kDiagAblate & 64u), "The copy ablation is BF16-only");
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
             constexpr uint32_t kSFPoolRows = kNumRanks * kNumMaxTokensPerRank * kNumTopk + kNumExpertsPerRank * 128;
             const auto smem_x = pull_buffer.get_base_ptr();
             const auto smem_dy = math::advance_ptr(smem_x, kRowBytes);
-            const auto load_sf = [&](const PullRow& row, uint32_t& sf_word) {
-                if (lane_idx < kNumSFWords) {
-                    sf_word = *sym_buffer.map(
-                        buffer.input_sf_buffer.get_data_buffer(row.src_token_idx).template get_base_ptr<uint32_t>() + lane_idx, row.rank);
-                } else if (lane_idx < 2 * kNumSFWords) {
-                    sf_word = *backward.dy_sf.map(
-                        backward.dy_sf.template get_base_ptr<uint32_t*>() + static_cast<uint64_t>(row.src_token_idx) * kNumSFWords +
-                        (lane_idx - kNumSFWords), row.rank);
+            using sf_words_t = uint32_t[2 * kSFWordsPerLane];
+            const auto load_sf = [&](const PullRow& row, sf_words_t& sf_word) {
+                const auto* x_sf = sym_buffer.map(
+                    buffer.input_sf_buffer.get_data_buffer(row.src_token_idx).template get_base_ptr<uint32_t>(), row.rank);
+                const auto* dy_sf = backward.dy_sf.map(
+                    backward.dy_sf.template get_base_ptr<uint32_t*>() + static_cast<uint64_t>(row.src_token_idx) * kNumSFWords,
+                    row.rank);
+                #pragma unroll
+                for (uint32_t w = 0; w < kSFWordsPerLane; ++ w) {
+                    const uint32_t idx = lane_idx + 32 * w;
+                    if (idx < kNumSFWords) {
+                        sf_word[w] = x_sf[idx];
+                        sf_word[kSFWordsPerLane + w] = dy_sf[idx];
+                    }
                 }
             };
-            const auto issue = [&](const PullRow& row, uint32_t& sf_word) {
+            const auto issue = [&](const PullRow& row, sf_words_t& sf_word) {
                 if (cute::elect_one_sync()) {
                     ptx::tma_load_1d(smem_x, row.src_x, pull_mbarrier, kRowBytes, kDispatchLoadHint);
                     ptx::tma_load_1d(smem_dy, row.src_dy, pull_mbarrier, kRowBytes, kDispatchLoadHint);
@@ -682,7 +690,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             };
             uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
             PullRow cur, next;
-            uint32_t cur_sf = 0, next_sf = 0;
+            sf_words_t cur_sf = {}, next_sf = {};
             bool has_cur = resolve(token_idx, cur);
             if (has_cur)
                 issue(cur, cur_sf);
@@ -716,9 +724,14 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 // Scale words into the UTCCP-ordered (MN-major, 4 x 32 transposed) pools the GEMM loaders read; they
                 // are written by the generic proxy and read by TMA
                 const uint32_t sf_row = (pool_token_idx / 128) * 128 + (pool_token_idx % 32) * 4 + (pool_token_idx % 128) / 32;
-                if (lane_idx < 2 * kNumSFWords) {
-                    auto* sf_pool = reinterpret_cast<uint32_t*>(lane_idx < kNumSFWords ? backward.sx_pool : backward.sdy_pool);
-                    sf_pool[static_cast<uint64_t>(lane_idx % kNumSFWords) * kSFPoolRows + sf_row] = cur_sf;
+                #pragma unroll
+                for (uint32_t w = 0; w < kSFWordsPerLane; ++ w) {
+                    const uint32_t idx = lane_idx + 32 * w;
+                    if (idx < kNumSFWords) {
+                        reinterpret_cast<uint32_t*>(backward.sx_pool)[static_cast<uint64_t>(idx) * kSFPoolRows + sf_row] = cur_sf[w];
+                        reinterpret_cast<uint32_t*>(backward.sdy_pool)[static_cast<uint64_t>(idx) * kSFPoolRows + sf_row] =
+                            cur_sf[kSFWordsPerLane + w];
+                    }
                 }
                 asm volatile("fence.proxy.async.global;" ::: "memory");
 
@@ -751,7 +764,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumChunksPerLane; ++ i) {
                         const uint32_t chunk = i * 32 + lane_idx;
-                        const uint32_t word = __shfl_sync(0xffffffff, cur_sf, op * kNumSFWords + chunk / 8);
+                        // Word chunk / 8 = 4 i + lane / 8 sits in register i / 8 of lane (4 i + lane / 8) % 32
+                        DG_STATIC_ASSERT(kNumSFWords % 4 == 0, "Scale words of one chunk group share a register");
+                        const uint32_t word = __shfl_sync(0xffffffff, op == 0 ? cur_sf[i / 8] : cur_sf[kSFWordsPerLane + i / 8],
+                                                          (chunk / 8) % 32);
                         const float scale = __uint_as_float(((word >> (((chunk / 2) % 4) * 8)) & 0xffu) << 23);
                         const auto convert = [&](const uint32_t& packed) {
                             uint32_t out[2];
@@ -798,7 +814,9 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     }
                 }
                 cur = next;
-                cur_sf = next_sf;
+                #pragma unroll
+                for (uint32_t w = 0; w < 2 * kSFWordsPerLane; ++ w)
+                    cur_sf[w] = next_sf[w];
                 has_cur = has_next;
             }
         } else {
