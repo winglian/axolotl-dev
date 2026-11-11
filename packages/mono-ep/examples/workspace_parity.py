@@ -23,6 +23,7 @@ from mok_vs_mono_ep import SHAPES, _skewed_routing
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
+    parser.add_argument("--dtype", choices=("bf16", "blockwise"), default="bf16")
     args = parser.parse_args()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -42,7 +43,14 @@ def main():
         torch.cuda.get_device_properties(local_rank).multi_processor_count
     )
     runtime = PersistentMoE(
-        dist.group.WORLD, experts, tokens, topk, hidden, inner, fuse_activation=True
+        dist.group.WORLD,
+        experts,
+        tokens,
+        topk,
+        hidden,
+        inner,
+        fuse_activation=True,
+        compute_dtype=args.dtype,
     )
     os.environ["MONO_EP_WORKSPACE_BOUND"] = "max"
     worst = NativePersistentBackward(runtime)
@@ -148,6 +156,7 @@ def main():
         )
     payload = dict(
         shape=args.shape,
+        dtype=args.dtype,
         results=results,
         timing=timing,
         ring_tokens=dict(

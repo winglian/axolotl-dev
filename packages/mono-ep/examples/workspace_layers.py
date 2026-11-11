@@ -27,6 +27,7 @@ from torch.utils.checkpoint import checkpoint
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", choices=sorted(SHAPES), default="30b")
+    parser.add_argument("--dtype", choices=("bf16", "blockwise"), default="bf16")
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--microbatches", type=int, default=2)
     args = parser.parse_args()
@@ -48,7 +49,14 @@ def main():
         torch.cuda.get_device_properties(local_rank).multi_processor_count
     )
     runtime = PersistentMoE(
-        dist.group.WORLD, experts, tokens, topk, hidden, inner, fuse_activation=True
+        dist.group.WORLD,
+        experts,
+        tokens,
+        topk,
+        hidden,
+        inner,
+        fuse_activation=True,
+        compute_dtype=args.dtype,
     )
     os.environ["MONO_EP_WORKSPACE_BOUND"] = "max"
     worst = NativePersistentBackward(runtime)
@@ -170,6 +178,7 @@ def main():
     dist.all_reduce(counters, op=dist.ReduceOp.MAX)
     payload = dict(
         shape=args.shape,
+        dtype=args.dtype,
         layers=args.layers,
         microbatches=args.microbatches,
         dx=[compare(a, b) for a, b in zip(dx_auto, dx_max, strict=True)],

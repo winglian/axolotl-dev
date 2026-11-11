@@ -32,6 +32,7 @@ def _max(value):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
+    parser.add_argument("--dtype", choices=("bf16", "blockwise"), default="bf16")
     parser.add_argument(
         "--routing", choices=("balanced", "skewed", "adversarial"), default="balanced"
     )
@@ -81,7 +82,14 @@ def main():
     torch.cuda.synchronize()
     used0, alloc0 = _used(), torch.cuda.memory_allocated()
     runtime = PersistentMoE(
-        dist.group.WORLD, experts, tokens, topk, hidden, inner, fuse_activation=True
+        dist.group.WORLD,
+        experts,
+        tokens,
+        topk,
+        hidden,
+        inner,
+        fuse_activation=True,
+        compute_dtype=args.dtype,
     )
     native = NativePersistentBackward(runtime)
     runtime._peer_backward = native
@@ -105,6 +113,7 @@ def main():
     bound = native.bound
     payload = dict(
         shape=args.shape,
+        dtype=args.dtype,
         routing=args.routing,
         mode=os.getenv("MONO_EP_WORKSPACE_BOUND", "auto"),
         after_construction_gib=built,
