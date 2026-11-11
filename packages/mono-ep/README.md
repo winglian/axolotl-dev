@@ -113,8 +113,12 @@ adds are in [docs/trl-integration.md](docs/trl-integration.md).
 ### NVFP4 LoRA (SM100)
 
 LoRA on frozen packed NVFP4 experts runs through the package API
-(`MonoEPRuntime(precision="nvfp4_lora").forward_lora(...)`), not yet from an Axolotl config:
-[docs/trl-integration.md](docs/trl-integration.md#nvfp4-lora).
+(`MonoEPRuntime(precision="nvfp4_lora").forward_lora(...)`,
+[docs/trl-integration.md](docs/trl-integration.md#nvfp4-lora)) and from Axolotl with
+`expert_parallel_mono_ep_precision: nvfp4_lora`. The merged NVFP4 weights are built just in time
+per layer (`MONO_EP_NVFP4_MERGED_CACHE=layer`, the two most recent layers resident) and the
+transposed backward forms are quantized from the merged tile (`MONO_EP_NVFP4_REQUANT=cuda_fused`):
+Qwen3-30B-A3B-NVFP4 LoRA at EP4 on B200 peaks at 12.2 GiB per rank instead of 24.7 GiB.
 
 ## Benchmarks
 

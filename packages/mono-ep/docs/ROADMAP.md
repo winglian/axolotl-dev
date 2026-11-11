@@ -22,7 +22,8 @@ the benchmark logs, outside the package.
 - NVFP4 LoRA on SM100 (frozen packed NVFP4 experts with LoRA adapters, CUDA requant, lean
   recompute tail), through the package API and the Axolotl precision `nvfp4_lora` (PEFT
   `lora_target_parameters` adapters on modelopt NVFP4 checkpoints, the requant cache's
-  optimizer hook, adapter-only checkpoints).
+  optimizer hook, adapter-only checkpoints), with just-in-time merged weights per layer, fused
+  transposed forms and bounded pools and rings.
 - Axolotl backend `expert_parallel_backend: mono_ep` (fused and dispatch modes, fallback to
   `torch`), a TRL `SFTTrainer` example, validators and the benchmarks in
   [benchmarks.md](benchmarks.md).
@@ -39,7 +40,7 @@ the benchmark logs, outside the package.
 - Forward ring at narrow experts: the Qwen3-30B-A3B ring keeps one slot per budgeted row (1.50 GB)
   because the live-block ring cost 4-8 % of the forward; a dispatch order that reuses slots could
   reach the live bound.
-- The MXFP8, NVFP4 and SM90 forwards keep the worst-case forward ring.
+- The MXFP8 and SM90 forwards keep the worst-case forward ring.
 - The MXFP8 transport ring and the MXFP8 scale pools keep the worst case under the bound.
 - MXFP8 backward weight forms: the per-step builder is a Triton kernel (1.5 ms per step at Beam);
   a CUDA builder is the next step.
