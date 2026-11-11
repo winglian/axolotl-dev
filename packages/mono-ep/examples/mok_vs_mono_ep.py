@@ -14,9 +14,10 @@ timing: every case is one synchronized host-wall span per iteration, maximum ove
 median over the measured iterations, cases interleaved with the order reversed every other
 iteration. CUDA-event spans are recorded too (MoK's own method, median of the per-iteration
 rank maximum). mono-ep cases: forward, backward (forward untimed), forward + backward in one
-span (``fb``: the checkpointed step when a selective-checkpoint policy saves the layer output,
-since the backward recomputes z itself), checkpointed 2F+B, per env variant, plus the
-NCCL-backward control. MoK cases per precision: forward, backward from
+span (``fb``), the same under non-reentrant checkpointing with a selective policy that saves
+the fused op's output (``sac``, eager op: the recompute pass skips the layer because the
+backward recomputes z itself), checkpointed 2F+B, per env variant, plus the NCCL-backward
+control. MoK cases per precision: forward, backward from
 the stored context, recompute+backward, and checkpointed 2F+B (forward + recompute + backward
 in one span). MoK computes a shared expert inside every number; its MXFP8 weight forms are
 built once (the weight-quantization cost per step is timed separately as ``mok_*/wquant``).
@@ -176,6 +177,18 @@ def main():
                 return operation(x, ids, scores, w1, w2)
             if scope == "fb":
                 y = operation(x, ids, scores, w1, w2)
+            elif scope == "sac":
+                y = checkpoint(
+                    runtime,
+                    x,
+                    ids,
+                    scores,
+                    w1,
+                    w2,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                    context_fn=_save_mono_ep_output,
+                )
             elif scope == "2fb":
                 y = checkpoint(
                     operation,
@@ -195,7 +208,7 @@ def main():
 
     cases = []
     for name, env in variants:
-        for scope in ("fwd", "bwd", "fb", "2fb"):
+        for scope in ("fwd", "bwd", "fb", "sac", "2fb"):
             prepare, run, case_env = mono_case(scope, native)
             case_env.update(env)
             cases.append((f"mono/{name}/{scope}", prepare, run))
@@ -360,7 +373,7 @@ def main():
             if (
                 iteration == args.warmup
                 and label.startswith("mono/")
-                and label.endswith("/bwd")
+                and label.split("/")[-1] in ("bwd", "sac")
             ):
                 captured[label] = dict(
                     dx=x.grad.clone(),
@@ -383,8 +396,11 @@ def main():
     first = variants[0][0]
     for label, tensors in captured.items():
         _, name, scope = label.split("/")
-        reference_label = f"mono/{first}/{scope}"
-        if name == first:
+        # Variants against the first variant; the selective-checkpoint step against its own variant's bwd
+        reference_label = (
+            f"mono/{name}/bwd" if scope == "sac" else f"mono/{first}/{scope}"
+        )
+        if reference_label == label or reference_label not in captured:
             continue
         entry = {}
         for key, a in tensors.items():
@@ -394,7 +410,9 @@ def main():
             )
             dist.all_reduce(stats, op=dist.ReduceOp.MAX)
             entry[key] = dict(bitwise=stats[0].item() == 0.0, rel=stats[1].item())
-        parity[f"{name}_vs_{first}/{scope}"] = entry
+        parity[
+            f"{name}/sac_vs_bwd" if scope == "sac" else f"{name}_vs_{first}/{scope}"
+        ] = entry
     fp32 = None
     if args.reference:
         fp32 = _fp32_reference(
@@ -439,6 +457,21 @@ def main():
         functional.clear_workspace_cache()
     dist.destroy_process_group()
     os._exit(0)
+
+
+def _save_mono_ep_output():
+    """Selective checkpoint policy that saves the fused layer's output instead of re-running it."""
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        create_selective_checkpoint_contexts,
+    )
+
+    def policy(ctx, op, *args, **kwargs):
+        if op == torch.ops.mono_ep.persistent_forward.default:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return create_selective_checkpoint_contexts(policy)
 
 
 def _profile(cases, rank, iters=3):
