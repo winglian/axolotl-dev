@@ -68,6 +68,17 @@ class ExpertParallelArgs(BaseModel):
     forward actually routed to this rank (exported as ``MONO_EP_WORKSPACE_BOUND``). ``auto``
     starts at 1.25 x tokens x top-k and grows on demand, so no tuning is needed; ``max``
     restores the worst-case sizing (every token of every rank routed here)."""
+    expert_parallel_mono_ep_stored_context: Literal[
+        "auto", "recompute", "always", "off"
+    ] = "auto"
+    """Fused mode on SM100: let the activation-checkpoint recompute of a MoE layer store its
+    gate/up pre-activations so that layer's backward skips recomputing them (exported as
+    ``MONO_EP_STORED_CONTEXT``). ``auto``: only where the backward is GEMM-bound
+    (hidden x moe intermediate >= 4096 x 1536) and the buffer (sized from the routed-row
+    high-water mark, about 1-2 GB per rank) fits in free memory with headroom; one log line
+    says which. ``recompute`` forces it, ``always`` stores in every forward, ``off`` never.
+    It only acts when the fused op is recomputed, i.e. activation checkpointing without
+    ``selective`` (which saves the fused op's output instead)."""
 
     expert_parallel_num_nvl_bytes: int = 256 << 20
 

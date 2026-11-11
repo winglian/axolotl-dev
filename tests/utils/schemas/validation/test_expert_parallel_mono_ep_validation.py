@@ -71,6 +71,14 @@ class TestMonoEPValidation:
         with pytest.raises(ValueError):
             _validate(min_base_cfg, expert_parallel_mono_ep_workspace_bound="small")
 
+    def test_stored_context_key(self, min_base_cfg):
+        assert _validate(min_base_cfg).expert_parallel_mono_ep_stored_context == "auto"
+        for value in ("recompute", "always", "off"):
+            cfg = _validate(min_base_cfg, expert_parallel_mono_ep_stored_context=value)
+            assert cfg.expert_parallel_mono_ep_stored_context == value
+        with pytest.raises(ValueError):
+            _validate(min_base_cfg, expert_parallel_mono_ep_stored_context="yes")
+
     def test_warns_dispatch_chunks_ignored(self, min_base_cfg, warnings):
         _validate(min_base_cfg, expert_parallel_dispatch_chunks=2)
         assert "dispatch_chunks is ignored" in warnings()
