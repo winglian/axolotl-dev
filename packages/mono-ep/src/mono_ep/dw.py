@@ -49,6 +49,7 @@ def _requant_k_blocks(
     COLS: tl.constexpr,
     COL_BLOCKS: tl.constexpr,
     FROM_MX: tl.constexpr,
+    RECIPROCAL: tl.constexpr = False,
 ):
     # One 128-row block and COL_BLOCKS x 128 columns of a pool: E4M3 values with one UE8M0 scale per
     # 32 rows and column, packed per column into one int32 (rows 32 j .. 32 j + 31 in byte j). Rows
@@ -86,8 +87,17 @@ def _requant_k_blocks(
             bits = (amax / 448.0).to(tl.int32, bitcast=True)
             exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
             exponent = tl.minimum(tl.maximum(exponent, 1), 254)
-            scale = (exponent << 23).to(tl.float32, bitcast=True)
-            quantized = tl.minimum(tl.maximum(value / scale[None, :], -448.0), 448.0)
+            if RECIPROCAL:
+                # The scale is a power of two, so multiplying by its exact inverse rounds like the division
+                inverse = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
+                quantized = tl.minimum(
+                    tl.maximum(value * inverse[None, :], -448.0), 448.0
+                )
+            else:
+                scale = (exponent << 23).to(tl.float32, bitcast=True)
+                quantized = tl.minimum(
+                    tl.maximum(value / scale[None, :], -448.0), 448.0
+                )
             tl.store(
                 Q + row[:, None] * COLS + col[None, :],
                 quantized.to(Q.dtype.element_ty),
@@ -113,7 +123,7 @@ def requant_k_blocks(pool, starts, ends, scale_words=None):
             raise ValueError("scale words must be a contiguous [C / 128, rows] tensor")
     q = torch.empty(rows, cols, device=pool.device, dtype=torch.float8_e4m3fn)
     s = torch.empty(rows // 128, cols, device=pool.device, dtype=torch.int32)
-    col_blocks = 1
+    col_blocks, num_warps, reciprocal = _requant_config(cols)
     _requant_k_blocks[(rows // 128, cols // (128 * col_blocks))](
         pool,
         scale_words if scale_words is not None else pool,
@@ -127,9 +137,19 @@ def requant_k_blocks(pool, starts, ends, scale_words=None):
         cols,
         col_blocks,
         scale_words is not None,
-        num_warps=4,
+        reciprocal,
+        num_warps=num_warps,
     )
     return q, s
+
+
+def _requant_config(cols):
+    """``MONO_EP_SM100_REQUANT_CONFIG`` = ``col_blocks,num_warps,reciprocal`` (default ``1,4,0``, the original)."""
+    value = os.getenv("MONO_EP_SM100_REQUANT_CONFIG", "1,4,0")
+    col_blocks, num_warps, reciprocal = (int(v) for v in value.split(","))
+    if (cols // 128) % col_blocks:
+        col_blocks = 1
+    return col_blocks, num_warps, bool(reciprocal)
 
 
 def weight_grad_quantized(a, b, ends, counts, experts):

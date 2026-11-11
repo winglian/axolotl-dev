@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
     parser.add_argument("--world", type=int, default=8)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--configs", default="1,4,1;2,4,1;4,4,1;1,8,1;2,8,1;4,8,1")
     args = parser.parse_args()
     from mono_ep.dw import requant_k_blocks
 
@@ -65,8 +66,27 @@ def main():
         res["total"] = sum(res.values())
         return res
 
+    import os
+
     worst_ms = time(pools(worst))
-    trimmed_ms = time(pools(used))
+    trimmed = pools(used)
+    os.environ.pop("MONO_EP_SM100_REQUANT_CONFIG", None)
+    reference = {
+        n: requant_k_blocks(pool, starts, ends, sw) for n, (pool, sw) in trimmed.items()
+    }
+    configs = {}
+    for config in args.configs.split(";"):
+        os.environ["MONO_EP_SM100_REQUANT_CONFIG"] = config
+        ms = time(trimmed)
+        bitwise = all(
+            torch.equal(a[0].view(torch.uint8), b[0].view(torch.uint8))
+            and torch.equal(a[1], b[1])
+            for n, (pool, sw) in trimmed.items()
+            for a, b in [(requant_k_blocks(pool, starts, ends, sw), reference[n])]
+        )
+        configs[config] = dict(ms=ms, bitwise=bitwise)
+    os.environ.pop("MONO_EP_SM100_REQUANT_CONFIG", None)
+    trimmed_ms = time(trimmed)
     bytes_moved = sum(
         used * c * (2 if n == "h" else 1)
         + used * c
@@ -85,6 +105,7 @@ def main():
                 trimmed_pool_ms=trimmed_ms,
                 bytes_moved_gb=bytes_moved / 1e9,
                 trimmed_gbps=bytes_moved / trimmed_ms["total"] / 1e6,
+                configs=configs,
             )
         ),
         flush=True,
