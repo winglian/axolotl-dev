@@ -383,10 +383,11 @@ class NativePersistentBackward:
         scratch = self.pools[:4] if self.blockwise else None
         del self.pools
         self.pools = self._build_pools(rows, scratch)
-        if self._mx is not None:
-            self._mx.pools[:3] = [
+        # One MXFP8 resource set per owned-ring floor seen; each one's E4M3 pools follow the BF16 rows
+        for mx in self._mx.values():
+            mx.pools[:3] = [
                 torch.zeros(rows, p.shape[1], device=p.device, dtype=p.dtype)
-                for p in self._mx.pools[:3]
+                for p in mx.pools[:3]
             ]
 
     def _allocate(self, shape, dtype):
