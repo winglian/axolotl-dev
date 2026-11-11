@@ -13,8 +13,10 @@ Both paths see the same routing (mono-ep's generator, skewed or balanced) and th
 timing: every case is one synchronized host-wall span per iteration, maximum over ranks,
 median over the measured iterations, cases interleaved with the order reversed every other
 iteration. CUDA-event spans are recorded too (MoK's own method, median of the per-iteration
-rank maximum). mono-ep cases: forward, backward (forward untimed), checkpointed 2F+B, per
-env variant, plus the NCCL-backward control. MoK cases per precision: forward, backward from
+rank maximum). mono-ep cases: forward, backward (forward untimed), forward + backward in one
+span (``fb``: the checkpointed step when a selective-checkpoint policy saves the layer output,
+since the backward recomputes z itself), checkpointed 2F+B, per env variant, plus the
+NCCL-backward control. MoK cases per precision: forward, backward from
 the stored context, recompute+backward, and checkpointed 2F+B (forward + recompute + backward
 in one span). MoK computes a shared expert inside every number; its MXFP8 weight forms are
 built once (the weight-quantization cost per step is timed separately as ``mok_*/wquant``).
@@ -167,7 +169,9 @@ def main():
         def run(y):
             if scope == "fwd":
                 return operation(x, ids, scores, w1, w2)
-            if scope == "2fb":
+            if scope == "fb":
+                y = operation(x, ids, scores, w1, w2)
+            elif scope == "2fb":
                 y = checkpoint(
                     operation,
                     x,
@@ -186,7 +190,7 @@ def main():
 
     cases = []
     for name, env in variants:
-        for scope in ("fwd", "bwd", "2fb"):
+        for scope in ("fwd", "bwd", "fb", "2fb"):
             prepare, run, case_env = mono_case(scope, native)
             case_env.update(env)
             cases.append((f"mono/{name}/{scope}", prepare, run))
