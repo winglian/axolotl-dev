@@ -34,7 +34,8 @@ static void bf16_mono_ep_backward_launch(
     const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_ptrs,
     const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
     const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
-    int rank, int max_tokens, int ring_tokens, int topk, const std::optional<MonoEPBackwardDw>& dw) {
+    int rank, int max_tokens, int ring_tokens, int topk, const std::optional<MonoEPBackwardDw>& dw,
+    const std::optional<torch::Tensor>& saved_z = std::nullopt) {
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(dx.is_cuda() and dx.dim() == 2);
     const auto check = [&](const torch::Tensor& t, torch::ScalarType dtype) {
@@ -192,7 +193,15 @@ static void bf16_mono_ep_backward_launch(
     // MONO_EP_SM100_INKERNEL_DW_WIDE=1: 256 x 256 dW tiles over 32-row stages (option 1024)
     const char* wide_selector = std::getenv("MONO_EP_SM100_INKERNEL_DW_WIDE");
     const bool dw_wide = dw.has_value() and wide_selector != nullptr and std::string(wide_selector) == "1";
-    const uint32_t options = selected | (dw.has_value() ? 512u : 0u) | (dw_wide ? 1024u : 0u);
+    const uint32_t options = selected | (dw.has_value() ? 512u : 0u) | (dw_wide ? 1024u : 0u) |
+        (saved_z.has_value() ? 4096u : 0u);
+    if (saved_z.has_value()) {
+        // Stored forward context: the forward's z by source row, [ranks, max tokens, topk, 2I] BF16
+        check(*saved_z, torch::kBFloat16);
+        DG_HOST_ASSERT(not dw.has_value());
+        DG_HOST_ASSERT(saved_z->dim() == 4 and saved_z->size(0) == world and saved_z->size(1) == max_tokens and
+                       saved_z->size(2) == topk and saved_z->size(3) == 2 * inner);
+    }
     DG_HOST_ASSERT(not (options & 64u) or (options & 1u));
     DG_HOST_ASSERT(pull <= hidden * 2 or (options & 8u));
     // 16 (lookahead pull) needs the overlapped copy and whole x/dy rows in the pull buffer
@@ -206,6 +215,7 @@ static void bf16_mono_ep_backward_launch(
     const uint32_t diag_ablate = ablate_selector == nullptr ? 0 :
         static_cast<uint32_t>(std::strtoul(ablate_selector, nullptr, 10));
     const bool diag = phase_trace_ptr != 0 or diag_ablate != 0;
+    DG_HOST_ASSERT(not saved_z.has_value() or phase_trace_ptr == 0);
     const std::string diag_suffix = (diag or options != 0)
         ? std::format(", true, {}, {}u, {}u", phase_trace_ptr != 0 ? "true" : "false", diag_ablate, options) : std::string();
     const std::string diag_name = (diag
@@ -232,7 +242,9 @@ static void instantiate() {{
         .block_dim = dim3(512), .cluster_dim = dim3(2, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),
         tx, tw1, l1_output, tz, tw1t, shared_l1_acts, tw1, shared_l1_output, shared_l2_acts, shared_l2_weights,
-        static_cast<const uint8_t*>(nullptr), reinterpret_cast<__nv_bfloat16*>(phase_trace_ptr), ty, tw2t, buffers);
+        static_cast<const uint8_t*>(nullptr),
+        saved_z.has_value() ? reinterpret_cast<__nv_bfloat16*>(saved_z->data_ptr()) : reinterpret_cast<__nv_bfloat16*>(phase_trace_ptr),
+        ty, tw2t, buffers);
 }
 
 static void bf16_mono_ep_backward(
@@ -246,6 +258,20 @@ static void bf16_mono_ep_backward(
     int rank, int max_tokens, int ring_tokens, int topk) {
     bf16_mono_ep_backward_launch(dx, ds, w1, w2t, w1t, pools, starts, counts, sym_buffer, sym_ptrs,
         dy, dy_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, std::nullopt);
+}
+
+// The same backward reading the forward's stored z instead of recomputing the gate/up projection.
+static void bf16_mono_ep_backward_ctx(
+    const torch::Tensor& dx, const torch::Tensor& ds,
+    const torch::Tensor& w1, const torch::Tensor& w2t, const torch::Tensor& w1t,
+    const std::vector<torch::Tensor>& pools,
+    const torch::Tensor& starts, const torch::Tensor& counts,
+    const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_ptrs,
+    const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
+    const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
+    int rank, int max_tokens, int ring_tokens, int topk, const torch::Tensor& saved_z) {
+    bf16_mono_ep_backward_launch(dx, ds, w1, w2t, w1t, pools, starts, counts, sym_buffer, sym_ptrs,
+        dy, dy_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, std::nullopt, saved_z);
 }
 
 // The same backward with dW1 = dz^T x and dW2 = dy^T h computed inside the persistent kernel.

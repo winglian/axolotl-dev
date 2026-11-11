@@ -141,6 +141,7 @@ class NativePersistentBackward:
         self.padded_counts = torch.empty_like(self.starts) if self.blockwise else None
         self.pools = self._build_pools(rows)
         self.finished = None
+        self.context_hits = self.context_misses = 0
         self.dw_state = None
         self._mx = None
 
@@ -154,6 +155,30 @@ class NativePersistentBackward:
         if self.experts > 32:
             raise ValueError("In-kernel dW supports at most 32 local experts")
         return True
+
+    def stored_context_usable(self):
+        """The SM100 BF16 backward can read a stored forward z (not with the MXFP8 backward or in-kernel dW)."""
+        return (
+            self.arch == 10
+            and not self.blockwise
+            and self.precision() == "bf16"
+            and not self.inkernel_dw()
+            and os.getenv("MONO_EP_SM100_PHASE_TRACE") is None
+            and self.runtime.buffer.num_max_tokens_per_rank
+            == self.buffer.num_max_tokens_per_rank
+        )
+
+    def _take_context(self, x, indices, scores, w1, w2):
+        from .runtime import context_key
+
+        runtime = self.runtime
+        key, runtime._context_key = runtime._context_key, None
+        if key is None or key != context_key(x, indices, scores, w1, w2):
+            if key is not None:
+                self.context_misses += 1
+            return None
+        self.context_hits += 1
+        return runtime._context_z
 
     def precision(self):
         """``MONO_EP_SM100_BACKWARD_PRECISION``: ``bf16`` (default) or ``mxfp8`` (SM100 BF16 runtimes)."""
@@ -450,7 +475,15 @@ class NativePersistentBackward:
         inkernel_dw = self.inkernel_dw()
         dw_args = ()
         native_name = self.native_name
-        if inkernel_dw:
+        stored_z = (
+            self._take_context(x, indices, scores, w1, w2)
+            if self.arch == 10 and not self.blockwise
+            else None
+        )
+        if stored_z is not None:
+            dw_args = (stored_z,)
+            native_name = "bf16_mono_ep_backward_ctx"
+        elif inkernel_dw:
             if self.dw_state is None:
                 # Readiness and claim counters; the kernel leaves them zeroed for the next launch
                 self.dw_state = torch.zeros(
@@ -502,7 +535,7 @@ class NativePersistentBackward:
         x_pool, dy_pool, h_pool, dz_pool = self.pools[:4]
         if not (fused and self.blockwise) and not inkernel_dw:
             ends = self.starts + self.counts
-        if inkernel_dw:
+        if inkernel_dw and stored_z is None:
             dw1, dw2 = dw_args[:2]
         elif self.blockwise:
             from .hopper_wgrad import weight_grad_fp8_hopper_packed

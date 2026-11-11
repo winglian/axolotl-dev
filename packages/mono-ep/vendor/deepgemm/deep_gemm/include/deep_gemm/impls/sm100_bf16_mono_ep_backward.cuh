@@ -199,6 +199,16 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         return kInkernelDw and (info.block_phase == sched::BlockPhase::BackwardDw1 or
                                 info.block_phase == sched::BlockPhase::BackwardDw2);
     };
+    // 4096: stored forward context. The forward saved z (BF16 gate/up pre-activations by source row,
+    // [ranks, max tokens, topk, 2I]) in `saved_z`; RecomputeLow/High tasks skip their loads and UMMAs and the
+    // epilogue reads z from there instead of TMEM. `saved_z` otherwise carries the phase trace.
+    constexpr bool kStoredContext = kOptions & 4096u;
+    DG_STATIC_ASSERT(not (kStoredContext and (kPhaseTrace or kMXFP8 or kInkernelDw)),
+                     "Stored context excludes the phase trace, the MXFP8 backward and in-kernel dW");
+    const auto is_stored_recompute = [](const auto& info) {
+        return kStoredContext and (info.block_phase == sched::BlockPhase::BackwardRecomputeLow or
+                                   info.block_phase == sched::BlockPhase::BackwardRecomputeHigh);
+    };
     DG_STATIC_ASSERT(not kMXFP8 or (kStagedPoolStores and not (kOptions & 4u) and not kLookaheadPull),
                      "MXFP8 needs the staged pool stores, two TMEM stages and its own pull loop");
     DG_STATIC_ASSERT(not (kInkernelDw and kMXFP8), "In-kernel dW (BLOCK_K 64) and the MXFP8 backward (BLOCK_K 128) share operand slots");
@@ -1217,6 +1227,25 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     continue;
                 }
             }
+            if (is_stored_recompute(task_info)) {
+                // No operands: prefetch this task's stored z rows (this CTA's 64 gate and 64 up columns) into L2
+                // ahead of its epilogue. The block's source metadata is final once its rows are in the ring.
+                const uint32_t pool_block_idx = task_info.pool_block_idx;
+                const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+                const auto expected = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
+                while (ptx::ld_acq(workspace.get_l1_full_count_ptr(ring_block_idx)) != expected);
+                const uint32_t n = task_info.get_n_block_idx(is_leader_cta) * 64;
+                for (uint32_t row = lane_idx; row < task_info.valid_m; row += 32) {
+                    const auto src = *workspace.get_token_src_metadata_ptr(pool_block_idx * BLOCK_M + row);
+                    const auto& [rank, token, slot] = src;
+                    const auto* z = saved_z + ((static_cast<uint64_t>(rank) * kNumMaxTokensPerRank + token) *
+                                               kNumTopk + slot) * (2 * kIntermediateHidden) + n;
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(z));
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(z + kIntermediateHidden));
+                }
+                __syncwarp();
+                continue;
+            }
             const auto tensor_map_a_ptr = task_info.block_phase == sched::BlockPhase::BackwardDh ? &tensor_map_dy :
                 task_info.block_phase == sched::BlockPhase::BackwardDx ? &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto num_k_blocks = math::ceil_div(task_info.shape_k, BLOCK_K);
@@ -1330,6 +1359,8 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     continue;
                 }
             }
+            if (is_stored_recompute(task_info))
+                continue;
             const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::BackwardDh ? &tensor_map_dh_weights :
                 task_info.block_phase == sched::BlockPhase::BackwardDx ? &tensor_map_l2_weights : &tensor_map_l1_weights;
             const auto shape_k = task_info.shape_k;
@@ -1472,6 +1503,8 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                         continue;
                     }
                 }
+                if (is_stored_recompute(task_info))
+                    continue;
                 const uint64_t trace_mma_task = trace_clock();
                 uint64_t trace_mma_full = 0;
                 const auto num_k_blocks = task_info.shape_k / BLOCK_K;
@@ -1635,11 +1668,14 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         }
         while (scheduler.get_next_task(task_info)) {
             const uint64_t trace_task = trace_clock();
-            // Wait UMMA arrival
+            // Wait UMMA arrival (stored-context recompute tasks have no UMMA and no accumulator stage)
+            const bool stored_z = is_stored_recompute(task_info);
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
-            const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
-            shared_storage.tmem_full_barriers[accum_stage_idx].wait(accum_phase);
-            ptx::tcgen05_after_thread_sync();
+            if (not stored_z) {
+                const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+                shared_storage.tmem_full_barriers[accum_stage_idx].wait(accum_phase);
+                ptx::tcgen05_after_thread_sync();
+            }
             const uint64_t trace_got = trace_clock();
             uint64_t trace_spin = 0, trace_atoms = 0, trace_tail = 0, trace_dscore_partial = 0, trace_dx_tail = 0;
 
@@ -1873,7 +1909,43 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                         }
                     }
                 };
-                if constexpr (kEarlyTmemRelease) {
+                if (stored_z) {
+                    // The atom's z in the TMEM register layout: lane rows (lane % 4) * 2 + {0, 1}, columns
+                    // warp * 16 + lane / 4 + {0, 8} of this CTA's 64 intermediate columns; gate at
+                    // values[col * 4 + row], up at values[col * 4 + 2 + row]
+                    const auto load_z = [&](const uint32_t& atom, uint32_t (&values)[8]) {
+                        const auto atom_row = epilogue_wg_idx * WG_BLOCK_M + atom * ATOM_M;
+                        const auto n = n_block_idx * 64 + warp_idx_in_wg * 16 + lane_idx / 4;
+                        #pragma unroll
+                        for (uint32_t r = 0; r < 2; ++r) {
+                            const auto row = atom_row + (lane_idx % 4) * 2 + r;
+                            nv_bfloat16 g[2] = {}, u[2] = {};
+                            if (row < valid_m) {
+                                const auto src = *workspace.get_token_src_metadata_ptr(pool_m_idx + row);
+                                const auto& [rank, token, slot] = src;
+                                const auto* z = saved_z + ((static_cast<uint64_t>(rank) * kNumMaxTokensPerRank + token) *
+                                                           kNumTopk + slot) * (2 * kIntermediateHidden);
+                                #pragma unroll
+                                for (uint32_t col = 0; col < 2; ++col) {
+                                    g[col] = z[n + col * 8];
+                                    u[col] = z[kIntermediateHidden + n + col * 8];
+                                }
+                            }
+                            #pragma unroll
+                            for (uint32_t col = 0; col < 2; ++col) {
+                                values[col * 4 + r] = __float_as_uint(__bfloat162float(g[col]));
+                                values[col * 4 + 2 + r] = __float_as_uint(__bfloat162float(u[col]));
+                            }
+                        }
+                    };
+                    uint32_t atom_values[kNumAtoms][8];
+                    #pragma unroll
+                    for (uint32_t atom = 0; atom < kNumAtoms; ++atom)
+                        load_z(atom, atom_values[atom]);
+                    #pragma unroll
+                    for (uint32_t atom = 0; atom < kNumAtoms; ++atom)
+                        process_atom(atom, atom_values[atom]);
+                } else if constexpr (kEarlyTmemRelease) {
                     // Drain the whole accumulator into registers so the MMA warp can reuse the stage during the math
                     uint32_t atom_values[kNumAtoms][8];
                     #pragma unroll
@@ -1901,8 +1973,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 const uint64_t trace_atom1 = trace_clock();
                 trace_atoms = trace_atom1 - trace_atom0;
                 if constexpr (not kEarlyTmemRelease) {
-                    ptx::tcgen05_before_thread_sync();
-                    shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                    if (not stored_z) {
+                        ptx::tcgen05_before_thread_sync();
+                        shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                    }
                 }
                 [[maybe_unused]] const bool is_last_recompute = task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
                     task_info.n_cluster_idx + 1 == kIntermediateHidden / (2 * BLOCK_N);

@@ -92,6 +92,10 @@ class PersistentMoE:
             )
         self._fixed_capacity_backward = True
         self._peer_backward = None
+        # Stored forward context (MONO_EP_STORED_CONTEXT): one z buffer per runtime and the key of the
+        # forward call that last filled it; the native backward consumes it once.
+        self._context_z = None
+        self._context_key = None
         self.retain_activations = retain_activations
         self.compute_dtype = compute_dtype
         self.group = group
@@ -332,7 +336,21 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
         else deep_gemm.bf16_mono_ep
     )
     saved_z = None
-    if runtime.retain_activations:
+    store = _store_context(runtime)
+    runtime._context_key = None
+    if store:
+        if runtime._context_z is None:
+            runtime._context_z = x.new_empty(
+                (
+                    dist.get_world_size(runtime.group),
+                    buffer.num_max_tokens_per_rank,
+                    runtime.topk,
+                    2 * runtime.intermediate,
+                )
+            )
+        forward(y, tw1, tw2, buffer, fast_math=False, saved_z=runtime._context_z)
+        runtime._context_key = context_key(x, indices, scores, w1, w2)
+    elif runtime.retain_activations:
         saved_z = x.new_empty(
             (
                 dist.get_world_size(runtime.group),
@@ -367,6 +385,40 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
         else:
             forward(y, tw1, tw2, buffer, fast_math=False)
     return y, saved_z
+
+
+def stored_context_policy():
+    """``MONO_EP_STORED_CONTEXT``: ``0`` (default, the backward recomputes z), ``recompute`` (store z in a
+    forward that runs inside a backward pass, i.e. the activation-checkpoint recompute, so the backward that
+    follows skips the gate/up GEMMs) or ``always`` (store z in every forward; only the last forward before a
+    backward is kept)."""
+    value = os.getenv("MONO_EP_STORED_CONTEXT", "0")
+    if value not in ("0", "recompute", "always"):
+        raise ValueError("MONO_EP_STORED_CONTEXT must be 0, recompute or always")
+    return value
+
+
+def _store_context(runtime):
+    if (
+        runtime.compute_dtype != "bf16"
+        or runtime.retain_activations
+        or torch.cuda.get_device_capability()[0] != 10
+        or runtime._peer_backward is None
+        or not hasattr(runtime._peer_backward, "stored_context_usable")
+    ):
+        return False
+    policy = stored_context_policy()
+    if policy == "0":
+        return False
+    if policy == "recompute" and torch._C._current_graph_task_id() == -1:
+        return False
+    return runtime._peer_backward.stored_context_usable()
+
+
+def context_key(x, indices, scores, w1, w2):
+    return tuple(
+        (t.data_ptr(), t.shape, t._version) for t in (x, indices, scores, w1, w2)
+    )
 
 
 def _backward_impl(dy, x, indices, scores, w1, w2, runtime, retained=()):
