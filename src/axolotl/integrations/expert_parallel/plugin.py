@@ -1009,13 +1009,12 @@ class ExpertParallelPlugin(BasePlugin):
         from accelerate import Accelerator
         from accelerate.state import AcceleratorState
 
-        try:
-            state = AcceleratorState()
-        except (RuntimeError, AttributeError, ValueError) as e:
-            # ValueError occurs from unittest due to no trainer constructing Accelerator()
-            LOG.debug(f"expert_parallel: AcceleratorState() not ready: {e}")
+        # A bare AcceleratorState() before any Accelerator() writes part of the shared state and
+        # raises; a later Accelerator() then takes it as initialized and never sets mixed_precision.
+        if "_mixed_precision" not in AcceleratorState._shared_state:
+            LOG.debug("expert_parallel: no Accelerator yet, so no accelerate mesh")
             return None
-        mesh = getattr(state, "device_mesh", None)
+        mesh = AcceleratorState._shared_state.get("device_mesh")
         if mesh is not None:
             return mesh
         try:
@@ -1081,22 +1080,29 @@ class ExpertParallelPlugin(BasePlugin):
                     f"ep={ep_size}, dp_shard={dp_shard_size}, tp={tp_size}, cp={cp_size}. "
                     "Supported: EP, EP × dp_shard, EP × cp, EP × cp × dp_shard."
                 )
+            from axolotl.monkeypatch.accelerate.parallelism_config import MESH_ORDER
+
+            sizes = {
+                "dp_replicate": dp_replicate_size,
+                "dp_shard": dp_shard_size,
+                "cp": cp_size,
+                "ep": ep_size,
+            }
+            axes = [(n, sizes[n]) for n in MESH_ORDER if sizes.get(n, 1) > 1]
             mesh = ExpertParallelPlugin._accelerate_mesh()
+            cached = ExpertParallelPlugin._device_mesh
+            if (
+                (mesh is None or "ep" not in (mesh.mesh_dim_names or ()))
+                and cached is not None
+                and tuple(cached.mesh_dim_names or ()) == tuple(n for n, _ in axes)
+                and tuple(cached.shape) == tuple(size for _, size in axes)
+            ):
+                # Before the trainer's Accelerator exists, reuse the mesh an earlier call built
+                return cached["ep"].get_group()
             if mesh is None or "ep" not in (mesh.mesh_dim_names or ()):
                 from torch.distributed.device_mesh import init_device_mesh
 
-                from axolotl.monkeypatch.accelerate.parallelism_config import (
-                    MESH_ORDER,
-                )
-
                 # Fallback mesh in accelerate's axis order (ep innermost, node-local groups).
-                sizes = {
-                    "dp_replicate": dp_replicate_size,
-                    "dp_shard": dp_shard_size,
-                    "cp": cp_size,
-                    "ep": ep_size,
-                }
-                axes = [(n, sizes[n]) for n in MESH_ORDER if sizes.get(n, 1) > 1]
                 mesh = init_device_mesh(
                     "cuda" if torch.cuda.is_available() else "cpu",
                     tuple(s for _, s in axes),
