@@ -17,6 +17,11 @@ compiles with `fullgraph=True`. The package has no Axolotl, Transformers or TRL 
   trainer. The fused kernels need plain SwiGLU experts and full fine-tuning; the dispatch mode
   (`expert_parallel_mono_ep_mode: dispatch`) runs mono-ep's peer transfers around Axolotl's
   local experts kernel, so adapters and quantized experts work there.
+- Memory: the backward pools and both rings are sized from the rows each step actually routes
+  (`MONO_EP_WORKSPACE_BOUND=auto`, Axolotl `expert_parallel_mono_ep_workspace_bound: auto`).
+  Resident per rank at EP8 on B200, 16,384 tokens per GPU: 4.9 / 7.9 / 9.0 GB at the
+  Qwen3-30B-A3B / Qwen3-235B-A22B / Beam shapes instead of 18.1 / 35.5 / 41.0 GB, with
+  bitwise-identical dx; SM90 BF16 and blockwise FP8 take the same bounds.
 
 ## Installation
 
