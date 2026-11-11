@@ -222,6 +222,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
     };
     DG_STATIC_ASSERT(not kMXFP8 or (kStagedPoolStores and not (kOptions & 4u) and not kLookaheadPull),
                      "MXFP8 needs the staged pool stores, two TMEM stages and its own pull loop");
+    // 8192 (with 2048): the weight gradients read the E4M3 pools, so the dispatch warps write no BF16 x/dy copies
+    // and the epilogue no BF16 dz rows; h stays BF16.
+    constexpr bool kNoBF16Copies = kOptions & 8192u;
+    DG_STATIC_ASSERT(not kNoBF16Copies or kMXFP8, "Dropping the BF16 pool copies needs the MXFP8 backward");
     DG_STATIC_ASSERT(not (kInkernelDw and kMXFP8), "In-kernel dW (BLOCK_K 64) and the MXFP8 backward (BLOCK_K 128) share operand slots");
 
     // Epilogue configs
@@ -761,8 +765,17 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 // Per operand: stage this lane's bytes in registers, hand that half of the buffer to the next row's
                 // load, then write exact BF16 copies (E4M3 times a power of two) for the BF16 weight-gradient GEMMs
                 constexpr uint32_t kNumChunksPerLane = kRowBytes / (16 * 32);
+                if constexpr (kNoBF16Copies) {
+                    // No copies: the next row's loads go out as soon as the E4M3 stores have read the buffer
+                    if (has_next) {
+                        if (cute::elect_one_sync())
+                            cute::tma_store_wait<0>();
+                        __syncwarp();
+                        issue(next, next_sf);
+                    }
+                }
                 #pragma unroll 1
-                for (uint32_t op = 0; op < 2; ++ op) {
+                for (uint32_t op = 0; op < (kNoBF16Copies ? 0u : 2u); ++ op) {
                     const auto src = static_cast<const uint8_t*>(op == 0 ? smem_x : smem_dy);
                     uint4 staged[kNumChunksPerLane];
                     #pragma unroll
@@ -812,7 +825,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     }
                 }
                 __syncwarp();
-                if (has_next)
+                if (has_next and not kNoBF16Copies)
                     load_sf(next, next_sf);
 
                 // Publish once the E4M3 rows are written (full completion, not only the shared-memory read)
@@ -1845,10 +1858,10 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                                             asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" ::
                                                 "l"(dst), "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w),
                                                 "l"(static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_FIRST)) : "memory");
-                                        } else {
+                                        } else if (not kNoBF16Copies) {
                                             *reinterpret_cast<float4*>(dst) = value;
                                         }
-                                    } else {
+                                    } else if (o == 0 or not kNoBF16Copies) {
                                         *reinterpret_cast<float4*>(dst) = value;
                                     }
                                     if constexpr (kMXFP8) {

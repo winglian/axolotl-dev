@@ -414,9 +414,13 @@ static void mxfp8_mono_ep_backward_launch(
     // E4M3 x and dy rows travel together (one NVLink round trip per routed row); scales are fetched by lanes.
     const int pull = hidden * 2;
     const char* options_selector = std::getenv("MONO_EP_SM100_BACKWARD_OPTIONS");
+    // MXFP8 weight gradients (MONO_EP_SM100_DW_PRECISION=mxfp8) read the E4M3 pools: no BF16 x/dy/dz copies (8192)
+    const char* dw_precision = std::getenv("MONO_EP_SM100_DW_PRECISION");
+    const bool mxfp8_dw = dw_precision != nullptr and std::string(dw_precision) == "mxfp8";
     const uint32_t options = (options_selector == nullptr ? kDefaultBackwardOptions :
-        static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10))) | 2048u | (saved_z.has_value() ? 4096u : 0u);
-    DG_HOST_ASSERT(options < 8192 and not (options & (512u | 1024u)));
+        static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10))) | 2048u | (saved_z.has_value() ? 4096u : 0u) |
+        (mxfp8_dw ? 8192u : 0u);
+    DG_HOST_ASSERT(options < 16384 and not (options & (512u | 1024u)));
     if (saved_z.has_value()) {
         check(*saved_z, torch::kUInt8);
         DG_HOST_ASSERT(saved_z->dim() == 1 and static_cast<uint64_t>(saved_z->numel()) >=
