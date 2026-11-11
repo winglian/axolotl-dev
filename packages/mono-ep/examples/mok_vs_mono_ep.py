@@ -414,6 +414,10 @@ def main():
         parity_first_measured=parity,
         fp32_reference=fp32,
         peak_alloc_gib=torch.cuda.max_memory_allocated(device) / 2**30,
+        stored_context_hits_misses_rank0=[
+            getattr(native, "context_hits", None),
+            getattr(native, "context_misses", None),
+        ],
         timing="per case: synchronized host-wall span (and CUDA events), max over ranks, median over iterations; cases interleaved, order reversed every other iteration",
     )
     if rank == 0:
