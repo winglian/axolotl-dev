@@ -233,6 +233,10 @@ struct MonoEPScheduler {
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
     uint32_t num_total_m_blocks = 0;
 
+    // Set when this launch's routing needs more live blocks than the ring holds (a ring sized below the
+    // worst case): L1 claims then wait for the L2 claims of the block one ring generation back
+    bool is_ring_gated = false;
+
     // Per-scheduler warmup waves; all cluster schedulers together form one global wave.
     static constexpr uint32_t kNumSchedL1WavesDone = 0xffffffffu;
     uint32_t num_sched_l1_waves = 0;
@@ -324,6 +328,9 @@ struct MonoEPScheduler {
         const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
             num_total_m_blocks, kNumSchedulerClusters, kNumL1Clusters, kNumL2Clusters);
         num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
+        is_ring_gated = get_num_max_live_pool_blocks<static_cast<int>(kNumCTAsPerCluster)>(
+            static_cast<int>(num_total_m_blocks), static_cast<int>(kNumSMs),
+            static_cast<int>(L2_SHAPE_N), static_cast<int>(L1_SHAPE_N / 2)) > static_cast<int>(kNumRingBlocks);
     }
 
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
@@ -389,7 +396,109 @@ struct MonoEPScheduler {
                get_next_task_idx<kNumClusters>(task_count_ptr, sm_locality_domain_idx ^ 1, num_m_blocks, m_block_idx, n_cluster_idx);
     }
 
+    // Gated L1 claim: L1 of block `b` is claimed only once every L2 task of block `b - kNumRingBlocks` is
+    // claimed. Then every task a cluster runs or waits behind depends only on tasks of earlier blocks (or on
+    // an earlier ring generation), so a ring smaller than the live-block bound cannot deadlock.
+    // Returns 1 (claimed), 0 (no L1 tasks left in the domain) or -1 (blocked by the gate).
+    CUTLASS_DEVICE int claim_gated_l1_task(const uint32_t& locality_domain_idx,
+                                           uint32_t& m_block_idx, uint32_t& n_cluster_idx) const {
+        constexpr uint32_t kNumLocalL1Clusters = kNumL1Clusters / kNumLocalityDomains;
+        constexpr uint32_t kNumLocalL2Clusters = kNumL2Clusters / kNumLocalityDomains;
+        const auto l1_count_ptr = workspace.get_l1_task_count_ptr() + locality_domain_idx;
+        const auto l2_count_ptr = workspace.get_l2_task_count_ptr();
+        int status = 0;
+        uint32_t task_idx = 0;
+        if (cute::elect_one_sync()) {
+            while (true) {
+                const uint32_t count = ptx::ld_volatile(l1_count_ptr);
+                if (count >= num_total_m_blocks * kNumLocalL1Clusters) {
+                    status = 0;
+                    break;
+                }
+                const uint32_t block_idx = count / kNumLocalL1Clusters;
+                bool is_open = true;
+                if (block_idx >= kNumRingBlocks) {
+                    const uint32_t num_required_l2_tasks = (block_idx - kNumRingBlocks + 1) * kNumLocalL2Clusters;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumLocalityDomains; ++ i)
+                        is_open &= ptx::ld_volatile(l2_count_ptr + i) >= num_required_l2_tasks;
+                }
+                if (not is_open) {
+                    status = -1;
+                    break;
+                }
+                if (atomicCAS(l1_count_ptr, count, count + 1) == count) {
+                    status = 1;
+                    task_idx = count;
+                    break;
+                }
+            }
+        }
+        status = ptx::exchange(status, 0);
+        task_idx = ptx::exchange(task_idx, 0);
+        m_block_idx = task_idx / kNumLocalL1Clusters;
+        n_cluster_idx = locality_domain_idx * kNumLocalL1Clusters + task_idx % kNumLocalL1Clusters;
+        return status;
+    }
+
+    CUTLASS_DEVICE bool is_l1_block_claimed(const uint32_t& block_idx) const {
+        constexpr uint32_t kNumLocalL1Clusters = kNumL1Clusters / kNumLocalityDomains;
+        bool claimed = true;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumLocalityDomains; ++ i)
+            claimed &= ptx::ld_volatile(workspace.get_l1_task_count_ptr() + i) >= (block_idx + 1) * kNumLocalL1Clusters;
+        return claimed;
+    }
+
+    CUTLASS_DEVICE task_info_t get_next_gated_task() {
+        constexpr uint32_t kNumLocalL2Clusters = kNumL2Clusters / kNumLocalityDomains;
+        uint32_t m_block_idx, n_cluster_idx;
+        while (true) {
+            if (num_sched_l1_waves != kNumSchedL1WavesDone) {
+                // Also take L1 when the next L2 block still has unclaimed L1 tasks, so L2 claims never spin on it
+                bool wants_l1 = num_sched_l1_waves > 0;
+                if (not wants_l1) {
+                    const uint32_t next_l2_block_idx =
+                        ptx::ld_volatile(workspace.get_l2_task_count_ptr() + sm_locality_domain_idx) / kNumLocalL2Clusters;
+                    wants_l1 = next_l2_block_idx < num_total_m_blocks and not is_l1_block_claimed(next_l2_block_idx);
+                }
+                if (wants_l1) {
+                    int status = claim_gated_l1_task(sm_locality_domain_idx, m_block_idx, n_cluster_idx);
+                    if (status == 0 and kNumLocalityDomains > 1 and
+                        num_total_m_blocks * kNumL1Clusters >= kNumMinStealWaves * kNumSchedulerClusters)
+                        status = claim_gated_l1_task(sm_locality_domain_idx ^ 1, m_block_idx, n_cluster_idx);
+                    if (status == 1) {
+                        if (num_sched_l1_waves > 0)
+                            -- num_sched_l1_waves;
+                        return create_task(BlockPhase::Linear1, m_block_idx, n_cluster_idx, L1_SHAPE_N, L1_SHAPE_K);
+                    }
+                    if (status == 0 and is_l1_block_claimed(num_total_m_blocks - 1))
+                        num_sched_l1_waves = kNumSchedL1WavesDone;
+                }
+            }
+
+            if (not get_next_task_idx<kNumL2Clusters>(workspace.get_l2_task_count_ptr(), num_total_m_blocks, m_block_idx, n_cluster_idx)) {
+                // L2 exhausted locally, but L1 tasks may remain behind the gate
+                if (num_sched_l1_waves == kNumSchedL1WavesDone)
+                    break;
+                num_sched_l1_waves = 1;
+                continue;
+            }
+            if (num_sched_l1_waves != kNumSchedL1WavesDone)
+                num_sched_l1_waves = 1;
+            auto task_info = create_task(BlockPhase::Linear2, m_block_idx, n_cluster_idx, L2_SHAPE_N, L2_SHAPE_K);
+            const auto num_required_l1_tasks = (task_info.pool_block_idx + 1) * (kNumL1Clusters / kNumLocalityDomains);
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumLocalityDomains; ++ i)
+                while (ptx::ld_volatile(workspace.get_l1_task_count_ptr() + i) < num_required_l1_tasks) {}
+            return task_info;
+        }
+        return task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0);
+    }
+
     CUTLASS_DEVICE task_info_t get_next_task() {
+        if (is_ring_gated)
+            return get_next_gated_task();
         uint32_t m_block_idx, n_cluster_idx;
         while (true) {
             if (num_sched_l1_waves != kNumSchedL1WavesDone and num_sched_l1_waves) {

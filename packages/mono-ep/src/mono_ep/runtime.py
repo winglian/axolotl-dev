@@ -102,6 +102,14 @@ class PersistentMoE:
         self.intermediate = intermediate
         self.fuse_activation = fuse_activation
         self.alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+        # The SM100 BF16 forward gates L1 claims on its ring, so its ring can be sized for a routed-row budget
+        self.forward_ring_budget = (
+            workspace_bound.forward_ring_budget(max_tokens, topk)
+            if arch == 10
+            and compute_dtype == "bf16"
+            and workspace_bound.mode() == "auto"
+            else 0
+        )
         self.buffer = deep_gemm.get_symm_buffer_for_mono_ep(
             group,
             experts,
@@ -118,6 +126,7 @@ class PersistentMoE:
                 if compute_dtype == "nvfp4_lora"
                 else "bf16xbf16"
             ),
+            num_ring_routed_tokens=self.forward_ring_budget,
         )
 
         if backward_backend == "native":

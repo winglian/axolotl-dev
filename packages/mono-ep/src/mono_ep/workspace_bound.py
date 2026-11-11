@@ -27,7 +27,14 @@ than ``MAX_DEPTH`` drops its oldest entry with a warning. Pools start at 1.25 x 
 larger need, logged). A backward with no record is sized for the worst case and logged every
 time (it means a forward was not recorded, e.g. a custom autograd path).
 
-``max``: the worst-case pools, as before.
+The SM100 BF16 forward's symmetric ring is sized the same way: for ``HEADROOM x tokens x top-k`` routed
+rows instead of every token of every rank. Its scheduler gates L1 claims on the ring (an L1 block is
+claimed only after every L2 task one ring generation back is claimed), so a step whose routing needs
+more live blocks runs gated and slower instead of overflowing; ``forward_over_budget`` counts the
+recorded forwards whose padded rows exceeded the budget. The owned backward's ring is its one-wave
+floor.
+
+``max``: the worst-case pools and rings, as before.
 """
 
 import logging
@@ -60,6 +67,13 @@ MAX_DEPTH = 64
 _LIVE: "weakref.WeakSet[WorkspaceBound]" = weakref.WeakSet()
 
 
+def forward_ring_budget(max_tokens, topk):
+    override = os.getenv("MONO_EP_FORWARD_RING_ROWS")
+    if override:
+        return int(override)
+    return _round_up(math.ceil(HEADROOM * max_tokens * topk))
+
+
 def layer_key(w1):
     return w1.untyped_storage()._cdata
 
@@ -89,6 +103,8 @@ class WorkspaceBound:
         self.found = 0
         self.high_water = 0
         self.dropped = 0
+        self.forward_budget = 0
+        self.forward_over_budget = 0
         _LIVE.add(self)
 
     def clear(self):
@@ -137,6 +153,15 @@ class WorkspaceBound:
         event.synchronize()
         rows = int(host.item())
         self.high_water = max(self.high_water, rows)
+        if self.forward_budget and rows > self.forward_budget:
+            self.forward_over_budget += 1
+            if self.forward_over_budget == 1:
+                LOG.info(
+                    "mono_ep bounded workspace: %d routed pool rows exceed the forward ring budget of %d; "
+                    "the forward ran ring-gated (slower, still exact)",
+                    rows,
+                    self.forward_budget,
+                )
         return rows
 
     def target(self, needed):

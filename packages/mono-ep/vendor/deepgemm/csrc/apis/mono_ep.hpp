@@ -72,9 +72,9 @@ get_symm_buffer_size_for_mono_ep(
     const int& hidden, const int& intermediate_hidden,
     const std::string& mma_type, const std::string& activation,
     const int& num_shared_experts = 0, const int& num_min_ring_tokens = 0,
-    const int& num_exact_ring_tokens = 0) {
+    const int& num_exact_ring_tokens = 0, const int& num_ring_routed_tokens = 0) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(num_min_ring_tokens >= 0 and num_exact_ring_tokens >= 0);
+    DG_HOST_ASSERT(num_min_ring_tokens >= 0 and num_exact_ring_tokens >= 0 and num_ring_routed_tokens >= 0);
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
@@ -83,7 +83,11 @@ get_symm_buffer_size_for_mono_ep(
     const auto num_sms = get_num_sms_for_mono_ep();
     const auto num_experts_per_rank = num_experts / num_ranks;
     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
-    const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
+    // NOTES: a routed-token budget below the worst case sizes the ring for that budget; only the SM100 BF16
+    // forward (ring-gated scheduler) and owned backwards may run on such a ring
+    const auto num_max_routed_tokens = num_ring_routed_tokens > 0 ?
+        std::min(num_ring_routed_tokens, num_max_tokens_per_rank * num_ranks * num_active_topk) :
+        num_max_tokens_per_rank * num_ranks * num_active_topk;
 
     // Shared
     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
@@ -382,11 +386,14 @@ static void bf16_mono_ep(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const std::optional<torch::Tensor>& saved_z
+    const std::optional<torch::Tensor>& saved_z,
+    const int& num_ring_tokens
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(num_ring_tokens >= 0);
+    DG_HOST_ASSERT(num_ring_tokens == 0 or jit->device.get_arch_major() >= 10);
     DG_HOST_ASSERT(shared_l1_weights_opt.has_value() == shared_l2_weights_opt.has_value());
 
     // Activation checks
@@ -449,7 +456,7 @@ static void bf16_mono_ep(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        "bf16xbf16", activation, num_shared_experts
+        "bf16xbf16", activation, num_shared_experts, 0, num_ring_tokens
     );
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);

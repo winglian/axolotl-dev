@@ -131,6 +131,10 @@ class NativePersistentBackward:
                 capacity, runtime.topk, self.experts, rows
             )
             rows = self.bound.rows
+            if runtime.forward_ring_budget:
+                self.bound.forward_budget = (
+                    runtime.forward_ring_budget + self.experts * 128
+                )
         scratch_rows = self.buffer.l1_acts.shape[0] if self.blockwise else rows
         self.pools = [
             torch.zeros(

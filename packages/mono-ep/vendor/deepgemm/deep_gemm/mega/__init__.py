@@ -25,7 +25,8 @@ class SymmBuffer:
                  activation: str = 'swiglu',
                  base: Optional['SymmBuffer'] = None,
                  num_min_ring_tokens: int = 0,
-                 num_exact_ring_tokens: int = 0):
+                 num_exact_ring_tokens: int = 0,
+                 num_ring_routed_tokens: int = 0):
         # Align token count
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mono_ep())
 
@@ -41,6 +42,8 @@ class SymmBuffer:
         self.mma_type = mma_type
         self.activation = activation
         self.num_sms = _C.get_num_sms()
+        # A ring sized below the worst case runs only on kernels that gate or own their ring blocks
+        self.bounded_ring = num_exact_ring_tokens > 0 or num_ring_routed_tokens > 0
 
         # Allocate or reuse a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mono_ep(
@@ -48,7 +51,8 @@ class SymmBuffer:
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
             mma_type, activation,
-            num_shared_experts, num_min_ring_tokens, num_exact_ring_tokens
+            num_shared_experts, num_min_ring_tokens, num_exact_ring_tokens,
+            num_ring_routed_tokens
         )
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
@@ -99,7 +103,8 @@ def get_symm_buffer_for_mono_ep(group: dist.ProcessGroup,
                                  mma_type: str = 'fp8xfp4',
                                  activation: str = 'swiglu',
                                  num_min_ring_tokens: int = 0,
-                                 num_exact_ring_tokens: int = 0) -> SymmBuffer:
+                                 num_exact_ring_tokens: int = 0,
+                                 num_ring_routed_tokens: int = 0) -> SymmBuffer:
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -115,7 +120,8 @@ def get_symm_buffer_for_mono_ep(group: dist.ProcessGroup,
         num_shared_experts,
         mma_type=mma_type, activation=activation,
         num_min_ring_tokens=num_min_ring_tokens,
-        num_exact_ring_tokens=num_exact_ring_tokens
+        num_exact_ring_tokens=num_exact_ring_tokens,
+        num_ring_routed_tokens=num_ring_routed_tokens
     )
 
 
@@ -261,5 +267,6 @@ def bf16_mono_ep(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math, saved_z
+        fast_math, saved_z,
+        sym_buffer.l1_acts.shape[0] if sym_buffer.bounded_ring else 0
     )
