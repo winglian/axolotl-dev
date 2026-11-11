@@ -81,7 +81,9 @@ def _rel(a, b):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
-    parser.add_argument("--routing", choices=("balanced", "skewed"), default="balanced")
+    parser.add_argument(
+        "--routing", choices=("balanced", "skewed", "adversarial"), default="balanced"
+    )
     parser.add_argument("--variants", default="")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=15)
@@ -130,6 +132,10 @@ def main():
     ids = torch.rand(tokens, experts, device="cuda").argsort(-1)[:, :topk].contiguous()
     if args.routing == "skewed":
         ids = _skewed_routing(tokens, experts, topk, rank)
+    elif args.routing == "adversarial":
+        # every token of every rank to rank 0's experts: rank 0 receives the worst case
+        ids = torch.rand(tokens, local_experts, device="cuda").argsort(-1)[:, :topk]
+        ids = ids.contiguous()
     scores = torch.rand(tokens, topk, device="cuda")
     scores = scores / scores.sum(-1, keepdim=True)
     w1 = (
@@ -453,6 +459,19 @@ def main():
             getattr(native, "context_hits", None),
             getattr(native, "context_misses", None),
         ],
+        workspace_rank0=dict(
+            pool_rows=getattr(native, "pools", [torch.empty(0)])[0].shape[0],
+            worst_rows=getattr(native, "worst_rows", None),
+            bound=None
+            if getattr(native, "bound", None) is None
+            else dict(
+                rows=native.bound.rows,
+                high_water=native.bound.high_water,
+                grows=native.bound.grows,
+                unrecorded=native.bound.unrecorded,
+            ),
+        ),
+        device_used_gib_max_rank=_device_used_max(device),
         stored_context_rank0=(
             None
             if getattr(runtime, "_stored", None) is None
@@ -474,6 +493,13 @@ def main():
         functional.clear_workspace_cache()
     dist.destroy_process_group()
     os._exit(0)
+
+
+def _device_used_max(device):
+    free, total = torch.cuda.mem_get_info(device)
+    used = torch.tensor([float(total - free)], device=device, dtype=torch.float64)
+    dist.all_reduce(used, op=dist.ReduceOp.MAX)
+    return used.item() / 2**30
 
 
 def _save_mono_ep_output():
