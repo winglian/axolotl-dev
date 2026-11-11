@@ -71,9 +71,10 @@ get_symm_buffer_size_for_mono_ep(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const std::string& mma_type, const std::string& activation,
-    const int& num_shared_experts = 0, const int& num_min_ring_tokens = 0) {
+    const int& num_shared_experts = 0, const int& num_min_ring_tokens = 0,
+    const int& num_exact_ring_tokens = 0) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(num_min_ring_tokens >= 0);
+    DG_HOST_ASSERT(num_min_ring_tokens >= 0 and num_exact_ring_tokens >= 0);
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
@@ -88,9 +89,12 @@ get_symm_buffer_size_for_mono_ep(
     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
     // Iterate all block candidates to get the maximum ring size
+    // NOTES: an exact size skips the forward's live-block bound; only owned schedules may run on it
     int num_ring_tokens = 0;
     const auto arch_major = jit->device.get_arch_major();
     for (const auto& block_m: layout::kCandidateBlockM) {
+        if (num_exact_ring_tokens > 0)
+            break;
         const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
         const auto num_live_pool_blocks = arch_major == 9 ?
             sched::get_num_max_live_pool_blocks<1>(num_pool_blocks, num_sms, hidden, intermediate_hidden) :
@@ -98,7 +102,9 @@ get_symm_buffer_size_for_mono_ep(
         num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
     }
     // Owned schedules (the backward) hold one live block per CTA cluster; callers raise the floor for them
-    num_ring_tokens = math::align(std::max(num_ring_tokens, num_min_ring_tokens), layout::kLCMCandidateBlockM);
+    num_ring_tokens = math::align(
+        num_exact_ring_tokens > 0 ? num_exact_ring_tokens : std::max(num_ring_tokens, num_min_ring_tokens),
+        layout::kLCMCandidateBlockM);
 
     // Parse MMA type
     const bool fp8_combine = mma_type == "fp8xbf16_fp8combine";

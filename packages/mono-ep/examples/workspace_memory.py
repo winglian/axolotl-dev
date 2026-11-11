@@ -121,6 +121,8 @@ def main():
         ),
         forward_symmetric_gib=_max(runtime.buffer.buffer.nbytes),
         backward_symmetric_gib=_max(native.buffer.buffer.nbytes),
+        forward_ring_tokens=runtime.buffer.l1_acts.shape[0],
+        backward_ring_tokens=native.buffer.l1_acts.shape[0],
     )
     if rank == 0:
         print("WSMEM_JSON " + json.dumps(payload), flush=True)

@@ -85,6 +85,10 @@ class NativePersistentBackward:
         dist.all_gather_object(hosts, socket.gethostname(), group=self.group)
         if len(set(hosts)) != 1:
             raise ValueError("Native persistent backward currently requires one host")
+        floor = owned_backward_ring_tokens(runtime.num_sms)
+        self.bounded = (
+            self.arch == 10 and not self.blockwise and workspace_bound.mode() == "auto"
+        )
         self.buffer = deep_gemm.get_symm_buffer_for_mono_ep(
             self.group,
             runtime.experts,
@@ -99,7 +103,9 @@ class NativePersistentBackward:
                 if self.fp8_transport
                 else "bf16xbf16"
             ),
-            num_min_ring_tokens=owned_backward_ring_tokens(runtime.num_sms),
+            num_min_ring_tokens=floor,
+            # the owned schedule keeps one block live per cluster, so the floor is all it needs
+            num_exact_ring_tokens=floor if self.bounded else 0,
         )
         self.handles = []
         capacity = self.buffer.num_max_tokens_per_rank
@@ -120,7 +126,7 @@ class NativePersistentBackward:
         rows = self.world * capacity * runtime.topk + self.experts * 128
         self.worst_rows = rows
         self.bound = None
-        if self.arch == 10 and not self.blockwise and workspace_bound.mode() == "auto":
+        if self.bounded:
             self.bound = workspace_bound.WorkspaceBound(
                 capacity, runtime.topk, self.experts, rows
             )
