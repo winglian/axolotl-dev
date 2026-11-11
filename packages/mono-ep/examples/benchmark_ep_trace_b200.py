@@ -30,6 +30,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from probe_diag_b200 import STRIDE, summarize_trace  # noqa: E402
 
 TOKENS, HIDDEN, INNER, LOCAL_EXPERTS, TOPK = 16384, 2048, 768, 16, 8
+# Global expert counts of the shapes the MoK driver uses; local experts follow the world size
+SHAPES = {
+    "30b": dict(hidden=2048, intermediate=768, experts=128),
+    "235b": dict(hidden=4096, intermediate=1536, experts=128),
+    "beam": dict(hidden=5120, intermediate=2560, experts=256),
+}
 DIST_STRIDE = 64
 ENV = {
     "bwd": ("MONO_EP_SM100_PHASE_TRACE", "MONO_EP_SM100_DIAG_ABLATE"),
@@ -43,6 +49,9 @@ NATIVE = {
     "fwd": "bf16_mono_ep",
     # In-kernel dW entry (MONO_EP_SM100_INKERNEL_DW=1), timed as the native backward
     "bwd_dw": "bf16_mono_ep_backward_dw",
+    # Stored-context entries (MONO_EP_STORED_CONTEXT), timed as the native backward
+    "bwd_ctx": "bf16_mono_ep_backward_ctx",
+    "bwd_dw_ctx": "bf16_mono_ep_backward_dw_ctx",
 }
 
 
@@ -153,6 +162,7 @@ def run(args):
     from mono_ep import weight_cache
     from mono_ep.runtime import PersistentMoE
 
+    global HIDDEN, INNER, LOCAL_EXPERTS
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     device_name = torch.cuda.get_device_name()
@@ -160,6 +170,10 @@ def run(args):
         raise RuntimeError(f"Expected B200, got {device_name}")
     dist.init_process_group("nccl", device_id=torch.device("cuda", rank))
     world = dist.get_world_size()
+    if args.shape != "30b":
+        shape = SHAPES[args.shape]
+        HIDDEN, INNER = shape["hidden"], shape["intermediate"]
+        LOCAL_EXPERTS = shape["experts"] // world
     experts = LOCAL_EXPERTS * world
     torch.manual_seed(812 + rank)
     runtime = PersistentMoE(
@@ -206,10 +220,13 @@ def run(args):
     weight_cache.weight_layouts = wrap("layouts", original_layouts)
     # MXFP8 backward (MONO_EP_SM100_BACKWARD_PRECISION=mxfp8): its own launcher and weight forms
     original_mx = getattr(deep_gemm._C, "mxfp8_mono_ep_backward", None)
+    original_mx_ctx = getattr(deep_gemm._C, "mxfp8_mono_ep_backward_ctx", None)
     original_mx_forms = getattr(weight_cache, "mxfp8_backward_weight_forms", None)
     if original_mx is not None:
         deep_gemm._C.mxfp8_mono_ep_backward = wrap("native", original_mx)
         weight_cache.mxfp8_backward_weight_forms = wrap("layouts", original_mx_forms)
+    if original_mx_ctx is not None:
+        deep_gemm._C.mxfp8_mono_ep_backward_ctx = wrap("native", original_mx_ctx)
 
     def bump():
         with torch.no_grad():
@@ -394,12 +411,15 @@ def run(args):
     if original_mx is not None:
         deep_gemm._C.mxfp8_mono_ep_backward = original_mx
         weight_cache.mxfp8_backward_weight_forms = original_mx_forms
+    if original_mx_ctx is not None:
+        deep_gemm._C.mxfp8_mono_ep_backward_ctx = original_mx_ctx
     if rank == 0:
         print(
             "EPTRACE_JSON "
             + json.dumps(
                 dict(
                     benchmark="b200_ep_trace",
+                    shape=args.shape,
                     device=device_name,
                     torch=torch.__version__,
                     world=world,
@@ -436,6 +456,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--shape", choices=sorted(SHAPES), default="30b")
     parser.add_argument("--routing", choices=("balanced", "skewed"), default="balanced")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=8)
