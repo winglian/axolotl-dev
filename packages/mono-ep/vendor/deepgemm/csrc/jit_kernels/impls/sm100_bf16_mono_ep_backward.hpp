@@ -199,7 +199,6 @@ static void bf16_mono_ep_backward_launch(
     if (saved_z.has_value()) {
         // Stored forward context, layout::StoredZ bytes (capacity in the device header)
         check(*saved_z, torch::kUInt8);
-        DG_HOST_ASSERT(not dw.has_value());
         DG_HOST_ASSERT(saved_z->dim() == 1 and static_cast<uint64_t>(saved_z->numel()) >=
                        layout::stored_z_meta_bytes(world, max_tokens, topk));
     }
@@ -275,6 +274,21 @@ static void bf16_mono_ep_backward_ctx(
         dy, dy_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, std::nullopt, saved_z);
 }
 
+// In-kernel weight gradients with the stored forward context.
+static void bf16_mono_ep_backward_dw_ctx(
+    const torch::Tensor& dx, const torch::Tensor& ds,
+    const torch::Tensor& w1, const torch::Tensor& w2t, const torch::Tensor& w1t,
+    const std::vector<torch::Tensor>& pools,
+    const torch::Tensor& starts, const torch::Tensor& counts,
+    const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_ptrs,
+    const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
+    const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
+    int rank, int max_tokens, int ring_tokens, int topk,
+    const torch::Tensor& dw1, const torch::Tensor& dw2, const torch::Tensor& state, const torch::Tensor& saved_z) {
+    bf16_mono_ep_backward_launch(dx, ds, w1, w2t, w1t, pools, starts, counts, sym_buffer, sym_ptrs,
+        dy, dy_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, MonoEPBackwardDw{dw1, dw2, state}, saved_z);
+}
+
 // The same backward with dW1 = dz^T x and dW2 = dy^T h computed inside the persistent kernel.
 static void bf16_mono_ep_backward_dw(
     const torch::Tensor& dx, const torch::Tensor& ds,
@@ -294,7 +308,7 @@ static void bf16_mono_ep_backward_dw(
 // dh, z recompute and dx GEMMs (BLOCK_K 128), dz quantized in the epilogue. The weight-gradient pools stay BF16.
 // Options bit 2048 selects it in the shared kernel (512 and 1024 are in-kernel dW); the operand and scale tensor maps
 // reuse the unused shared-expert slots, which in-kernel dW also uses, so the two do not combine.
-static void mxfp8_mono_ep_backward(
+static void mxfp8_mono_ep_backward_launch(
     const torch::Tensor& dx, const torch::Tensor& ds,
     const torch::Tensor& w1, const torch::Tensor& w2t, const torch::Tensor& w1t,
     const std::vector<torch::Tensor>& weight_scales,
@@ -304,7 +318,7 @@ static void mxfp8_mono_ep_backward(
     const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
     const torch::Tensor& dy_sf, const std::vector<int64_t>& dy_sf_ptrs,
     const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
-    int rank, int max_tokens, int ring_tokens, int topk) {
+    int rank, int max_tokens, int ring_tokens, int topk, const std::optional<torch::Tensor>& saved_z = std::nullopt) {
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(dx.is_cuda() and dx.dim() == 2);
     const auto check = [&](const torch::Tensor& t, torch::ScalarType dtype) {
@@ -401,8 +415,13 @@ static void mxfp8_mono_ep_backward(
     const int pull = hidden * 2;
     const char* options_selector = std::getenv("MONO_EP_SM100_BACKWARD_OPTIONS");
     const uint32_t options = (options_selector == nullptr ? kDefaultBackwardOptions :
-        static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10))) | 2048u;
-    DG_HOST_ASSERT(options < 4096 and not (options & (512u | 1024u)));
+        static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10))) | 2048u | (saved_z.has_value() ? 4096u : 0u);
+    DG_HOST_ASSERT(options < 8192 and not (options & (512u | 1024u)));
+    if (saved_z.has_value()) {
+        check(*saved_z, torch::kUInt8);
+        DG_HOST_ASSERT(saved_z->dim() == 1 and static_cast<uint64_t>(saved_z->numel()) >=
+                       layout::stored_z_meta_bytes(world, max_tokens, topk));
+    }
     DG_HOST_ASSERT((options & 1u) and not (options & 4u) and not (options & 16u) and not (options & 64u));
     const auto exact_smem_for = [&](const int& n) {
         int offset = math::align(experts * world * 4, 1024) + 4 * pull;   // token counts, 4 dispatch pull buffers
@@ -428,6 +447,7 @@ static void mxfp8_mono_ep_backward(
     const uint32_t diag_ablate = ablate_selector == nullptr ? 0 :
         static_cast<uint32_t>(std::strtoul(ablate_selector, nullptr, 10));
     DG_HOST_ASSERT(not (diag_ablate & 64u));
+    DG_HOST_ASSERT(not saved_z.has_value() or phase_trace_ptr == 0);
     const bool diag = phase_trace_ptr != 0 or diag_ablate != 0;
     const std::string diag_name = (diag
         ? std::format("_diag_t{}_a{}", phase_trace_ptr != 0 ? 1 : 0, diag_ablate) : std::string()) +
@@ -458,7 +478,40 @@ static void instantiate() {{
         .block_dim = dim3(512), .cluster_dim = dim3(2, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),
         tqx, tw1, tsw2t, tqz, tw1t, tsx, tsw1, tsy, tsz, tsw1t,
-        static_cast<const uint8_t*>(nullptr), reinterpret_cast<__nv_bfloat16*>(phase_trace_ptr), tqy, tw2t, buffers);
+        static_cast<const uint8_t*>(nullptr),
+        saved_z.has_value() ? reinterpret_cast<__nv_bfloat16*>(saved_z->data_ptr()) : reinterpret_cast<__nv_bfloat16*>(phase_trace_ptr),
+        tqy, tw2t, buffers);
+}
+
+static void mxfp8_mono_ep_backward(
+    const torch::Tensor& dx, const torch::Tensor& ds,
+    const torch::Tensor& w1, const torch::Tensor& w2t, const torch::Tensor& w1t,
+    const std::vector<torch::Tensor>& weight_scales,
+    const std::vector<torch::Tensor>& pools,
+    const torch::Tensor& starts, const torch::Tensor& counts,
+    const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_ptrs,
+    const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
+    const torch::Tensor& dy_sf, const std::vector<int64_t>& dy_sf_ptrs,
+    const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
+    int rank, int max_tokens, int ring_tokens, int topk) {
+    mxfp8_mono_ep_backward_launch(dx, ds, w1, w2t, w1t, weight_scales, pools, starts, counts, sym_buffer, sym_ptrs,
+        dy, dy_ptrs, dy_sf, dy_sf_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk);
+}
+
+// The MXFP8 backward reading the forward's stored z instead of recomputing the gate/up projection.
+static void mxfp8_mono_ep_backward_ctx(
+    const torch::Tensor& dx, const torch::Tensor& ds,
+    const torch::Tensor& w1, const torch::Tensor& w2t, const torch::Tensor& w1t,
+    const std::vector<torch::Tensor>& weight_scales,
+    const std::vector<torch::Tensor>& pools,
+    const torch::Tensor& starts, const torch::Tensor& counts,
+    const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_ptrs,
+    const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
+    const torch::Tensor& dy_sf, const std::vector<int64_t>& dy_sf_ptrs,
+    const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
+    int rank, int max_tokens, int ring_tokens, int topk, const torch::Tensor& saved_z) {
+    mxfp8_mono_ep_backward_launch(dx, ds, w1, w2t, w1t, weight_scales, pools, starts, counts, sym_buffer, sym_ptrs,
+        dy, dy_ptrs, dy_sf, dy_sf_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, saved_z);
 }
 
 } // namespace deep_gemm

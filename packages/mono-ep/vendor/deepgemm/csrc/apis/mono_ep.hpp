@@ -622,7 +622,9 @@ static void register_apis(pybind11::module_& m) {
     m.def("nvfp4_mono_ep_backward", &nvfp4_mono_ep_backward);
     m.def("bf16_mono_ep_backward_dw", &bf16_mono_ep_backward_dw);
     m.def("bf16_mono_ep_backward_ctx", &bf16_mono_ep_backward_ctx);
+    m.def("bf16_mono_ep_backward_dw_ctx", &bf16_mono_ep_backward_dw_ctx);
     m.def("mxfp8_mono_ep_backward", &mxfp8_mono_ep_backward);
+    m.def("mxfp8_mono_ep_backward_ctx", &mxfp8_mono_ep_backward_ctx);
     m.def("bf16_mono_ep_backward_sm90", &bf16_mono_ep_backward_sm90);
     m.def("fp8_mono_ep_backward_sm90", &fp8_mono_ep_backward_sm90,
           py::arg("dx"), py::arg("ds"), py::arg("w1"), py::arg("w2t"), py::arg("w1t"),

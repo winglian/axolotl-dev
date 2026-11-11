@@ -157,12 +157,10 @@ class NativePersistentBackward:
         return True
 
     def stored_context_usable(self):
-        """The SM100 BF16 backward can read a stored forward z (not with the MXFP8 backward or in-kernel dW)."""
+        """The SM100 BF16 and MXFP8 backwards (with or without in-kernel dW) can read a stored z."""
         return (
             self.arch == 10
             and not self.blockwise
-            and self.precision() == "bf16"
-            and not self.inkernel_dw()
             and os.getenv("MONO_EP_SM100_PHASE_TRACE") is None
             and self.runtime.buffer.num_max_tokens_per_rank
             == self.buffer.num_max_tokens_per_rank
@@ -243,7 +241,7 @@ class NativePersistentBackward:
         )
         return self._mx
 
-    def _backward_mxfp8(self, dy, x, indices, scores, w1, w2):
+    def _backward_mxfp8(self, dy, x, indices, scores, w1, w2, stored_z=None):
         import deep_gemm
 
         from .token_quantization import quantize_persistent_mxfp8_into
@@ -262,7 +260,12 @@ class NativePersistentBackward:
         forms = mxfp8_backward_weight_forms(w1, w2)
         dx = torch.empty_like(x)
         ds = torch.empty_like(scores, dtype=torch.float32)
-        deep_gemm._C.mxfp8_mono_ep_backward(
+        getattr(
+            deep_gemm._C,
+            "mxfp8_mono_ep_backward"
+            if stored_z is None
+            else "mxfp8_mono_ep_backward_ctx",
+        )(
             dx,
             ds,
             *[f[0] for f in forms],
@@ -282,6 +285,7 @@ class NativePersistentBackward:
             mx.buffer.num_max_tokens_per_rank,
             mx.buffer.l1_acts.shape[0],
             self.runtime.topk,
+            *(() if stored_z is None else (stored_z,)),
         )
         return dx, ds
 
@@ -393,7 +397,15 @@ class NativePersistentBackward:
                     "MONO_EP_SM100_INKERNEL_DW=1 does not combine with "
                     "MONO_EP_SM100_BACKWARD_PRECISION=mxfp8"
                 )
-            dx, ds = self._backward_mxfp8(dy, x, indices, scores, w1, w2)
+            dx, ds = self._backward_mxfp8(
+                dy,
+                x,
+                indices,
+                scores,
+                w1,
+                w2,
+                self._take_context(x, indices, scores, w1, w2),
+            )
             return self._finish_bf16_sm100(dx, ds, scores, stream)
         tokens = x.shape[0]
         from .sm90_prep import enabled as fused_prep
@@ -482,7 +494,7 @@ class NativePersistentBackward:
             if self.arch == 10 and not self.blockwise
             else None
         )
-        if stored_z is not None:
+        if stored_z is not None and not inkernel_dw:
             dw_args = (stored_z,)
             native_name = "bf16_mono_ep_backward_ctx"
         elif inkernel_dw:
@@ -500,6 +512,9 @@ class NativePersistentBackward:
             )
             dw_args = (dw1, dw2, self.dw_state)
             native_name = "bf16_mono_ep_backward_dw"
+            if stored_z is not None:
+                dw_args += (stored_z,)
+                native_name = "bf16_mono_ep_backward_dw_ctx"
         getattr(deep_gemm._C, native_name)(
             dx,
             ds,
@@ -537,7 +552,7 @@ class NativePersistentBackward:
         x_pool, dy_pool, h_pool, dz_pool = self.pools[:4]
         if not (fused and self.blockwise) and not inkernel_dw:
             ends = self.starts + self.counts
-        if inkernel_dw and stored_z is None:
+        if inkernel_dw:
             dw1, dw2 = dw_args[:2]
         elif self.blockwise:
             from .hopper_wgrad import weight_grad_fp8_hopper_packed

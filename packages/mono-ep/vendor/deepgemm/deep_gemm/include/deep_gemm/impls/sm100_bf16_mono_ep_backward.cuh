@@ -215,8 +215,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
             stored_z_meta[layout::kStoredZHeaderInts + (rank * kNumMaxTokensPerRank + token) * kNumTopk + slot]);
         return stored_z + pool_row * (2 * kIntermediateHidden);
     };
-    DG_STATIC_ASSERT(not (kStoredContext and (kPhaseTrace or kMXFP8 or kInkernelDw)),
-                     "Stored context excludes the phase trace, the MXFP8 backward and in-kernel dW");
+    DG_STATIC_ASSERT(not (kStoredContext and kPhaseTrace), "Stored context and the phase trace share `saved_z`");
     const auto is_stored_recompute = [&](const auto& info) {
         return kStoredContext and stored_z_valid and (info.block_phase == sched::BlockPhase::BackwardRecomputeLow or
                                    info.block_phase == sched::BlockPhase::BackwardRecomputeHigh);
