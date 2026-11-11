@@ -74,6 +74,11 @@ def forward_ring_budget(max_tokens, topk):
     return _round_up(math.ceil(HEADROOM * max_tokens * topk))
 
 
+def forward_ring_tokens():
+    """``MONO_EP_FORWARD_RING_TOKENS``: an exact forward ring size (sweeps); 0 sizes it from the budget."""
+    return int(os.getenv("MONO_EP_FORWARD_RING_TOKENS", "0"))
+
+
 def layer_key(w1):
     return w1.untyped_storage()._cdata
 

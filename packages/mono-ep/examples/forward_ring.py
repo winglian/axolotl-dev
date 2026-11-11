@@ -23,6 +23,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--cases", default="balanced,skewed,adversarial")
     args = parser.parse_args()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -82,7 +83,7 @@ def main():
         return t.tolist()
 
     results = {}
-    for case in ("balanced", "skewed", "adversarial"):
+    for case in args.cases.split(","):
         x = torch.randn(
             tokens, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
@@ -139,6 +140,7 @@ def main():
         shape=args.shape,
         world=world,
         forward_ring_rows_env=os.getenv("MONO_EP_FORWARD_RING_ROWS"),
+        forward_ring_tokens_env=os.getenv("MONO_EP_FORWARD_RING_TOKENS"),
         forward_ring_budget=runtimes["auto"].forward_ring_budget,
         ring_tokens={m: r.buffer.l1_acts.shape[0] for m, r in runtimes.items()},
         forward_symmetric_gib={
