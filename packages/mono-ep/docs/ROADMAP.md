@@ -16,6 +16,9 @@ the benchmark logs, outside the package.
   (opt-in).
 - Bounded workspace (default on): backward pools, the backward ring and the SM100 BF16 forward
   ring sized from the routed rows instead of the worst case, on SM90 and SM100.
+- SM100 backward stack: stored gate/up pre-activations in checkpoint recomputes (default `auto`,
+  wide experts only) and direct-write weight gradients (default on); MXFP8 weight gradients with
+  the fused weight forms and the row requantization (opt-in, with the MXFP8 backward).
 - NVFP4 LoRA on SM100 (frozen packed NVFP4 experts with LoRA adapters, CUDA requant, lean
   recompute tail), through the package API.
 - Axolotl backend `expert_parallel_backend: mono_ep` (fused and dispatch modes, fallback to
@@ -35,6 +38,12 @@ the benchmark logs, outside the package.
   because the live-block ring cost 4-8 % of the forward; a dispatch order that reuses slots could
   reach the live bound.
 - The MXFP8, NVFP4 and SM90 forwards keep the worst-case forward ring.
+- The MXFP8 transport ring and the MXFP8 scale pools keep the worst case under the bound.
+- MXFP8 backward weight forms: the per-step builder is a Triton kernel (1.5 ms per step at Beam);
+  a CUDA builder is the next step.
+- Stored context: count hits and misses per layer. At Qwen3-235B-A22B skewed routing `auto` only
+  ties `off` (26.33 / 26.38 ms), and it is not yet known whether the hot rank overflows the buffer
+  or hides the saving behind its transfers.
 - Layering refactor of the Python package into stateless ops with fake implementations, a
   functional layer and the API.
 - SM120 (RTX PRO 6000 / RTX 50-series): no TMEM or tcgen05, so it needs its own kernels.

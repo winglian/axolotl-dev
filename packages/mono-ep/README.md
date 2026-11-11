@@ -22,6 +22,11 @@ compiles with `fullgraph=True`. The package has no Axolotl, Transformers or TRL 
   Resident per rank at EP8 on B200, 16,384 tokens per GPU: 4.9 / 7.9 / 9.0 GB at the
   Qwen3-30B-A3B / Qwen3-235B-A22B / Beam shapes instead of 18.1 / 35.5 / 41.0 GB, with
   bitwise-identical dx; SM90 BF16 and blockwise FP8 take the same bounds.
+- SM100 backward: activation-checkpoint recomputes store the gate/up pre-activations and the
+  backward skips recomputing them at wide experts (`MONO_EP_STORED_CONTEXT=auto`, Axolotl
+  `expert_parallel_mono_ep_stored_context`; Beam checkpointed layer 51.7 -> 45.6 ms on 8xB200),
+  and the dW grouped GEMMs write their output directly (`MONO_EP_SM100_DW_DIRECT=1`). The MXFP8
+  backward and MXFP8 dW (`MONO_EP_SM100_BACKWARD_PRECISION`, `MONO_EP_SM100_DW_PRECISION`) are opt-in.
 
 ## Installation
 
