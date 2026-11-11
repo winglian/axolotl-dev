@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from . import workspace_bound
+from .dw import direct_dw, weight_grad
 from .ops import weight_grad_bf16, weight_grad_bf16_gpu_offsets
 
 OWNED_BLOCK_M = 128
@@ -526,15 +527,9 @@ class NativePersistentBackward:
             dw2 = weight_grad_bf16_gpu_offsets(
                 dy_pool, h_pool, self.starts, ends, expected_k
             )
-        elif os.getenv("MONO_EP_SM100_DW_DIRECT", "0") == "1":
-            from .ops import weight_grad_bf16_direct
-
-            dw1 = weight_grad_bf16_direct(
-                dz_pool, x_pool, ends, self.counts, self.experts
-            )
-            dw2 = weight_grad_bf16_direct(
-                dy_pool, h_pool, ends, self.counts, self.experts
-            )
+        elif direct_dw():
+            dw1 = weight_grad(dz_pool, x_pool, ends, self.counts, self.experts)
+            dw2 = weight_grad(dy_pool, h_pool, ends, self.counts, self.experts)
         else:
             dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)
             dw2 = weight_grad_bf16(dy_pool, h_pool, ends, None, self.experts, True)
@@ -546,8 +541,12 @@ class NativePersistentBackward:
         """SM100 BF16 weight gradients from the BF16 pools (the MXFP8 backward dequantizes x and dy into them)."""
         x_pool, dy_pool, h_pool, dz_pool = self.pools[:4]
         ends = self.starts + self.counts
-        dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)
-        dw2 = weight_grad_bf16(dy_pool, h_pool, ends, None, self.experts, True)
+        if direct_dw():
+            dw1 = weight_grad(dz_pool, x_pool, ends, self.counts, self.experts)
+            dw2 = weight_grad(dy_pool, h_pool, ends, self.counts, self.experts)
+        else:
+            dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)
+            dw2 = weight_grad_bf16(dy_pool, h_pool, ends, None, self.experts, True)
         self.finished = torch.cuda.Event()
         self.finished.record(stream)
         return dx, ds.to(scores.dtype), dw1, dw2

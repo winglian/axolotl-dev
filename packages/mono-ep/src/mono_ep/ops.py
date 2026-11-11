@@ -176,37 +176,6 @@ def _weight_grad_bf16_fake(dy, x, k_sizes, sizes, experts, use_psum_layout):
     return x.new_empty((experts, dy.shape[1], x.shape[1]), dtype=torch.float32)
 
 
-@torch.library.custom_op("mono_ep::weight_grad_bf16_direct", mutates_args=())
-def weight_grad_bf16_direct(
-    dy: torch.Tensor,
-    x: torch.Tensor,
-    ends: torch.Tensor,
-    counts: torch.Tensor,
-    experts: int,
-) -> torch.Tensor:
-    """``weight_grad_bf16`` (psum layout) writing D directly instead of accumulating into zeros.
-
-    The kernel leaves an empty expert's block unwritten, so those blocks are zeroed afterwards.
-    """
-    import deep_gemm
-
-    out = torch.empty(
-        (experts, dy.shape[1], x.shape[1]), device=x.device, dtype=torch.float32
-    )
-    if x.shape[0]:
-        deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
-            dy, x, out, None, ends, None, use_psum_layout=True
-        )
-    else:
-        out.zero_()
-    return out.masked_fill_((counts == 0).view(-1, 1, 1), 0.0)
-
-
-@weight_grad_bf16_direct.register_fake
-def _weight_grad_bf16_direct_fake(dy, x, ends, counts, experts):
-    return x.new_empty((experts, dy.shape[1], x.shape[1]), dtype=torch.float32)
-
-
 @torch.library.custom_op("mono_ep::weight_grad_bf16_gpu_offsets", mutates_args=())
 def weight_grad_bf16_gpu_offsets(
     dy: torch.Tensor,
