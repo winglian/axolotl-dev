@@ -504,8 +504,10 @@ class NativePersistentBackward:
                 qdy, sdy, qh, sh, self.padded_counts, capacity
             )
         elif self.arch == 9:
-            expected_k = (
-                self.buffer.num_max_tokens_per_rank * self.world * self.runtime.topk
+            # The GEMM's K hint may not exceed the (bounded) pool rows
+            expected_k = min(
+                self.buffer.num_max_tokens_per_rank * self.world * self.runtime.topk,
+                x_pool.shape[0],
             )
             dw1 = weight_grad_bf16_gpu_offsets(
                 dz_pool, x_pool, self.starts, ends, expected_k
