@@ -12,6 +12,7 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
+#include <deep_gemm/impls/mono_ep_combine.cuh>
 #include <deep_gemm/layout/mono_ep.cuh>
 #include <deep_gemm/layout/moe_backward.cuh>
 #include <deep_gemm/mma/sm90.cuh>
@@ -872,14 +873,17 @@ sm90_bf16_mono_ep_backward_impl(void* y,
         constexpr uint32_t kNumChunkSlots = 3;
         constexpr uint32_t kNumMaxRegistersForBuffer = 128;
 
-        // NOTES: either 1 or 2 chunks for simplicity
-        // NOTES: Restrict on both smem and register
-        constexpr uint32_t kNumChunks =
-            kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= kNumReusableSmemBytes and kHidden <= 32 * kNumMaxRegistersForBuffer ? 1 : 2;
-        constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
+        // NOTES: the smallest chunk count that fits the reusable smem and the register buffer; the
+        // combine loop below is per (token, chunk), so any divisor of the hidden size works
+        constexpr uint32_t kNumChunks = mono_ep_combine::get_num_chunks<
+            kHidden, kNumHiddenBytes, kNumChunkSlots, kNumEpilogueWarps,
+            kNumReusableSmemBytes, kNumMaxRegistersForBuffer>();
+        DG_STATIC_ASSERT(kNumChunks > 0, "Hidden is too large: no combine chunk fits the reusable shared memory");
+        constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / (kNumChunks > 0 ? kNumChunks : 1);
         constexpr uint32_t kNumChunkUint4 = kNumChunkBytes / sizeof(uint4);
         constexpr uint32_t kNumUint4PerLane = kNumChunkUint4 / 32;
         DG_STATIC_ASSERT(kHidden % kNumChunks == 0, "Hidden must be divisible by number of chunks");
+        DG_STATIC_ASSERT(kHidden / kNumChunks <= 32 * kNumMaxRegistersForBuffer, "Combine chunk exceeds the register buffer");
         DG_STATIC_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes / kNumChunks <= kNumReusableSmemBytes, "Hidden is too large");
         DG_STATIC_ASSERT(kNumChunkBytes % 16 == 0, "Combine chunk must be TMA-aligned (16 bytes)");
         DG_STATIC_ASSERT(kNumChunkBytes % sizeof(uint4) == 0, "Combine chunk must be divisible by 16 bytes");

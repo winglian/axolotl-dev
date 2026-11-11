@@ -22,9 +22,9 @@ is new code in this tree. By theme:
   gate/up retention.
 - **Shared pieces**: the readiness-queue scheduler (`scheduler/mono_ep.cuh`, adapted from
   TeraMoE's BF16 chunk queue design), layouts (`layout/mono_ep.cuh`), the activation
-  selector and the dispatch pull sizing (`mono_ep_dispatch_pull.hpp`), exclusive-slot
-  scatter-store epilogues, and the grouped GEMM entry points with in-kernel readiness and
-  GPU row bounds.
+  selector, the dispatch pull sizing (`mono_ep_dispatch_pull.hpp`), the combine chunk
+  sizing (`mono_ep_combine.cuh`), exclusive-slot scatter-store epilogues, and the grouped
+  GEMM entry points with in-kernel readiness and GPU row bounds.
 - **Host side** (`src/mono_ep`): the `torch.library` ops and fake implementations, the
   `PersistentMoE` runtime and `MonoEPRuntime` API, the NCCL reference backward, the weight
   layout cache and its FSDP2 contract, SM90 FP8 weight forms and fused token preparation
