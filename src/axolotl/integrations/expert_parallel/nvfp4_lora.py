@@ -102,6 +102,23 @@ def expert_params(experts) -> set[torch.nn.Parameter]:
     return {getattr(experts, _GATE_UP), getattr(experts, _DOWN)}
 
 
+def move_frozen_experts(experts, device_type: str = "cuda") -> int:
+    """Put the frozen expert params on the accelerator in place (FSDP moves only the params
+    it manages, and the EP scatter leaves them on the loader's device). Returns the count moved."""
+    device = torch.device(device_type, torch.cuda.current_device())
+    moved = 0
+    for attr in (_GATE_UP, _DOWN):
+        param = getattr(experts, attr)
+        if param.device == device:
+            continue
+        with torch.no_grad():
+            on_device = param.to(device)
+        replacement = torch.nn.Parameter(on_device, requires_grad=param.requires_grad)
+        torch.utils.swap_tensors(param, replacement)
+        moved += 1
+    return moved
+
+
 def layer_index(module_name: str) -> int | None:
     match = _LAYER_RE.search(f".{module_name}.")
     return int(match.group(1)) if match else None

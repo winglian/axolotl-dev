@@ -47,14 +47,21 @@ def _pack(dense):
 
 
 def _quantize_experts(model):
+    """Pack the experts and leave them on the CPU, where a checkpoint loader leaves them."""
     from axolotl.integrations.expert_parallel.shard import _detect_experts_modules
 
     for _name, experts in _detect_experts_modules(model):
         for attr in ("gate_up_proj", "down_proj"):
             dense = getattr(experts, attr).detach().to(torch.bfloat16)
-            setattr(
-                experts, attr, torch.nn.Parameter(_pack(dense), requires_grad=False)
+            packed = _pack(dense)
+            packed = type(packed)(
+                packed.qdata.cpu(),
+                packed.scale.cpu(),
+                packed.block_size,
+                packed.orig_dtype,
+                per_tensor_scale=packed.per_tensor_scale.cpu(),
             )
+            setattr(experts, attr, torch.nn.Parameter(packed, requires_grad=False))
 
 
 def _relative(a, b):
@@ -175,15 +182,11 @@ def main():
             ),
         )
         generator = torch.Generator(device="cuda").manual_seed(7)
-        adapters = {}
         for name, parameter in model.named_parameters():
             if "lora_" in name:
                 parameter.data = parameter.data.float()
                 parameter.data.normal_(std=0.02, generator=generator)
-                adapters[name] = parameter
-        assert adapters and all(
-            "lora_" in n for n, p in model.named_parameters() if p.requires_grad
-        )
+        assert all("lora_" in n for n, p in model.named_parameters() if p.requires_grad)
         model._ep_lora_group = ep_group
         shard_expert_lora(model, 2)
         ExpertParallelPlugin._register_checkpoint_saves(cfg, model)
@@ -215,8 +218,11 @@ def main():
                     assert nvfp4_lora.is_nvfp4_tensor(module.gate_up_proj), type(
                         module.gate_up_proj
                     )
+        # FSDP swapped the parameters for DTensors: collect the adapters after wrapping
+        adapters = {n: p for n, p in model.named_parameters() if p.requires_grad}
+        assert adapters and all("lora_" in n for n in adapters)
         optimizer = torch.optim.AdamW(adapters.values(), lr=1e-3)
-        starts = {n: p.detach().clone() for n, p in adapters.items()}
+        starts = {n: p.to_local().detach().clone() for n, p in adapters.items()}
         losses, grads, builds = [], [], []
         for step in range(STEPS):
             optimizer.zero_grad(set_to_none=True)
@@ -262,11 +268,7 @@ def main():
             assert builds == [LAYERS * (step + 1) for step in range(STEPS)], builds
             assert state.cache.version == STEPS
         moved = {
-            n: _relative(
-                (p.to_local() if hasattr(p, "to_local") else p).detach(),
-                starts[n].to_local() if hasattr(starts[n], "to_local") else starts[n],
-            )
-            for n, p in adapters.items()
+            n: _relative(p.to_local().detach(), starts[n]) for n, p in adapters.items()
         }
         assert all(v > 0 for v in moved.values()), moved
         if backend == "mono_ep":

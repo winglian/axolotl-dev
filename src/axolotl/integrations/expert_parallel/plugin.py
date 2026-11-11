@@ -1194,17 +1194,22 @@ class ExpertParallelPlugin(BasePlugin):
                 continue
             fully_shard(module, **kwargs)
             wrapped.append(module)
-        from .nvfp4_lora import active as nvfp4_lora_active, expert_params
+        from .nvfp4_lora import (
+            active as nvfp4_lora_active,
+            expert_params,
+            move_frozen_experts,
+        )
 
         for pw in outer_expert_pws:
             pw_kwargs = kwargs
             if nvfp4_lora_active():
                 # the frozen packed NVFP4 experts stay plain tensors on every rank: the
                 # persistent kernels and the requant read their bytes in place, and an
-                # all-gathered copy per forward would be freed under them
-                pw_kwargs = dict(
-                    kwargs, ignored_params=expert_params(_real_experts_base(pw))
-                )
+                # all-gathered copy per forward would be freed under them. FSDP moves only
+                # the params it manages, so the base goes to the device here.
+                ignored = expert_params(_real_experts_base(pw))
+                move_frozen_experts(_real_experts_base(pw), dp_shard_mesh.device_type)
+                pw_kwargs = dict(kwargs, ignored_params=ignored)
             fully_shard(pw, **pw_kwargs)
             wrapped.append(pw)
 
