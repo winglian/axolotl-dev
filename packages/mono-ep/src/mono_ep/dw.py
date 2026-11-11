@@ -166,17 +166,28 @@ def requant_k_blocks(pool, starts, ends, scale_words=None):
     """E4M3 ``[rows, C]`` copy of a pool with ``[rows / 128, C]`` packed UE8M0 scales along rows.
 
     ``pool`` is BF16, or the backward's row-wise E4M3 pool when ``scale_words`` (its packed
-    ``[C / 128, rows]`` scale pool) is given; the quantization is then a requantization of the
-    exactly dequantized E4M3 values along the row axis."""
+    ``[C / 128, scale rows]`` scale pool, ``scale rows >= rows``) is given; the quantization is then a
+    requantization of the exactly dequantized E4M3 values along the row axis. The scale pool may keep
+    more rows than the bounded E4M3 pool (the kernel's scale layout is compiled for the worst case);
+    only its first ``rows`` rows are read."""
     rows, cols = pool.shape
     if rows % 128 or cols % 128 or not pool.is_contiguous():
         raise ValueError(
             "pools must be contiguous with rows and columns multiples of 128"
         )
     experts = starts.numel()
+    scale_rows = rows
     if scale_words is not None:
-        if scale_words.shape != (cols // 128, rows) or not scale_words.is_contiguous():
-            raise ValueError("scale words must be a contiguous [C / 128, rows] tensor")
+        scale_rows = scale_words.shape[1]
+        if (
+            scale_words.dim() != 2
+            or scale_words.shape[0] != cols // 128
+            or scale_rows < rows
+            or not scale_words.is_contiguous()
+        ):
+            raise ValueError(
+                "scale words must be a contiguous [C / 128, >= rows] tensor"
+            )
     q = torch.empty(rows, cols, device=pool.device, dtype=torch.float8_e4m3fn)
     s = torch.empty(rows // 128, cols, device=pool.device, dtype=torch.int32)
     col_blocks, num_warps, reciprocal, persistent = _requant_config(cols)
@@ -189,7 +200,7 @@ def requant_k_blocks(pool, starts, ends, scale_words=None):
     _requant_k_blocks[(row_programs, cols // (128 * col_blocks))](
         pool,
         scale_words if scale_words is not None else pool,
-        rows,
+        scale_rows,
         q,
         s,
         starts,
