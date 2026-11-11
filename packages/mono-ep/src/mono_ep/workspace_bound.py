@@ -28,7 +28,8 @@ larger need, logged). A backward with no record is sized for the worst case and 
 time (it means a forward was not recorded, e.g. a custom autograd path).
 
 The SM100 BF16 forward's symmetric ring is sized the same way: for ``HEADROOM x tokens x top-k`` routed
-rows instead of every token of every rank. Its scheduler gates L1 claims on the ring (an L1 block is
+rows instead of every token of every rank (wide experts: the live-block bound for that budget; narrow
+experts, where slot reuse costs forward time: one slot per budgeted row; never above the worst case). Its scheduler gates L1 claims on the ring (an L1 block is
 claimed only after every L2 task one ring generation back is claimed), so a step whose routing needs
 more live blocks runs gated and slower instead of overflowing; ``forward_over_budget`` counts the
 recorded forwards whose padded rows exceeded the budget. The owned backward's ring is its one-wave
@@ -74,9 +75,20 @@ def forward_ring_budget(max_tokens, topk):
     return _round_up(math.ceil(HEADROOM * max_tokens * topk))
 
 
-def forward_ring_tokens():
-    """``MONO_EP_FORWARD_RING_TOKENS``: an exact forward ring size (sweeps); 0 sizes it from the budget."""
-    return int(os.getenv("MONO_EP_FORWARD_RING_TOKENS", "0"))
+# Narrow experts (Qwen3-30B-A3B class) are dispatch-bound: reusing forward ring slots inside one launch costs
+# 4-8 % of the forward there, so their ring holds every budgeted row; wide experts hide the reuse waits
+WIDE_EXPERT_HIDDEN_X_INTERMEDIATE = 4096 * 1536
+
+
+def forward_ring_tokens(hidden, intermediate, budget):
+    """Exact forward ring tokens (0 = the live-block bound for ``budget`` routed rows), capped at the worst-case
+    ring. ``MONO_EP_FORWARD_RING_TOKENS`` overrides."""
+    override = os.getenv("MONO_EP_FORWARD_RING_TOKENS")
+    if override is not None:
+        return int(override)
+    if hidden * intermediate >= WIDE_EXPERT_HIDDEN_X_INTERMEDIATE:
+        return 0
+    return budget
 
 
 def layer_key(w1):

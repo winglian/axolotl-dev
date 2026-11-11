@@ -127,7 +127,9 @@ class PersistentMoE:
                 else "bf16xbf16"
             ),
             num_ring_routed_tokens=self.forward_ring_budget,
-            num_exact_ring_tokens=workspace_bound.forward_ring_tokens()
+            num_exact_ring_tokens=workspace_bound.forward_ring_tokens(
+                hidden, intermediate, self.forward_ring_budget
+            )
             if self.forward_ring_budget
             else 0,
         )

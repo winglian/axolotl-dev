@@ -83,31 +83,35 @@ get_symm_buffer_size_for_mono_ep(
     const auto num_sms = get_num_sms_for_mono_ep();
     const auto num_experts_per_rank = num_experts / num_ranks;
     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
-    // NOTES: a routed-token budget below the worst case sizes the ring for that budget; only the SM100 BF16
-    // forward (ring-gated scheduler) and owned backwards may run on such a ring
+    // NOTES: a routed-token budget below the worst case sizes the ring for that budget, and an exact size skips the
+    // live-block bound; only the SM100 BF16 forward (ring-gated scheduler) and owned backwards may run on such rings
+    const auto num_worst_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
     const auto num_max_routed_tokens = num_ring_routed_tokens > 0 ?
-        std::min(num_ring_routed_tokens, num_max_tokens_per_rank * num_ranks * num_active_topk) :
-        num_max_tokens_per_rank * num_ranks * num_active_topk;
+        std::min(num_ring_routed_tokens, num_worst_routed_tokens) : num_worst_routed_tokens;
 
     // Shared
     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
-    // Iterate all block candidates to get the maximum ring size
-    // NOTES: an exact size skips the forward's live-block bound; only owned schedules may run on it
-    int num_ring_tokens = 0;
+    // Iterate all block candidates to get the maximum ring size (for the budget and for the worst case)
+    int num_ring_tokens = 0, num_worst_ring_tokens = 0;
     const auto arch_major = jit->device.get_arch_major();
-    for (const auto& block_m: layout::kCandidateBlockM) {
-        if (num_exact_ring_tokens > 0)
-            break;
-        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+    const auto live_ring_tokens = [&](const int& num_routed_tokens, const int& block_m) {
+        const auto num_pool_blocks = ceil_div(num_routed_tokens, block_m) + num_experts_per_rank;
         const auto num_live_pool_blocks = arch_major == 9 ?
             sched::get_num_max_live_pool_blocks<1>(num_pool_blocks, num_sms, hidden, intermediate_hidden) :
             sched::get_num_max_live_pool_blocks<2>(num_pool_blocks, num_sms, hidden, intermediate_hidden);
-        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+        return num_live_pool_blocks * block_m;
+    };
+    for (const auto& block_m: layout::kCandidateBlockM) {
+        num_ring_tokens = std::max(num_ring_tokens, live_ring_tokens(num_max_routed_tokens, block_m));
+        num_worst_ring_tokens = std::max(num_worst_ring_tokens, live_ring_tokens(num_worst_routed_tokens, block_m));
     }
-    // Owned schedules (the backward) hold one live block per CTA cluster; callers raise the floor for them
+    // Owned schedules (the backward) hold one live block per CTA cluster; callers raise the floor for them.
+    // An exact size never exceeds what the worst case (with that floor) would allocate.
+    const int num_ring_ceiling = std::max(num_worst_ring_tokens, num_min_ring_tokens);
     num_ring_tokens = math::align(
-        num_exact_ring_tokens > 0 ? num_exact_ring_tokens : std::max(num_ring_tokens, num_min_ring_tokens),
+        num_exact_ring_tokens > 0 ? std::min(num_exact_ring_tokens, num_ring_ceiling) :
+                                    std::max(num_ring_tokens, num_min_ring_tokens),
         layout::kLCMCandidateBlockM);
 
     // Parse MMA type
