@@ -61,7 +61,36 @@ def _wrap_experts_fn(module):
     module._local_expert_weights = local
 
 
+def _wrap_trainer(module):
+    trainer = module.Trainer
+    original = trainer.training_step
+
+    def training_step(self, model, *args, **kwargs):
+        if not getattr(self, "_dtype_probe_hooked", False):
+            self._dtype_probe_hooked = True
+            for name, sub in model.named_modules():
+                if name.endswith("experts") and hasattr(sub, "gate_up_proj"):
+                    # Registered after fully_shard, so it runs after FSDP2's unshard pre-hook
+                    def hook(mod, _inputs):
+                        weight = mod.gate_up_proj
+                        local = (
+                            weight.to_local() if hasattr(weight, "to_local") else weight
+                        )
+                        _once("experts_forward", local)
+
+                    sub.register_forward_pre_hook(hook)
+                    stored = sub.gate_up_proj
+                    _once(
+                        "experts_stored_shard",
+                        stored.to_local() if hasattr(stored, "to_local") else stored,
+                    )
+        return original(self, model, *args, **kwargs)
+
+    trainer.training_step = training_step
+
+
 PATCHES = {
+    "transformers.trainer": _wrap_trainer,
     "mono_ep.runtime": _wrap_runtime,
     "mono_ep.weight_cache": _wrap_forms,
     "axolotl.integrations.expert_parallel.experts_fn": _wrap_experts_fn,
