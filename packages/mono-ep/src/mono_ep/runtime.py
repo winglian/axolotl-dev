@@ -16,6 +16,8 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch.autograd.function import once_differentiable
 
+from . import workspace_bound
+
 _RUNTIMES: dict[int, "PersistentMoE"] = {}
 _RUNTIME_KEYS = count(1)
 
@@ -209,6 +211,7 @@ class PersistentMoE:
         torch._assert_async(
             ((indices >= -1) & (indices < self.experts)).all(), "invalid expert index"
         )
+        self._record_forward = workspace_bound.will_backward(x, scores, w1, w2)
         if self.retain_activations:
             return _PersistentMoE.apply(x, indices, scores, w1, w2, self)
         return persistent_forward(x, indices, scores, w1, w2, self._key)
@@ -316,7 +319,11 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
         forward(y, tw1, tw2, buffer, fast_math=False, saved_z=saved_z)
     else:
         bound = getattr(runtime._peer_backward, "bound", None)
-        if bound is not None and not os.getenv("MONO_EP_SM100_FORWARD_PHASE_TRACE"):
+        if (
+            bound is not None
+            and getattr(runtime, "_record_forward", True)
+            and not os.getenv("MONO_EP_SM100_FORWARD_PHASE_TRACE")
+        ):
             # Per-expert receive counts of this call size the matching backward's pools
             counts = torch.zeros(
                 runtime.experts // dist.get_world_size(runtime.group),

@@ -18,7 +18,12 @@ usable keys because a checkpoint recompute rebuilds the MoE input and the routin
 tensors. Each key holds a stack: a forward pushes, a checkpoint-recompute forward does not (the
 original forward's record serves, so the backward never waits on a just-launched forward), the
 backward pops. Repeated calls of one layer and gradient-accumulation micro-batches nest
-correctly. Pools start at 1.25 x tokens x top-k + 128 per local expert and only grow (to 1.1 x a
+correctly. Only a forward that can reach a backward pushes (grad mode on and an input or weight
+requiring grad), so eval, ``no_grad`` / ``inference_mode`` and generation forwards leave no
+record; a recompute forward pushes only when its layer has no record (reentrant checkpointing
+runs the original forward under ``no_grad``). Records of forwards whose backward never ran (a
+skipped or failed micro-batch) are dropped after every ``optimizer.step()``, and a stack deeper
+than ``MAX_DEPTH`` drops its oldest entry with a warning. Pools start at 1.25 x tokens x top-k + 128 per local expert and only grow (to 1.1 x a
 larger need, logged). A backward with no record is sized for the worst case and logged every
 time (it means a forward was not recorded, e.g. a custom autograd path).
 
@@ -28,9 +33,11 @@ time (it means a forward was not recorded, e.g. a custom autograd path).
 import logging
 import math
 import os
+import weakref
 from collections import OrderedDict
 
 import torch
+from torch.optim.optimizer import register_optimizer_step_post_hook
 
 LOG = logging.getLogger("mono_ep")
 HEADROOM = 1.25
@@ -50,10 +57,23 @@ def _round_up(value, multiple=128):
 
 
 MAX_DEPTH = 64
+_LIVE: "weakref.WeakSet[WorkspaceBound]" = weakref.WeakSet()
 
 
 def layer_key(w1):
     return w1.untyped_storage()._cdata
+
+
+def will_backward(*tensors):
+    return torch.is_grad_enabled() and any(t.requires_grad for t in tensors)
+
+
+def clear_all():
+    for bound in list(_LIVE):
+        bound.clear()
+
+
+register_optimizer_step_post_hook(lambda *_: clear_all())
 
 
 class WorkspaceBound:
@@ -68,10 +88,17 @@ class WorkspaceBound:
         self.unrecorded = 0
         self.found = 0
         self.high_water = 0
+        self.dropped = 0
+        _LIVE.add(self)
+
+    def clear(self):
+        self.dropped += sum(len(stack) for stack in self.records.values())
+        self.records.clear()
 
     def record(self, w1, counts):
-        """After a (non-recompute) forward: the padded row total, pushed under the layer's key."""
-        if torch._C._current_graph_task_id() != -1:
+        """After a forward that can reach a backward: the padded row total, pushed under the
+        layer's key (a recompute forward only when the layer has no record)."""
+        if torch._C._current_graph_task_id() != -1 and self.records.get(layer_key(w1)):
             return
         rows = ((counts + 127) // 128).sum() * 128
         host = torch.empty((), dtype=rows.dtype, pin_memory=True)
@@ -80,7 +107,14 @@ class WorkspaceBound:
         event.record()
         stack = self.records.setdefault(layer_key(w1), [])
         stack.append((host, event))
-        del stack[:-MAX_DEPTH]
+        if len(stack) > MAX_DEPTH:
+            del stack[0]
+            self.dropped += 1
+            LOG.warning(
+                "mono_ep bounded workspace: more than %d forwards of one layer without a "
+                "backward; dropping the oldest record",
+                MAX_DEPTH,
+            )
         self.records.move_to_end(layer_key(w1))
         while len(self.records) > MAX_RECORDS:
             self.records.popitem(last=False)

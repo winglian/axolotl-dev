@@ -6,6 +6,10 @@ region that computes the MoE input (a norm) and the routing (router linear + top
 so the checkpoint recompute produces new x / index tensors; M micro-batches with gradient accumulation.
 Runs the stack with a worst-case (max) and a bounded (auto) backward on one runtime and reports dx and
 parameter-gradient parity plus the bound's counters (records found / missing, grows, pool rows).
+Between training micro-batches it runs ``no_grad`` and ``inference_mode`` eval forwards, which must
+leave no record; the bounded pass is repeated with reentrant checkpointing (original forward under
+``no_grad``, so the recompute records); a final abandoned training forward must be dropped by the
+next ``optimizer.step()``.
 
 Prints ``WSLAYERS_JSON <payload>`` on rank 0.
 """
@@ -84,26 +88,57 @@ def main():
             x.contiguous(), ids.contiguous(), scores.contiguous(), w1, w2
         )
 
-    def run(backend):
+    def eval_forward(h0):
+        out = h0
+        for group in params:
+            out = layer(out, *group)
+        return out
+
+    def run(backend, reentrant=False):
         runtime._peer_backward = backend
         for group in params:
             for p in group:
                 p.grad = None
         dxs = []
-        for h0, dy in batches:
+        for i, (h0, dy) in enumerate(batches):
+            if i:
+                with torch.no_grad():
+                    eval_forward(h0)
+                with torch.inference_mode():
+                    eval_forward(h0)
             h = h0.clone().requires_grad_()
             out = h
             for group in params:
                 out = checkpoint(
-                    layer, out, *group, use_reentrant=False, preserve_rng_state=False
+                    layer,
+                    out,
+                    *group,
+                    use_reentrant=reentrant,
+                    preserve_rng_state=False,
                 )
             out.backward(dy)
             dxs.append(h.grad.clone())
         return dxs, [p.grad.clone() for group in params for p in group]
 
+    bound = bounded.bound
     dx_max, g_max = run(worst)
     dx_ctl, g_ctl = run(worst)
     dx_auto, g_auto = run(bounded)
+    found_nonreentrant, stale_after_nonreentrant = (
+        bound.found,
+        sum(map(len, bound.records.values())),
+    )
+    dx_max_re, g_max_re = run(worst, reentrant=True)
+    dx_auto_re, g_auto_re = run(bounded, reentrant=True)
+    found_reentrant = bound.found - found_nonreentrant
+    stale_after_reentrant = sum(map(len, bound.records.values()))
+    runtime._peer_backward = bounded
+    eval_forward(batches[0][0].clone().requires_grad_())
+    abandoned = sum(map(len, bound.records.values()))
+    dummy = torch.zeros(1, device="cuda", requires_grad=True)
+    dummy.grad = torch.zeros_like(dummy)
+    torch.optim.SGD([dummy], lr=0.0).step()
+    after_step = sum(map(len, bound.records.values()))
 
     def compare(a, b):
         stats = torch.tensor(
@@ -118,13 +153,17 @@ def main():
         dist.all_reduce(stats, op=dist.ReduceOp.MAX)
         return dict(bitwise=stats[0].item() == 0.0, rel=stats[1].item())
 
-    bound = bounded.bound
     counters = torch.tensor(
         [
             float(bound.unrecorded),
             float(bound.grows),
             float(bounded.pools[0].shape[0]),
-            float(bound.found),
+            float(found_nonreentrant),
+            float(found_reentrant),
+            float(stale_after_nonreentrant + stale_after_reentrant),
+            float(abandoned),
+            float(after_step),
+            float(bound.dropped),
         ],
         device="cuda",
     )
@@ -145,8 +184,20 @@ def main():
             (compare(a, b) for a, b in zip(g_auto, g_max, strict=True)),
             key=lambda e: e["rel"],
         ),
+        reentrant_dx=[
+            compare(a, b) for a, b in zip(dx_auto_re, dx_max_re, strict=True)
+        ],
+        reentrant_param_grads_worst=max(
+            (compare(a, b) for a, b in zip(g_auto_re, g_max_re, strict=True)),
+            key=lambda e: e["rel"],
+        ),
         backwards=args.layers * args.microbatches,
         records_found_max_rank=int(counters[3].item()),
+        reentrant_records_found_max_rank=int(counters[4].item()),
+        stale_records_after_runs_max_rank=int(counters[5].item()),
+        abandoned_forward_records_max_rank=int(counters[6].item()),
+        records_after_optimizer_step_max_rank=int(counters[7].item()),
+        dropped_max_rank=int(counters[8].item()),
         unrecorded_max_rank=int(counters[0].item()),
         grows_max_rank=int(counters[1].item()),
         pool_rows_max_rank=int(counters[2].item()),

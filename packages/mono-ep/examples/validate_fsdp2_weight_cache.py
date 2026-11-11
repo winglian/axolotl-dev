@@ -262,7 +262,24 @@ def run_case(args, case, mesh, flat, runner_factory, device):
         dy = torch.randn(args.tokens, HIDDEN, generator=generator).bfloat16()
         inputs.append([t.to(device).contiguous() for t in (x, ids, scores, dy)])
     results = []
+    runtime = getattr(layers[0].experts, "runner", None)
+    bound = getattr(getattr(runtime, "_peer_backward", None), "bound", None)
+    bound_keys = []
+    if bound is not None:
+        from mono_ep.workspace_bound import layer_key
+
+        original_record = bound.record
+
+        def tracing_record(w1, counts):
+            bound_keys[-1].append(layer_key(w1))
+            original_record(w1, counts)
+
+        bound.record = tracing_record
     for step in range(args.steps + 1):
+        bound_keys.append([])
+        bound_before = (
+            None if bound is None else (bound.found, bound.unrecorded, bound.dropped)
+        )
         if case.get("caller_epoch"):
             weight_cache.set_weight_cache_epoch(step)
         stats_before = dict(getattr(weight_cache, "cache_stats", lambda: {})())
@@ -324,10 +341,22 @@ def run_case(args, case, mesh, flat, runner_factory, device):
                 per_layer_rank0=errors if dist.get_rank() == 0 else None,
             )
         )
+        if bound is not None:
+            # w1's unsharded storage must stay the record key across reshard / regather and steps
+            results[-1]["workspace_bound"] = dict(
+                records=len(bound_keys[-1]),
+                keys_match_step0=bound_keys[-1] == bound_keys[0],
+                found=bound.found - bound_before[0],
+                unrecorded=bound.unrecorded - bound_before[1],
+                dropped=bound.dropped - bound_before[2],
+                pending=sum(map(len, bound.records.values())),
+            )
         if step < args.steps:
             optimizer.step()
             if case.get("explicit_invalidate"):
                 weight_cache.invalidate_weight_caches()
+    if bound is not None:
+        del bound.record
     weight_cache.weight_layouts = original_layouts
     if original_mx_forms is not None:
         weight_cache.mxfp8_backward_weight_forms = original_mx_forms
