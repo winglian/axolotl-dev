@@ -70,15 +70,19 @@ Install the package and its pinned DeepGEMM build with `bash cicd/install_mono_e
 | `mxfp8`   | no            | yes               |
 | `fp8` (blockwise E4M3 forward and backward) | yes | no |
 | `fp8_bwd` (BF16 forward, blockwise FP8 backward) | not implemented yet | no |
+| `nvfp4_lora` (frozen packed NVFP4 experts, PEFT expert LoRA) | no | yes (`auto` picks it with `adapter: lora` on a modelopt NVFP4 base) |
 
 Master weights keep their own dtype (BF16 or FP32) and weight gradients come back in it. SM120 (RTX PRO 6000, RTX 50-series) and older GPUs are unsupported and fall back.
+
+`nvfp4_lora` is the one fused precision that trains with an adapter. The kernels plugin loads the modelopt NVFP4 experts and its `ParamWrapper` fastpath hands the `lora_target_parameters` adapter to the experts module, so the config needs `use_sonicmoe: true`, `nvfp4_merge_aware: false` (merge-aware training stays the SonicMoE path), `lora_dropout: 0` and both `experts.gate_up_proj` and `experts.down_proj` in `lora_target_parameters` ([examples/expert_parallel/qwen3_30ba3b_nvfp4_lora_mono_ep.yaml](../../../../examples/expert_parallel/qwen3_30ba3b_nvfp4_lora_mono_ep.yaml)). The packed experts stay frozen plain tensors outside FSDP on every rank (`fully_shard_experts` passes them as `ignored_params`; dp_shard peers hold the same EP slice); the first forward of each layer builds a `mono_ep.nvfp4_lora.Nvfp4LoraExperts` over their bytes in place plus a transposed copy, and a global optimizer post-step hook invalidates the requant cache so the next forward rebuilds the merged weights from the updated adapter (gradient accumulation reuses them; FSDP2-sharded adapters are read unsharded inside the forward). The checkpoint's `input_scale` tensors (read once from its safetensors) set the static activation scales. Adapter checkpoints take the usual EP / FSDP2 gather paths; `merge-lora` is the SonicMoE merge-aware path's job.
 
 **Fallback matrix.** The fused checks below decide between the modes; the dispatch mode has its own, much shorter list. Under `expert_parallel_fallback_on_unsupported: true` (the default) a `mono_ep` that cannot run in the requested mode logs the reason and degrades; with `false` it raises with the reason.
 
 | Condition | Checked | `fused` (forced) | `auto` | `dispatch` (forced) |
 |-----------|---------|------------------|--------|---------------------|
 | `mono_ep` package not installed | config load | `torch` | `torch` | `torch` |
-| an adapter (`adapter: lora`, `qlora`, ...) is configured | config load | `torch` | `dispatch` | `dispatch` |
+| an adapter is configured and the config does not qualify for `nvfp4_lora` (see above), or `nvfp4_lora` without `adapter: lora` | config load | `torch` | `dispatch` | `dispatch` |
+| an adapter is configured and the experts are not packed `NVFP4Tensor`s on SM100 | after model build | `torch` | `dispatch` | `dispatch` |
 | quantized loading (`load_in_4bit`, `load_in_8bit`, `gptq`, `model_quantization_config`) | config load | `torch` | `dispatch` | `dispatch` |
 | compute capability other than SM90/SM100 (SM80, SM120, ...) | after model build | `torch` | `dispatch` | `dispatch` |
 | `hidden_size % 256 != 0` or expert intermediate size `% 128 != 0` | after model build | `torch` | `dispatch` | `dispatch` |
