@@ -281,7 +281,9 @@ def run(args):
             counts = backend.counts
             used_pool_rows = int((((counts + 127) // 128) * 128).sum())
             ring_tokens = (
-                backend._mx.buffer if precision == "mxfp8" else backend.buffer
+                backend._mx_resources().buffer
+                if precision == "mxfp8"
+                else backend.buffer
             ).l1_acts.shape[0]
             record = dict(
                 rank=rank,
