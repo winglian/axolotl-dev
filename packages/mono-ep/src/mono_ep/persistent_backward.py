@@ -11,7 +11,13 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from . import workspace_bound
-from .dw import direct_dw, dw_precision, weight_grad
+from .dw import (
+    direct_dw,
+    dw_precision,
+    requant_k_blocks,
+    weight_grad,
+    weight_grad_quantized,
+)
 from .ops import weight_grad_bf16, weight_grad_bf16_gpu_offsets
 
 OWNED_BLOCK_M = 128
@@ -411,7 +417,7 @@ class NativePersistentBackward:
                 w2,
                 self._take_context(x, indices, scores, w1, w2),
             )
-            return self._finish_bf16_sm100(dx, ds, scores, stream)
+            return self._finish_bf16_sm100(dx, ds, scores, stream, self._mx_resources())
         tokens = x.shape[0]
         from .sm90_prep import enabled as fused_prep
 
@@ -583,8 +589,12 @@ class NativePersistentBackward:
                 dy_pool, h_pool, self.starts, ends, expected_k
             )
         elif direct_dw() or dw_precision() != "bf16":
-            dw1 = weight_grad(dz_pool, x_pool, ends, self.counts, self.experts)
-            dw2 = weight_grad(dy_pool, h_pool, ends, self.counts, self.experts)
+            dw1 = weight_grad(
+                dz_pool, x_pool, ends, self.counts, self.experts, self.starts
+            )
+            dw2 = weight_grad(
+                dy_pool, h_pool, ends, self.counts, self.experts, self.starts
+            )
         else:
             dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)
             dw2 = weight_grad_bf16(dy_pool, h_pool, ends, None, self.experts, True)
@@ -594,13 +604,29 @@ class NativePersistentBackward:
         self.finished.record(stream)
         return dx, ds.to(scores.dtype), dw1, dw2
 
-    def _finish_bf16_sm100(self, dx, ds, scores, stream):
-        """SM100 BF16 weight gradients from the BF16 pools (the MXFP8 backward dequantizes x and dy into them)."""
+    def _finish_bf16_sm100(self, dx, ds, scores, stream, mx=None):
+        """SM100 weight gradients after the persistent backward.
+
+        BF16 dW reads the BF16 pools (the MXFP8 backward dequantizes x and dy into them); MXFP8 dW
+        (``MONO_EP_SM100_DW_PRECISION=mxfp8``) requantizes x, dy and dz along the rows from the
+        MXFP8 backward's E4M3 pools when ``mx`` is given, h from its BF16 pool."""
         x_pool, dy_pool, h_pool, dz_pool = self.pools[:4]
         ends = self.starts + self.counts
-        if direct_dw() or dw_precision() != "bf16":
-            dw1 = weight_grad(dz_pool, x_pool, ends, self.counts, self.experts)
-            dw2 = weight_grad(dy_pool, h_pool, ends, self.counts, self.experts)
+        if dw_precision() == "mxfp8" and mx is not None:
+            qx, qdy, qdz, sx, sdy, sdz = mx.pools
+            x_q = requant_k_blocks(qx, self.starts, ends, sx)
+            dy_q = requant_k_blocks(qdy, self.starts, ends, sdy)
+            dz_q = requant_k_blocks(qdz, self.starts, ends, sdz)
+            h_q = requant_k_blocks(h_pool, self.starts, ends)
+            dw1 = weight_grad_quantized(dz_q, x_q, ends, self.counts, self.experts)
+            dw2 = weight_grad_quantized(dy_q, h_q, ends, self.counts, self.experts)
+        elif direct_dw() or dw_precision() != "bf16":
+            dw1 = weight_grad(
+                dz_pool, x_pool, ends, self.counts, self.experts, self.starts
+            )
+            dw2 = weight_grad(
+                dy_pool, h_pool, ends, self.counts, self.experts, self.starts
+            )
         else:
             dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)
             dw2 = weight_grad_bf16(dy_pool, h_pool, ends, None, self.experts, True)

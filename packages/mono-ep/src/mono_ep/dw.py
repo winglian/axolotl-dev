@@ -8,7 +8,8 @@ The pools hold each local expert's rows from ``starts[e]`` (a multiple of 128) t
 writes ``out[e] = a_pool[rows of e]^T b_pool[rows of e]`` straight into an
 uninitialized FP32 output; only the slabs of experts with no rows, which it leaves
 unwritten, are zeroed afterwards. ``MONO_EP_SM100_DW_PRECISION=mxfp8`` (opt-in) quantizes
-the pools to E4M3 with one UE8M0 scale per 32 pool rows and column and runs DeepGEMM's
+the pools to E4M3 with one UE8M0 scale per 32 pool rows and column (from the BF16 pools, or
+from the MXFP8 backward's row-wise E4M3 pools and their scales) and runs DeepGEMM's
 k-grouped ``recipe=(1, 1, 32)`` GEMM instead.
 """
 
@@ -35,45 +36,108 @@ def dw_precision():
 
 
 @triton.jit
-def _quantize_k_blocks(
-    X, Q, S, ENDS, NUM_EXPERTS: tl.constexpr, COLS: tl.constexpr, BLOCK_C: tl.constexpr
+def _requant_k_blocks(
+    X,
+    SW,
+    SF_ROWS,
+    Q,
+    S,
+    STARTS,
+    ENDS,
+    NUM_EXPERTS: tl.constexpr,
+    EXPERTS_POW2: tl.constexpr,
+    COLS: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    FROM_MX: tl.constexpr,
 ):
-    # One 128-row block and BLOCK_C columns: E4M3 values and, per column, one packed int32
-    # of four UE8M0 exponents (rows 32 j .. 32 j + 31 in byte j)
+    # One 128-row block and BLOCK_C columns of a pool: E4M3 values with one UE8M0 scale per 32 rows
+    # and column, packed per column into one int32 (rows 32 j .. 32 j + 31 in byte j). Rows outside
+    # the owning expert's [start, end) are written as zero. FROM_MX reads the backward's row-wise
+    # E4M3 pool and its packed scale words ([COLS / 128][SF_ROWS], UTCCP row order) instead of BF16.
     block = tl.program_id(0)
-    if block * 128 >= tl.load(ENDS + NUM_EXPERTS - 1):
-        return
-    row = block.to(tl.int64) * 128 + tl.arange(0, 128)
+    experts = tl.arange(0, EXPERTS_POW2)
+    starts = tl.load(STARTS + experts, experts < NUM_EXPERTS, other=2147483647)
+    owner = tl.max(tl.where(starts <= block * 128, experts, -1), 0)
+    end = tl.load(ENDS + tl.maximum(owner, 0))
     col = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
-    value = tl.load(X + row[:, None] * COLS + col[None, :]).to(tl.float32)
-    grouped = tl.reshape(value, (4, 32, BLOCK_C))
-    amax = tl.maximum(tl.max(tl.abs(grouped), 1), 1.0e-4)
-    bits = (amax / 448.0).to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    exponent = tl.minimum(tl.maximum(exponent, 1), 254)
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    quantized = tl.minimum(tl.maximum(grouped / scale[:, None, :], -448.0), 448.0)
-    tl.store(
-        Q + row[:, None] * COLS + col[None, :],
-        tl.reshape(quantized, (128, BLOCK_C)).to(Q.dtype.element_ty),
-    )
-    packed = tl.sum(exponent << (tl.arange(0, 4)[:, None] * 8), 0)
+    if FROM_MX:
+        shift = (tl.arange(0, BLOCK_C) // 32) * 8
+    packed = tl.zeros([BLOCK_C], dtype=tl.int32)
+    for j in tl.static_range(4):
+        r = j * 32 + tl.arange(0, 32)
+        row = block.to(tl.int64) * 128 + r
+        valid = (row < end) & (owner >= 0)
+        value = tl.load(
+            X + row[:, None] * COLS + col[None, :], valid[:, None], other=0.0
+        ).to(tl.float32)
+        if FROM_MX:
+            sf_row = block.to(tl.int64) * 128 + (r % 32) * 4 + r // 32
+            word = tl.load(SW + tl.program_id(1).to(tl.int64) * SF_ROWS + sf_row)
+            # Stale words of masked rows may hold 255: keep the scale finite so 0 * scale stays 0
+            exponent = tl.minimum((word[:, None] >> shift[None, :]) & 255, 254)
+            value = value * (exponent << 23).to(tl.float32, bitcast=True)
+        amax = tl.maximum(tl.max(tl.abs(value), 0), 1.0e-4)
+        bits = (amax / 448.0).to(tl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        exponent = tl.minimum(tl.maximum(exponent, 1), 254)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        quantized = tl.minimum(tl.maximum(value / scale[None, :], -448.0), 448.0)
+        tl.store(
+            Q + row[:, None] * COLS + col[None, :], quantized.to(Q.dtype.element_ty)
+        )
+        packed += exponent << (j * 8)
     tl.store(S + block.to(tl.int64) * COLS + col, packed)
 
 
-def quantize_k_blocks(pool, ends):
-    """E4M3 copy of a ``[rows, C]`` BF16 pool and ``[rows / 128, C]`` packed UE8M0 scales along rows."""
+def requant_k_blocks(pool, starts, ends, scale_words=None):
+    """E4M3 ``[rows, C]`` copy of a pool with ``[rows / 128, C]`` packed UE8M0 scales along rows.
+
+    ``pool`` is BF16, or the backward's row-wise E4M3 pool when ``scale_words`` (its packed
+    ``[C / 128, rows]`` scale pool) is given; the quantization is then a requantization of the
+    exactly dequantized E4M3 values along the row axis."""
     rows, cols = pool.shape
     if rows % 128 or cols % 128 or not pool.is_contiguous():
         raise ValueError(
             "pools must be contiguous with rows and columns multiples of 128"
         )
+    experts = starts.numel()
+    if scale_words is not None:
+        if scale_words.shape != (cols // 128, rows) or not scale_words.is_contiguous():
+            raise ValueError("scale words must be a contiguous [C / 128, rows] tensor")
     q = torch.empty(rows, cols, device=pool.device, dtype=torch.float8_e4m3fn)
     s = torch.empty(rows // 128, cols, device=pool.device, dtype=torch.int32)
-    _quantize_k_blocks[(rows // 128, cols // 128)](
-        pool, q, s, ends, ends.numel(), cols, 128
+    _requant_k_blocks[(rows // 128, cols // 128)](
+        pool,
+        scale_words if scale_words is not None else pool,
+        rows,
+        q,
+        s,
+        starts,
+        ends,
+        experts,
+        triton.next_power_of_2(experts),
+        cols,
+        128,
+        scale_words is not None,
+        num_warps=8,
     )
     return q, s
+
+
+def weight_grad_quantized(a, b, ends, counts, experts):
+    """FP32 ``[experts, A cols, B cols]`` weight gradients from ``(E4M3, scales)`` pairs of
+    ``requant_k_blocks`` (DeepGEMM k-grouped ``recipe=(1, 1, 32)``, MN-major operands)."""
+    import deep_gemm
+
+    out = torch.empty(
+        (experts, a[0].shape[1], b[0].shape[1]),
+        device=a[0].device,
+        dtype=torch.float32,
+    )
+    deep_gemm.k_grouped_fp8_gemm_tn_contiguous(
+        a, b, out, None, ends, None, (1, 1, 32), "mn", True
+    )
+    return zero_empty_experts(out, counts)
 
 
 @triton.jit
@@ -93,29 +157,24 @@ def zero_empty_experts(out, counts):
     return out
 
 
-def weight_grad(a_pool, b_pool, ends, counts, experts):
+def weight_grad(a_pool, b_pool, ends, counts, experts, starts=None):
     """FP32 ``[experts, A cols, B cols]`` weight gradients, written directly."""
     import deep_gemm
 
+    if dw_precision() == "mxfp8":
+        return weight_grad_quantized(
+            requant_k_blocks(a_pool, starts, ends),
+            requant_k_blocks(b_pool, starts, ends),
+            ends,
+            counts,
+            experts,
+        )
     out = torch.empty(
         (experts, a_pool.shape[1], b_pool.shape[1]),
         device=a_pool.device,
         dtype=torch.float32,
     )
-    if dw_precision() == "mxfp8":
-        deep_gemm.k_grouped_fp8_gemm_tn_contiguous(
-            quantize_k_blocks(a_pool, ends),
-            quantize_k_blocks(b_pool, ends),
-            out,
-            None,
-            ends,
-            None,
-            (1, 1, 32),
-            "mn",
-            True,
-        )
-    else:
-        deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
-            a_pool, b_pool, out, None, ends, None, use_psum_layout=True
-        )
+    deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
+        a_pool, b_pool, out, None, ends, None, use_psum_layout=True
+    )
     return zero_empty_experts(out, counts)
