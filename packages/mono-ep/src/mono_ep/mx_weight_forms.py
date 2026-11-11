@@ -8,6 +8,8 @@ H) and the transposed form (scales along 2I); each tile of W2 as the transposed 
 packed UE8M0 scale words are bitwise identical to :func:`mono_ep.token_quantization.prepare_persistent_mxfp8`.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -33,6 +35,7 @@ def _mx_weight_tiles(
     INTERLEAVE: tl.constexpr,
     T_FORM: tl.constexpr,
     PASS_ROWS: tl.constexpr,
+    RECIPROCAL: tl.constexpr = False,
 ):
     # One [128 rows, 128 cols] tile of W[e] ([E, ROWS, COLS]), in four 32-row passes.
     # Row form: QR [E, ROWS, COLS] with one scale per row and 32 columns, words [E][COLS / 128][ROWS].
@@ -51,10 +54,15 @@ def _mx_weight_tiles(
         if ROW_FORM:
             groups = tl.reshape(value, [PASS_ROWS, 4, 32])
             exponent = _ue8m0_exponent(tl.max(tl.abs(groups), 2))
-            scale = (exponent << 23).to(tl.float32, bitcast=True)
+            if RECIPROCAL:
+                # Power-of-two scales: multiplying by the exact inverse rounds like the division
+                inverse = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
+                scaled = groups * inverse[:, :, None]
+            else:
+                scale = (exponent << 23).to(tl.float32, bitcast=True)
+                scaled = groups / scale[:, :, None]
             quantized = tl.reshape(
-                tl.minimum(tl.maximum(groups / scale[:, :, None], -448.0), 448.0),
-                [PASS_ROWS, 128],
+                tl.minimum(tl.maximum(scaled, -448.0), 448.0), [PASS_ROWS, 128]
             )
             if INTERLEAVE:
                 out_row = (r % (ROWS // 2) // 8) * 16 + (r // (ROWS // 2)) * 8 + r % 8
@@ -70,10 +78,14 @@ def _mx_weight_tiles(
         if T_FORM:
             row_groups = tl.reshape(value, [PASS_ROWS // 32, 32, 128])
             exponent_t = _ue8m0_exponent(tl.max(tl.abs(row_groups), 1))
-            scale_t = (exponent_t << 23).to(tl.float32, bitcast=True)
+            if RECIPROCAL:
+                inverse_t = ((254 - exponent_t) << 23).to(tl.float32, bitcast=True)
+                scaled_t = row_groups * inverse_t[:, None, :]
+            else:
+                scale_t = (exponent_t << 23).to(tl.float32, bitcast=True)
+                scaled_t = row_groups / scale_t[:, None, :]
             quantized_t = tl.reshape(
-                tl.minimum(tl.maximum(row_groups / scale_t[:, None, :], -448.0), 448.0),
-                [PASS_ROWS, 128],
+                tl.minimum(tl.maximum(scaled_t, -448.0), 448.0), [PASS_ROWS, 128]
             )
             tl.store(
                 QT + e * COLS * ROWS + col[:, None] * ROWS + r[None, :],
@@ -89,7 +101,17 @@ def _mx_weight_tiles(
         tl.store(ST + (e * (ROWS // 128) + rb) * COLS + sf_col, packed_t)
 
 
-def _forms(w, *, row_form, interleave, t_form, num_warps=4, pass_rows=32):
+def _launch_config():
+    """``MONO_EP_SM100_MXFP8_FORMS_CONFIG`` = ``num_warps,pass_rows,reciprocal`` (``/`` also separates); default
+    ``4,32,0``, the original launch."""
+    value = os.getenv("MONO_EP_SM100_MXFP8_FORMS_CONFIG", "4,32,0")
+    num_warps, pass_rows, reciprocal = (
+        int(v) for v in value.replace("/", ",").split(",")
+    )
+    return num_warps, pass_rows, bool(reciprocal)
+
+
+def _forms(w, *, row_form, interleave, t_form, num_warps=None, pass_rows=None):
     experts, rows, cols = w.shape
     if (
         not w.is_cuda
@@ -101,6 +123,9 @@ def _forms(w, *, row_form, interleave, t_form, num_warps=4, pass_rows=32):
         raise ValueError(
             "expected contiguous [E, N, K] CUDA weights with N, K multiples of 128"
         )
+    default_warps, default_pass_rows, reciprocal = _launch_config()
+    num_warps = default_warps if num_warps is None else num_warps
+    pass_rows = default_pass_rows if pass_rows is None else pass_rows
     device = w.device
     qr = sr = qt = st = w
     if row_form:
@@ -122,6 +147,7 @@ def _forms(w, *, row_form, interleave, t_form, num_warps=4, pass_rows=32):
             interleave,
             t_form,
             pass_rows,
+            reciprocal,
             num_warps=num_warps,
             enable_fp_fusion=False,
         )
