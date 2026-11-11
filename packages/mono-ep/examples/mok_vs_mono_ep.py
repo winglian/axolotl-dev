@@ -87,6 +87,11 @@ def main():
         "--reference", action="store_true", help="FP32 reference parity"
     )
     parser.add_argument("--tokens", type=int, default=0, help="override tokens per GPU")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="per-kernel device time of mono-ep bwd/fb",
+    )
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -371,6 +376,7 @@ def main():
                 captured[label] = dict(y=out.detach().clone())
             del out, state
     set_env({})
+    kernels = _profile(cases, rank) if args.profile else None
 
     # Parity of every mono-ep variant against the first, and optionally against FP32
     parity = {}
@@ -417,6 +423,7 @@ def main():
         host_wall_samples_ms=host,
         parity_first_measured=parity,
         fp32_reference=fp32,
+        kernel_ms_rank0=kernels,
         peak_alloc_gib=torch.cuda.max_memory_allocated(device) / 2**30,
         stored_context_hits_misses_rank0=[
             getattr(native, "context_hits", None),
@@ -432,6 +439,32 @@ def main():
         functional.clear_workspace_cache()
     dist.destroy_process_group()
     os._exit(0)
+
+
+def _profile(cases, rank, iters=3):
+    """Rank 0's device time per kernel (ms per call) for every mono-ep bwd and fb case."""
+    out = {}
+    for label, prepare, run in cases:
+        if not label.startswith("mono/") or label.split("/")[-1] not in ("bwd", "fb"):
+            continue
+        state = prepare()
+        run(state)
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as trace:
+            for _ in range(iters):
+                dist.barrier()
+                state = prepare()
+                run(state)
+            torch.cuda.synchronize()
+        totals = {}
+        for event in trace.key_averages():
+            if event.self_device_time_total > 0:
+                totals[event.key[:120]] = event.self_device_time_total / 1000 / iters
+        out[label] = dict(sorted(totals.items(), key=lambda kv: -kv[1])[:25])
+        dist.barrier()
+    return out if rank == 0 else None
 
 
 def _fp32_reference(
