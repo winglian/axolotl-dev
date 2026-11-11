@@ -103,6 +103,25 @@ LoRA on frozen packed NVFP4 experts runs through the package API
 
 ## Benchmarks
 
+Timing contracts, used as labels in every table:
+
+- **(a)** forward + backward with the forward's context stored, no recompute.
+- **(b)** forward + partial recompute (the gate/up projection only) + backward: Mixture of
+  Kittens' checkpointed mode (`recompute_forward_context`).
+- **(c)** forward + the full forward recomputed + backward: Axolotl's non-reentrant activation
+  checkpointing (`activation_checkpointing: true`). Every mono-ep "2F+B" number here is (c), and
+  so is the Mega MoE number Prime Intellect published.
+- **(d)** forward + backward with the fused op's output saved under selective checkpointing
+  (`activation_checkpointing: {selective: {save: ["mono_ep::persistent_forward"]}}`), the same as
+  prime-rl's "selective" mode.
+
+The Mega MoE rows compare (c) with (c). The Mixture of Kittens rows compare mono-ep's (c) with
+MoK's (b), which charges mono-ep one more full forward than MoK. No (d) number appears in these
+tables: none was measured in these allocations. Per layer, (c) keeps the layer input
+(tokens x hidden BF16: 64 / 128 / 160 MiB at Qwen3-30B-A3B / Qwen3-235B-A22B / Beam with 16,384
+tokens per GPU) plus the routing (1.5 MiB); (d) also keeps the output, twice that. Prime
+Intellect publishes no memory numbers.
+
 One MoE layer at expert parallel 8 (16,384 tokens per GPU, top-8), checkpointed layer step
 (forward, recomputed forward, backward) in max-rank median ms, balanced routing, router and
 optimizer excluded, one Modal allocation per GPU type. Qwen3-30B-A3B is hidden 2048 /
@@ -110,30 +129,32 @@ intermediate 768 / 128 experts, Qwen3-235B-A22B hidden 4096 / intermediate 1536 
 Beam hidden 5120 / intermediate 2560 / 256 experts. FP8 on Hopper, BF16 on B200, FP32 masters,
 `fullgraph` compiled:
 
-| Hardware | Shape | mono-ep 2F+B (ms) | Routed TFLOPS per GPU (% of dense peak) | NCCL all-to-all backward, same run (ms) | Reference (ms) |
+| Hardware | Shape | mono-ep, (c) (ms) | Routed TFLOPS per GPU (% of dense peak) | NCCL all-to-all backward, same run, (c) (ms) | Reference (ms) |
 |---|---|---:|---:|---:|---|
-| 8xH200 | 30B-A3B | 12.63 | 392 (20%) | 46.67 | Mega MoE (Prime Intellect, published): 15.9 |
-| 8xH200 | 235B-A22B | 38.30 | 517 (26%) | 107.52 | Mega MoE (Prime Intellect, published): 43.7 |
+| 8xH200 | 30B-A3B | 12.63 | 392 (20%) | 46.67 | Mega MoE (Prime Intellect, published), (c): 15.9 |
+| 8xH200 | 235B-A22B | 38.30 | 517 (26%) | 107.52 | Mega MoE (Prime Intellect, published), (c): 43.7 |
 | 8xH200 | Beam | 79.50 | 519 (26%) | 190.40 |  |
 | 8xH100 | 30B-A3B | 13.55 | 365 (18%) | 49.91 |  |
 | 8xH100 | 235B-A22B | 42.73 | 463 (23%) | 113.76 |  |
 | 8xH100 | Beam | 90.86 | 454 (23%) | did not fit (80 GB) |  |
-| 8xB200 | 30B-A3B | 7.79 | 635 (28%) | 24.89 | MoK BF16 / MXFP8, same run: 6.96 / 6.40 |
-| 8xB200 | 235B-A22B | 21.65 | 914 (41%) | 65.35 | MoK BF16 / MXFP8, same run: 21.05 / 17.06 |
-| 8xB200 | Beam | 49.29 | 837 (37%) | 113.38 | MoK BF16 / MXFP8, same run: 40.63 / 30.33 |
+| 8xB200 | 30B-A3B | 7.79 | 635 (28%) | 24.89 | MoK BF16 / MXFP8, same run, (b): 6.96 / 6.40 |
+| 8xB200 | 235B-A22B | 21.65 | 914 (41%) | 65.35 | MoK BF16 / MXFP8, same run, (b): 21.05 / 17.06 |
+| 8xB200 | Beam | 49.29 | 837 (37%) | 113.38 | MoK BF16 / MXFP8, same run, (b): 40.63 / 30.33 |
 
 Mega MoE is Prime Intellect's published prime-rl measurement on 8xH200 with the same shapes,
 routing and FP8 precision, not a rerun. Mixture of Kittens (MoK) ran in the same B200
 allocation with its best knobs; its times include a shared expert (1/8 more FLOPs) that
-mono-ep does not compute, and it is faster than mono-ep's BF16 default at every shape, by
-0.6-0.8 ms at the Qwen3 shapes and 8.7 ms at Beam, all of it in the backward. TFLOPS are routed GEMM FLOPs over
+mono-ep does not compute. Its (b) time is below mono-ep's (c) time at every shape, by
+0.6-0.8 ms at the Qwen3 shapes and 8.7 ms at Beam, while (c) charges mono-ep one more full
+forward; mono-ep's forward alone is faster at all three shapes, and a comparison under one
+contract has not been measured. TFLOPS are routed GEMM FLOPs over
 the whole layer time against dense peaks of 1,979 (FP8, Hopper) and 2,250 (BF16, B200).
 
 The same layer through Axolotl's expert-parallel backends with SonicMoE as the local experts
 kernel and BF16 weights, every column interleaved in one process (the fused column is the same
 kernels uncompiled, with parameters quantized per call):
 
-| Hardware | Shape | mono-ep fused | mono-ep dispatch (bounded) + SonicMoE | DeepEP + SonicMoE, best SM count | DeepEP + SonicMoE, 20 SMs (Axolotl default) | torch all-to-all + SonicMoE |
+| Hardware | Shape (all (c), ms) | mono-ep fused | mono-ep dispatch (bounded) + SonicMoE | DeepEP + SonicMoE, best SM count | DeepEP + SonicMoE, 20 SMs (Axolotl default) | torch all-to-all + SonicMoE |
 |---|---|---:|---:|---:|---:|---:|
 | 8xH200 | 30B-A3B | 13.41 | 19.09 | 18.12 (40 SMs) | 20.10 | 22.09 |
 | 8xH200 | 235B-A22B | 42.19 | 46.67 | 45.87 (40 SMs) | 47.31 | 50.28 |
