@@ -87,7 +87,8 @@ static void fp8_mono_ep_backward_sm90(
     DG_HOST_ASSERT(required_rows < std::numeric_limits<int>::max());
     const int64_t rows = packed_wgrad ? pools[4].size(0) : pools[0].size(0);
     const int64_t scratch_rows = packed_wgrad ? ring_tokens : rows;
-    DG_HOST_ASSERT(rows >= required_rows and rows < std::numeric_limits<int>::max());
+    // Bounded pools hold the rows this rank receives (padded to 128 per expert); the kernel traps past them
+    DG_HOST_ASSERT(rows > 0 and rows % 128 == 0 and rows <= required_rows);
     for (int i = 0; i < 4; ++i) {
         check(pools[i], torch::kBFloat16);
         DG_HOST_ASSERT(pools[i].dim() == 2 and pools[i].size(0) == scratch_rows and pools[i].size(1) == widths[i]);
@@ -274,9 +275,9 @@ static void fp8_mono_ep_backward_sm90(
     const int dispatch_threads = compact_non_math ? 32 : 128;
     const int non_epilogue_threads = compact_non_math ? 96 : 128;
     const int block_threads = compact_non_math ? 384 : 512;
-    check_ring_capacity_for_mono_ep(
-        ring_tokens, 128, world, experts, max_tokens, topk, hidden, inner);
     const int sms = get_num_sms_for_mono_ep();
+    check_owned_ring_capacity_for_mono_ep(
+        ring_tokens, 128, sms, world, experts, max_tokens, topk, hidden, inner);
     // Dispatch pull: the largest power of two up to 4 KB dividing the transported row, capped at 2 KB (two
     // pulls per row) when the 4 KB send buffers would push the layout past the SM90 capacity (FP8 transport at
     // hidden >= 4096 with 3 FP8 stages and the vector x/dy pack); MONO_EP_SM90_FP8_DISPATCH_PULL_BYTES
@@ -338,6 +339,7 @@ static void instantiate() {{
         reinterpret_cast<__nv_bfloat16*>(pools[2].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[3].data_ptr()),
         ds.data_ptr<float>(), reinterpret_cast<uint32_t*>(starts.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(counts.data_ptr<int>())};
+    buffers.pool_rows = rows < required_rows ? static_cast<uint32_t>(rows) : 0u;
     if (cached) {
         buffers.qx_pool = reinterpret_cast<uint8_t*>(pools[4].data_ptr());
         buffers.qdy_pool = reinterpret_cast<uint8_t*>(pools[5].data_ptr());

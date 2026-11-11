@@ -95,6 +95,20 @@ static void check_ring_capacity_for_mono_ep(
     DG_HOST_ASSERT(num_ring_tokens / block_m >= num_live_pool_blocks);
 }
 
+// Owned backward schedules (one live block per CTA cluster, generation-counted ring slots) need one wave of
+// owning clusters, not the forward's live-block bound; a ring below that bound must cover the wave
+static void check_owned_ring_capacity_for_mono_ep(
+    const int& num_ring_tokens, const int& block_m, const int& num_clusters,
+    const int& num_ranks, const int& num_experts_per_rank,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden) {
+    DG_HOST_ASSERT(block_m > 0 and num_ring_tokens % block_m == 0);
+    if (num_ring_tokens / block_m >= num_clusters)
+        return;
+    check_ring_capacity_for_mono_ep(num_ring_tokens, block_m, num_ranks, num_experts_per_rank,
+                                    num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden);
+}
+
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
     if (mma_type_str == "bf16xbf16" or mma_type_str == "fp8xbf16")
         return MmaKind::BF16;

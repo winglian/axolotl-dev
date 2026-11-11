@@ -476,6 +476,9 @@ sm90_bf16_mono_ep_backward_impl(void* y,
 
             // TMA load token from remote rank and store into local
             const auto pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+            // The host sizes bounded pools from the matching forward's counts; past them is a host bug, never a drop
+            if (backward.pool_rows != 0 and (pool_token_idx / BLOCK_M + 1) * BLOCK_M > backward.pool_rows)
+                asm volatile("trap;");
             const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
 
             // Wait for ring buffer slot to be available (previous consumer must have finished all N blocks)

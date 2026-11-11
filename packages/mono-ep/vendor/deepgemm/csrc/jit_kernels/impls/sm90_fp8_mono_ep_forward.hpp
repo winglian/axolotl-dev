@@ -24,7 +24,8 @@ static void fp8_mono_ep_forward_sm90(
     const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_ptrs,
     int rank, int max_tokens, int ring_tokens, int topk,
     const std::optional<torch::Tensor>& saved_z,
-    const bool original_w1_layout = false) {
+    const bool original_w1_layout = false,
+    const std::optional<torch::Tensor>& recv_stats = std::nullopt) {
     DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     DG_HOST_ASSERT(y.is_cuda() and y.dim() == 2);
     const auto check = [&](const torch::Tensor& t, torch::ScalarType dtype) {
@@ -32,6 +33,12 @@ static void fp8_mono_ep_forward_sm90(
         DG_HOST_ASSERT(t.scalar_type() == dtype);
     };
     check(y, torch::kBFloat16);
+    int* recv_stats_ptr = nullptr;
+    if (recv_stats.has_value()) {
+        check(*recv_stats, torch::kInt);
+        DG_HOST_ASSERT(recv_stats->numel() == w1.size(0));
+        recv_stats_ptr = recv_stats->data_ptr<int>();
+    }
     check(w1, torch::kFloat8_e4m3fn);
     check(w2, torch::kFloat8_e4m3fn);
     check(sym_buffer, torch::kInt8);
@@ -206,7 +213,8 @@ static void instantiate() {{
             diag_suffix + trailing_args));
     jit->launch(kernel, {.num_smem_bytes = SM90ArchSpec::smem_capacity, .grid_dim = dim3(sms),
         .block_dim = dim3(block_threads), .cluster_dim = dim3(1, 1, 1)},
-        y.data_ptr(), reinterpret_cast<int*>(phase_trace_ptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),
+        y.data_ptr(), phase_trace_ptr != 0 ? reinterpret_cast<int*>(phase_trace_ptr) : recv_stats_ptr,
+        tokens, layout::SymBuffer<>(sym_ptrs, rank),
         tx, tw1, th_out, th, th_cached, tw2, tx, tw1, th_out, th, tw2,
         static_cast<const uint8_t*>(nullptr), saved_z.has_value() ? saved_z->data_ptr() : nullptr,
         scales[0].data_ptr<float>(), scales[1].data_ptr<float>());

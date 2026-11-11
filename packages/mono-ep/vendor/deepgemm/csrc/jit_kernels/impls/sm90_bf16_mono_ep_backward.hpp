@@ -59,7 +59,8 @@ static void bf16_mono_ep_backward_sm90(
     const int64_t required_rows = static_cast<int64_t>(world) * max_tokens * topk + experts * 128;
     DG_HOST_ASSERT(required_rows < std::numeric_limits<int>::max());
     const int64_t rows = pools[0].size(0);
-    DG_HOST_ASSERT(rows >= required_rows and rows < std::numeric_limits<int>::max());
+    // Bounded pools hold the rows this rank receives (padded to 128 per expert); the kernel traps past them
+    DG_HOST_ASSERT(rows > 0 and rows % 128 == 0 and rows <= required_rows);
     for (int i = 0; i < 4; ++i) {
         check(pools[i], torch::kBFloat16);
         DG_HOST_ASSERT(pools[i].dim() == 2 and pools[i].size(0) == rows and pools[i].size(1) == widths[i]);
@@ -77,9 +78,9 @@ static void bf16_mono_ep_backward_sm90(
     };
     const auto tx = acts(pools[0]), ty = acts(pools[1]), tz = acts(pools[3]);
     const auto tw1 = weights(w1), tw2t = weights(w2t), tw1t = weights(w1t);
-    check_ring_capacity_for_mono_ep(
-        ring_tokens, 128, world, experts, max_tokens, topk, hidden, inner);
     const int sms = get_num_sms_for_mono_ep();
+    check_owned_ring_capacity_for_mono_ep(
+        ring_tokens, 128, sms, world, experts, max_tokens, topk, hidden, inner);
     int pull = hidden * 2;
     while (pull > 4096) pull /= 2;
     DG_HOST_ASSERT(hidden * 2 % pull == 0 and pull % 16 == 0);
@@ -97,6 +98,7 @@ static void instantiate() {{
         reinterpret_cast<__nv_bfloat16*>(pools[2].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[3].data_ptr()),
         ds.data_ptr<float>(), reinterpret_cast<uint32_t*>(starts.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(counts.data_ptr<int>())};
+    buffers.pool_rows = rows < required_rows ? static_cast<uint32_t>(rows) : 0u;
     jit->launch(kernel, {.num_smem_bytes = smem, .grid_dim = dim3(sms),
         .block_dim = dim3(512), .cluster_dim = dim3(1, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),

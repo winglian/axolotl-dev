@@ -627,7 +627,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("y"), py::arg("w1"), py::arg("w2"), py::arg("scales"),
           py::arg("sym_buffer"), py::arg("sym_ptrs"), py::arg("rank"),
           py::arg("max_tokens"), py::arg("ring_tokens"), py::arg("topk"),
-          py::arg("saved_z"), py::arg("original_w1_layout") = false);
+          py::arg("saved_z"), py::arg("original_w1_layout") = false,
+          py::arg("recv_stats") = py::none());
 }
 
 } // namespace deep_gemm::mega

@@ -86,9 +86,7 @@ class NativePersistentBackward:
         if len(set(hosts)) != 1:
             raise ValueError("Native persistent backward currently requires one host")
         floor = owned_backward_ring_tokens(runtime.num_sms)
-        self.bounded = (
-            self.arch == 10 and not self.blockwise and workspace_bound.mode() == "auto"
-        )
+        self.bounded = workspace_bound.mode() == "auto"
         self.buffer = deep_gemm.get_symm_buffer_for_mono_ep(
             self.group,
             runtime.experts,
@@ -135,58 +133,12 @@ class NativePersistentBackward:
                 self.bound.forward_budget = (
                     runtime.forward_ring_budget + self.experts * 128
                 )
-        scratch_rows = self.buffer.l1_acts.shape[0] if self.blockwise else rows
-        self.pools = [
-            torch.zeros(
-                scratch_rows, width, device=self.dy.device, dtype=torch.bfloat16
-            )
-            for width in (
-                runtime.hidden,
-                runtime.hidden,
-                runtime.intermediate,
-                2 * runtime.intermediate,
-            )
-        ]
-        if self.blockwise:
-            self.pools.extend(
-                torch.empty(rows, width, device=self.dy.device, dtype=dtype)
-                for width, dtype in (
-                    (runtime.hidden, torch.float8_e4m3fn),
-                    (runtime.hidden, torch.float8_e4m3fn),
-                    (runtime.hidden // 128, torch.float32),
-                    (runtime.hidden // 128, torch.float32),
-                    (runtime.intermediate * 2, torch.float8_e4m3fn),
-                    (runtime.intermediate * 2 // 128, torch.float32),
-                )
-            )
         self.starts = torch.empty(
             self.experts, device=self.dy.device, dtype=torch.int32
         )
         self.counts = torch.empty_like(self.starts)
-        self.padded_counts = None
-        if self.blockwise:
-            widths = (
-                runtime.hidden,
-                runtime.hidden,
-                runtime.intermediate,
-                2 * runtime.intermediate,
-            )
-            self.pools.extend(
-                torch.empty(
-                    rows * width, device=self.dy.device, dtype=torch.float8_e4m3fn
-                )
-                for width in widths
-            )
-            self.pools.extend(
-                torch.empty_strided(
-                    (width, rows // 128),
-                    (1, width),
-                    device=self.dy.device,
-                    dtype=torch.float32,
-                )
-                for width in widths
-            )
-            self.padded_counts = torch.empty_like(self.starts)
+        self.padded_counts = torch.empty_like(self.starts) if self.blockwise else None
+        self.pools = self._build_pools(rows)
         self.finished = None
         self.dw_state = None
         self._mx = None
@@ -305,6 +257,49 @@ class NativePersistentBackward:
         )
         return dx, ds
 
+    def _build_pools(self, rows, scratch=None):
+        """The x/dy/h/dz pools for ``rows`` routed rows; blockwise adds ring-sized BF16 scratch, the FP8 row
+        caches and the packed column-major wgrad operands with their scales."""
+        runtime = self.runtime
+        device = self.dy.device
+        widths = (
+            runtime.hidden,
+            runtime.hidden,
+            runtime.intermediate,
+            2 * runtime.intermediate,
+        )
+        if scratch is None:
+            scratch_rows = self.buffer.l1_acts.shape[0] if self.blockwise else rows
+            scratch = [
+                torch.zeros(scratch_rows, width, device=device, dtype=torch.bfloat16)
+                for width in widths
+            ]
+        pools = list(scratch)
+        if not self.blockwise:
+            return pools
+        pools.extend(
+            torch.empty(rows, width, device=device, dtype=dtype)
+            for width, dtype in (
+                (runtime.hidden, torch.float8_e4m3fn),
+                (runtime.hidden, torch.float8_e4m3fn),
+                (runtime.hidden // 128, torch.float32),
+                (runtime.hidden // 128, torch.float32),
+                (runtime.intermediate * 2, torch.float8_e4m3fn),
+                (runtime.intermediate * 2 // 128, torch.float32),
+            )
+        )
+        pools.extend(
+            torch.empty(rows * width, device=device, dtype=torch.float8_e4m3fn)
+            for width in widths
+        )
+        pools.extend(
+            torch.empty_strided(
+                (width, rows // 128), (1, width), device=device, dtype=torch.float32
+            )
+            for width in widths
+        )
+        return pools
+
     def _fit_pools(self, w1):
         """Bounded workspace: grow the pools before a backward whose routed rows exceed them."""
         if self.bound is None:
@@ -312,10 +307,10 @@ class NativePersistentBackward:
         rows = self.bound.target(self.bound.required_rows(w1))
         if rows is None:
             return
-        self.pools[:4] = [
-            torch.zeros(rows, p.shape[1], device=p.device, dtype=p.dtype)
-            for p in self.pools[:4]
-        ]
+        # Blockwise keeps its ring-sized BF16 scratch; every row-sized pool is rebuilt
+        scratch = self.pools[:4] if self.blockwise else None
+        del self.pools
+        self.pools = self._build_pools(rows, scratch)
         if self._mx is not None:
             self._mx.pools[:3] = [
                 torch.zeros(rows, p.shape[1], device=p.device, dtype=p.dtype)

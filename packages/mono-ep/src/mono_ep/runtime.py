@@ -284,6 +284,14 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
                 down = quantize_fp8(w2, block_rows=128, block_cols=128)
             prepared = [quantize_paired_gate_up_weights(w1), down]
         y = torch.empty_like(x)
+        bound = getattr(runtime._peer_backward, "bound", None)
+        counts = None
+        if bound is not None and getattr(runtime, "_record_forward", True):
+            counts = torch.zeros(
+                runtime.experts // dist.get_world_size(runtime.group),
+                dtype=torch.int32,
+                device=x.device,
+            )
         deep_gemm._C.fp8_mono_ep_forward_sm90(
             y,
             prepared[0][0],
@@ -297,7 +305,10 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
             runtime.topk,
             None,
             True,
+            counts,
         )
+        if counts is not None:
+            bound.record(w1, counts)
         return y, None
     if runtime.compute_dtype == "mxfp8":
         from .token_quantization import prepare_persistent_mxfp8
