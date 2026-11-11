@@ -548,7 +548,7 @@ def main():
         device = torch.device("cuda", rank)
         dist.init_process_group("nccl", device_id=device)
         name = torch.cuda.get_device_name()
-        assert "B200" in name, name
+        assert torch.cuda.get_device_capability()[0] in (9, 10), name
     else:
         device = torch.device("cpu")
         dist.init_process_group("gloo")

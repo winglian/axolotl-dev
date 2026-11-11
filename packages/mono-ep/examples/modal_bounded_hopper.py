@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Axolotl AI
 
-"""Modal runner for the bounded Hopper workspace (MONO_EP_WORKSPACE_BOUND) on 8xH100 / 8xH200: parity and
+"""Modal runner for the bounded Hopper workspace (MONO_EP_WORKSPACE_BOUND) on 8xH100 (pinned, `H100!`;
+plain `H100` may be served by H200) / 8xH200: parity and
 same-process backward timing (workspace_parity.py), resident memory per mode (workspace_memory.py), the
 checkpointed-layer record probe (workspace_layers.py) and the FSDP2 dp_shard x EP validator, for the SM90
 BF16 and blockwise FP8 backwards, on the NVFP4 LoRA image."""
@@ -106,6 +107,16 @@ def _suite(shapes, dtypes, parts):
             runs.append(
                 _run(["workspace_layers.py", "--shape", "30b", "--dtype", dtype], 8, {})
             )
+    if "ringwaves" in parts:
+        # Backward ring floor waves under the bound (the cap is one wave by default)
+        for waves in ("2", "4"):
+            runs.append(
+                _run(
+                    ["workspace_parity.py", "--shape", "30b", "--dtype", "bf16"],
+                    8,
+                    {"MONO_EP_BACKWARD_RING_WAVES": waves},
+                )
+            )
     if "fsdp2" in parts:
         for mode in ("auto", "max"):
             runs.append(
@@ -127,7 +138,7 @@ def _suite(shapes, dtypes, parts):
     return dict(returncode=max(r["returncode"] for r in runs), runs=runs)
 
 
-@app.function(image=image, gpu="H100:8", cpu=32, memory=262144, timeout=10800)
+@app.function(image=image, gpu="H100!:8", cpu=32, memory=262144, timeout=10800)
 def suite_h100(shapes: str, dtypes: str, parts: str):
     return _suite(shapes, dtypes, parts)
 
