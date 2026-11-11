@@ -23,6 +23,20 @@ from .ops import weight_grad_bf16, weight_grad_bf16_gpu_offsets
 OWNED_BLOCK_M = 128
 
 
+# MONO_EP_BACKWARD_SEGMENT_TIMING=1: (name, host seconds, CUDA event) at the MXFP8 backward's segment boundaries,
+# appended per call; diagnostic only (the probe drains it)
+SEGMENT_MARKS: list = []
+
+
+def _mark(name):
+    if os.getenv("MONO_EP_BACKWARD_SEGMENT_TIMING") == "1":
+        import time
+
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        SEGMENT_MARKS.append((name, time.perf_counter(), event))
+
+
 def owned_backward_ring_tokens(
     num_sms, env="MONO_EP_BACKWARD_RING_WAVES", default_waves=1
 ):
@@ -260,6 +274,7 @@ class NativePersistentBackward:
 
         mx = self._mx_resources()
         tokens = x.shape[0]
+        _mark("start")
         quantize_persistent_mxfp8_into(
             x.contiguous(), mx.buffer.x[:tokens], mx.buffer.x_sf[:tokens]
         )
@@ -268,7 +283,9 @@ class NativePersistentBackward:
         )
         mx.buffer.topk_idx[:tokens].copy_(indices)
         mx.buffer.topk_weights[:tokens].copy_(scores)
+        _mark("token_quant")
         forms = mxfp8_backward_weight_forms(w1, w2)
+        _mark("weight_forms")
         dx = torch.empty_like(x)
         ds = torch.empty_like(scores, dtype=torch.float32)
         getattr(
@@ -298,6 +315,7 @@ class NativePersistentBackward:
             self.runtime.topk,
             *(() if stored_z is None else (stored_z,)),
         )
+        _mark("kernel")
         return dx, ds
 
     def _bounded_ring(self, floor):
@@ -618,8 +636,11 @@ class NativePersistentBackward:
             dy_q = requant_k_blocks(qdy, self.starts, ends, sdy)
             dz_q = requant_k_blocks(qdz, self.starts, ends, sdz)
             h_q = requant_k_blocks(h_pool, self.starts, ends)
+            _mark("requant")
             dw1 = weight_grad_quantized(dz_q, x_q, ends, self.counts, self.experts)
+            _mark("dw1")
             dw2 = weight_grad_quantized(dy_q, h_q, ends, self.counts, self.experts)
+            _mark("dw2")
         elif direct_dw() or dw_precision() != "bf16":
             dw1 = weight_grad(
                 dz_pool, x_pool, ends, self.counts, self.experts, self.starts

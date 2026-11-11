@@ -91,6 +91,11 @@ def main():
         "--mok", default="BF16,MXFP8", help="MoK precisions, '' for none"
     )
     parser.add_argument("--no-nccl", action="store_true")
+    parser.add_argument(
+        "--no-bump",
+        action="store_true",
+        help="keep weight versions between iterations (weight-form caches hit, as within one optimizer step)",
+    )
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument(
         "--reference", action="store_true", help="FP32 reference parity"
@@ -169,6 +174,8 @@ def main():
     operation = runtime if args.no_compile else torch.compile(runtime, fullgraph=True)
 
     def bump():
+        if args.no_bump:
+            return
         for t in (w1, w2):
             torch.autograd.graph.increment_version(t)
 
@@ -440,6 +447,7 @@ def main():
         routing=args.routing,
         variants={n: e for n, e in variants},
         launch_env=launch_env,
+        no_bump=args.no_bump,
         warmup=args.warmup,
         iters=args.iters,
         compiled=not args.no_compile,
