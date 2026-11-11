@@ -36,7 +36,8 @@ def dw_precision():
 
 
 @triton.jit
-def _requant_k_blocks(
+def _requant_block(
+    block,
     X,
     SW,
     SF_ROWS,
@@ -49,17 +50,13 @@ def _requant_k_blocks(
     COLS: tl.constexpr,
     COL_BLOCKS: tl.constexpr,
     FROM_MX: tl.constexpr,
-    RECIPROCAL: tl.constexpr = False,
+    RECIPROCAL: tl.constexpr,
 ):
     # One 128-row block and COL_BLOCKS x 128 columns of a pool: E4M3 values with one UE8M0 scale per
     # 32 rows and column, packed per column into one int32 (rows 32 j .. 32 j + 31 in byte j). Rows
     # outside the owning expert's [start, end) are written as zero. FROM_MX reads the backward's
     # row-wise E4M3 pool and its packed scale words ([COLS / 128][SF_ROWS], UTCCP row order)
     # instead of BF16.
-    block = tl.program_id(0)
-    # Pools are sized for the worst case; blocks past the last expert's rows are never read
-    if block * 128 >= tl.load(ENDS + NUM_EXPERTS - 1):
-        return
     experts = tl.arange(0, EXPERTS_POW2)
     starts = tl.load(STARTS + experts, experts < NUM_EXPERTS, other=2147483647)
     owner = tl.max(tl.where(starts <= block * 128, experts, -1), 0)
@@ -106,6 +103,65 @@ def _requant_k_blocks(
         tl.store(S + block.to(tl.int64) * COLS + col, packed)
 
 
+@triton.jit
+def _requant_k_blocks(
+    X,
+    SW,
+    SF_ROWS,
+    Q,
+    S,
+    STARTS,
+    ENDS,
+    NUM_EXPERTS: tl.constexpr,
+    EXPERTS_POW2: tl.constexpr,
+    COLS: tl.constexpr,
+    COL_BLOCKS: tl.constexpr,
+    FROM_MX: tl.constexpr,
+    RECIPROCAL: tl.constexpr = False,
+    PERSISTENT: tl.constexpr = False,
+):
+    # Pools are sized for the worst case; blocks past the last expert's rows are never read. PERSISTENT
+    # launches a fixed row grid that strides over the used blocks instead of one program per block.
+    last = tl.load(ENDS + NUM_EXPERTS - 1)
+    block = tl.program_id(0)
+    if PERSISTENT:
+        while block * 128 < last:
+            _requant_block(
+                block,
+                X,
+                SW,
+                SF_ROWS,
+                Q,
+                S,
+                STARTS,
+                ENDS,
+                NUM_EXPERTS,
+                EXPERTS_POW2,
+                COLS,
+                COL_BLOCKS,
+                FROM_MX,
+                RECIPROCAL,
+            )
+            block += tl.num_programs(0)
+    elif block * 128 < last:
+        _requant_block(
+            block,
+            X,
+            SW,
+            SF_ROWS,
+            Q,
+            S,
+            STARTS,
+            ENDS,
+            NUM_EXPERTS,
+            EXPERTS_POW2,
+            COLS,
+            COL_BLOCKS,
+            FROM_MX,
+            RECIPROCAL,
+        )
+
+
 def requant_k_blocks(pool, starts, ends, scale_words=None):
     """E4M3 ``[rows, C]`` copy of a pool with ``[rows / 128, C]`` packed UE8M0 scales along rows.
 
@@ -123,8 +179,14 @@ def requant_k_blocks(pool, starts, ends, scale_words=None):
             raise ValueError("scale words must be a contiguous [C / 128, rows] tensor")
     q = torch.empty(rows, cols, device=pool.device, dtype=torch.float8_e4m3fn)
     s = torch.empty(rows // 128, cols, device=pool.device, dtype=torch.int32)
-    col_blocks, num_warps, reciprocal = _requant_config(cols)
-    _requant_k_blocks[(rows // 128, cols // (128 * col_blocks))](
+    col_blocks, num_warps, reciprocal, persistent = _requant_config(cols)
+    row_programs = rows // 128
+    if persistent:
+        sms = torch.cuda.get_device_properties(pool.device).multi_processor_count
+        row_programs = min(
+            row_programs, max(1, persistent * sms // (cols // (128 * col_blocks)))
+        )
+    _requant_k_blocks[(row_programs, cols // (128 * col_blocks))](
         pool,
         scale_words if scale_words is not None else pool,
         rows,
@@ -138,18 +200,23 @@ def requant_k_blocks(pool, starts, ends, scale_words=None):
         col_blocks,
         scale_words is not None,
         reciprocal,
+        persistent > 0,
         num_warps=num_warps,
     )
     return q, s
 
 
 def _requant_config(cols):
-    """``MONO_EP_SM100_REQUANT_CONFIG`` = ``col_blocks,num_warps,reciprocal`` (default ``1,4,0``, the original)."""
-    value = os.getenv("MONO_EP_SM100_REQUANT_CONFIG", "1,4,0")
-    col_blocks, num_warps, reciprocal = (int(v) for v in value.split(","))
+    """``MONO_EP_SM100_REQUANT_CONFIG`` = ``col_blocks,num_warps,reciprocal[,persistent]``; default ``1,2,1``
+    (bitwise equal to the original ``1,4,0`` and a third faster). ``persistent`` > 0 launches that many programs
+    per SM, striding over the used row blocks."""
+    value = os.getenv("MONO_EP_SM100_REQUANT_CONFIG", "1,2,1")
+    fields = [int(v) for v in value.split(",")]
+    col_blocks, num_warps, reciprocal = fields[:3]
+    persistent = fields[3] if len(fields) > 3 else 0
     if (cols // 128) % col_blocks:
         col_blocks = 1
-    return col_blocks, num_warps, bool(reciprocal)
+    return col_blocks, num_warps, bool(reciprocal), persistent
 
 
 def weight_grad_quantized(a, b, ends, counts, experts):

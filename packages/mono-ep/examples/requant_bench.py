@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
     parser.add_argument("--world", type=int, default=8)
     parser.add_argument("--iters", type=int, default=20)
-    parser.add_argument("--configs", default="1,4,1;2,4,1;4,4,1;1,8,1;2,8,1;4,8,1")
+    parser.add_argument("--configs", default="1,2,1;1,2,1,4;1,2,1,8;1,2,1,16")
     args = parser.parse_args()
     from mono_ep.dw import requant_k_blocks
 
@@ -68,9 +68,10 @@ def main():
 
     import os
 
+    os.environ["MONO_EP_SM100_REQUANT_CONFIG"] = "1,4,0"
     worst_ms = time(pools(worst))
     trimmed = pools(used)
-    os.environ.pop("MONO_EP_SM100_REQUANT_CONFIG", None)
+    os.environ["MONO_EP_SM100_REQUANT_CONFIG"] = "1,4,0"
     reference = {
         n: requant_k_blocks(pool, starts, ends, sw) for n, (pool, sw) in trimmed.items()
     }
@@ -85,8 +86,12 @@ def main():
             for a, b in [(requant_k_blocks(pool, starts, ends, sw), reference[n])]
         )
         configs[config] = dict(ms=ms, bitwise=bitwise)
-    os.environ.pop("MONO_EP_SM100_REQUANT_CONFIG", None)
+    os.environ["MONO_EP_SM100_REQUANT_CONFIG"] = "1,4,0"
     trimmed_ms = time(trimmed)
+    worst_pools = pools(worst)
+    for config in args.configs.split(";"):
+        os.environ["MONO_EP_SM100_REQUANT_CONFIG"] = config
+        configs[config]["worst_pool_ms"] = time(worst_pools)
     bytes_moved = sum(
         used * c * (2 if n == "h" else 1)
         + used * c
