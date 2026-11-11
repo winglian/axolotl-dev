@@ -5,7 +5,8 @@
 native backward on one runtime, per routing; dx / dW must be bitwise, dscore within its
 shared-memory-atomic order noise. Cases: balanced, skewed, adversarial (every token to rank 0's
 experts, so rank 0's pools must grow to the worst case), and ``unrecorded`` (the bounded backward
-runs without its forward's record and must fall back to the worst case).
+runs without its forward's record and must fall back to the worst case). Then times the
+backward of each mode interleaved in the same process (median of 20, max over ranks).
 
 Prints ``WSPAR_JSON <payload>`` on rank 0.
 """
@@ -116,9 +117,44 @@ def main():
         entry["bounded_pool_rows_max_rank"] = int(rows.item())
         entry["worst_rows"] = worst.worst_rows
         results[case] = entry
+    timing = {}
+    for case in ("balanced", "skewed"):
+        x = torch.randn(
+            tokens, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        ids = routing(case)
+        scores = torch.rand(tokens, topk, device="cuda")
+        scores = (scores / scores.sum(-1, keepdim=True)).requires_grad_()
+        dy = torch.randn_like(x)
+        times = {"max": [], "auto": []}
+        for it in range(24):
+            for name, backend in (("max", worst), ("auto", bounded)):
+                runtime._peer_backward = backend
+                y = runtime(x, ids, scores, w1, w2)
+                torch.cuda.synchronize()
+                start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+                start.record()
+                y.backward(dy)
+                end.record()
+                end.synchronize()
+                if it >= 4:
+                    times[name].append(start.elapsed_time(end))
+        stats = torch.tensor(
+            [sorted(v)[len(v) // 2] for v in times.values()], device="cuda"
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.MAX)
+        timing[case] = dict(
+            backward_ms_max=stats[0].item(), backward_ms_auto=stats[1].item()
+        )
     payload = dict(
         shape=args.shape,
         results=results,
+        timing=timing,
+        ring_tokens=dict(
+            forward=runtime.buffer.l1_acts.shape[0],
+            backward_max=worst.buffer.l1_acts.shape[0],
+            backward_auto=bounded.buffer.l1_acts.shape[0],
+        ),
         grows_rank0=bounded.bound.grows,
         unrecorded_rank0=bounded.bound.unrecorded,
     )
