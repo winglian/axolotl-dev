@@ -71,8 +71,10 @@ static void bf16_mono_ep_backward_launch(
     const int widths[] = {hidden, hidden, inner, inner * 2};
     const int64_t required_rows = static_cast<int64_t>(world) * max_tokens * topk + experts * 128;
     DG_HOST_ASSERT(required_rows < std::numeric_limits<int>::max());
+    // Pools may be bounded below the worst case (the host sizes them from the forward's counts; the kernel traps
+    // past `pool_rows`)
     const int64_t rows = pools[0].size(0);
-    DG_HOST_ASSERT(rows >= required_rows and rows < std::numeric_limits<int>::max());
+    DG_HOST_ASSERT(rows > 0 and rows % 128 == 0 and rows <= required_rows);
     for (int i = 0; i < 4; ++i) {
         check(pools[i], torch::kBFloat16);
         DG_HOST_ASSERT(pools[i].dim() == 2 and pools[i].size(0) == rows and pools[i].size(1) == widths[i]);
@@ -225,6 +227,7 @@ static void instantiate() {{
         reinterpret_cast<__nv_bfloat16*>(pools[2].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[3].data_ptr()),
         ds.data_ptr<float>(), reinterpret_cast<uint32_t*>(starts.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(counts.data_ptr<int>())};
+    buffers.pool_rows = rows < required_rows ? static_cast<uint32_t>(rows) : 0u;
     jit->launch(kernel, {.num_smem_bytes = smem, .grid_dim = dim3(sms),
         .block_dim = dim3(512), .cluster_dim = dim3(2, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),
@@ -327,7 +330,7 @@ static void mxfp8_mono_ep_backward(
     const int64_t sf_rows = static_cast<int64_t>(world) * max_tokens * topk + experts * 128;
     DG_HOST_ASSERT(sf_rows < std::numeric_limits<int>::max() and sf_rows % 128 == 0);
     const int64_t rows = pools[0].size(0);
-    DG_HOST_ASSERT(rows >= sf_rows and rows < std::numeric_limits<int>::max());
+    DG_HOST_ASSERT(rows > 0 and rows % 128 == 0 and rows <= sf_rows);
     const int widths[] = {hidden, hidden, inner, inner * 2, hidden, hidden, inner * 2};
     for (int i = 0; i < 7; ++i) {
         check(pools[i], i < 4 ? torch::kBFloat16 : torch::kFloat8_e4m3fn);
@@ -416,6 +419,7 @@ static void instantiate() {{
         reinterpret_cast<__nv_bfloat16*>(pools[2].data_ptr()), reinterpret_cast<__nv_bfloat16*>(pools[3].data_ptr()),
         ds.data_ptr<float>(), reinterpret_cast<uint32_t*>(starts.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(counts.data_ptr<int>())};
+    buffers.pool_rows = rows < sf_rows ? static_cast<uint32_t>(rows) : 0u;
     buffers.qx_pool = static_cast<uint8_t*>(pools[4].data_ptr());
     buffers.qdy_pool = static_cast<uint8_t*>(pools[5].data_ptr());
     buffers.qdz_pool = static_cast<uint8_t*>(pools[6].data_ptr());

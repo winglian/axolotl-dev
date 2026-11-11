@@ -19,6 +19,8 @@ struct MoEBackwardBuffers {
     float *sx_col = nullptr, *sdy_col = nullptr, *sh_col = nullptr, *sdz_col = nullptr;
     uint32_t* expert_padded_counts = nullptr;
     SymBuffer<> dy_sf;
+    // Rows allocated in the x/dy/h/dz pools (bounded workspace); 0 = sized for the worst case, unchecked
+    uint32_t pool_rows = 0;
 };
 
 // NVFP4 backward: `[K / 64][pool rows]` UE4M3 scale words for the packed `qx/qdy/qdz` pools and the

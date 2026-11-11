@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Axolotl AI
+
+"""Bounded SM100 backward pools (``MONO_EP_WORKSPACE_BOUND``).
+
+The persistent backward's x / dy / h / dz pools (and the MXFP8 E4M3 pools) need one row per
+routed row this rank receives, padded to 128 per local expert: ``sum_e ceil(count_e / 128) * 128``.
+Sizing them for every token of every rank (``ranks x max tokens x top-k``) is what made the
+workspace 19.5 / 38.1 / 44.0 GB per rank at the Qwen3-30B-A3B / 235B-A22B / Beam EP8 shapes.
+
+``auto`` (default): the forward reports its per-expert receive counts (an int32 tensor the
+kernel already fills), the padded row total is copied to pinned memory without a sync, and the
+backward of that layer sizes the pools to it before launching; the backward sees the same
+routing, so the count is exact and the kernel never overflows (it traps past ``pool_rows`` as a
+host-bug guard). Records are keyed by the layer's expert weight storage (``w1``'s StorageImpl),
+which is per layer, never recomputed and kept by FSDP2 across regathers; activations are not
+usable keys because a checkpoint recompute rebuilds the MoE input and the routing as new
+tensors. Each key holds a stack: a forward pushes, a checkpoint-recompute forward does not (the
+original forward's record serves, so the backward never waits on a just-launched forward), the
+backward pops. Repeated calls of one layer and gradient-accumulation micro-batches nest
+correctly. Pools start at 1.25 x tokens x top-k + 128 per local expert and only grow (to 1.1 x a
+larger need, logged). A backward with no record is sized for the worst case and logged every
+time (it means a forward was not recorded, e.g. a custom autograd path).
+
+``max``: the worst-case pools, as before.
+"""
+
+import logging
+import math
+import os
+from collections import OrderedDict
+
+import torch
+
+LOG = logging.getLogger("mono_ep")
+HEADROOM = 1.25
+GROWTH = 1.1
+MAX_RECORDS = 4096
+
+
+def mode():
+    value = os.getenv("MONO_EP_WORKSPACE_BOUND", "auto")
+    if value not in ("auto", "max"):
+        raise ValueError("MONO_EP_WORKSPACE_BOUND must be auto or max")
+    return value
+
+
+def _round_up(value, multiple=128):
+    return (value + multiple - 1) // multiple * multiple
+
+
+MAX_DEPTH = 64
+
+
+def layer_key(w1):
+    return w1.untyped_storage()._cdata
+
+
+class WorkspaceBound:
+    def __init__(self, max_tokens, topk, local_experts, worst_rows):
+        self.worst_rows = worst_rows
+        self.rows = min(
+            worst_rows,
+            _round_up(math.ceil(HEADROOM * max_tokens * topk)) + local_experts * 128,
+        )
+        self.records = OrderedDict()
+        self.grows = 0
+        self.unrecorded = 0
+        self.found = 0
+        self.high_water = 0
+
+    def record(self, w1, counts):
+        """After a (non-recompute) forward: the padded row total, pushed under the layer's key."""
+        if torch._C._current_graph_task_id() != -1:
+            return
+        rows = ((counts + 127) // 128).sum() * 128
+        host = torch.empty((), dtype=rows.dtype, pin_memory=True)
+        host.copy_(rows, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        stack = self.records.setdefault(layer_key(w1), [])
+        stack.append((host, event))
+        del stack[:-MAX_DEPTH]
+        self.records.move_to_end(layer_key(w1))
+        while len(self.records) > MAX_RECORDS:
+            self.records.popitem(last=False)
+
+    def required_rows(self, w1):
+        """The exact pool rows this layer's backward needs (its latest forward), or the worst case."""
+        stack = self.records.get(layer_key(w1))
+        if not stack:
+            self.unrecorded += 1
+            LOG.warning(
+                "mono_ep bounded workspace: a backward without a recorded forward; sizing its "
+                "pools for the worst case (%d rows, %d such backwards so far)",
+                self.worst_rows,
+                self.unrecorded,
+            )
+            return self.worst_rows
+        record = stack.pop()
+        self.found += 1
+        host, event = record
+        event.synchronize()
+        rows = int(host.item())
+        self.high_water = max(self.high_water, rows)
+        return rows
+
+    def target(self, needed):
+        """Rows to allocate so that ``needed`` fits, or ``None`` if the current pools do."""
+        if needed <= self.rows:
+            return None
+        rows = min(self.worst_rows, max(needed, _round_up(math.ceil(GROWTH * needed))))
+        self.grows += 1
+        LOG.info(
+            "mono_ep bounded workspace: %d routed pool rows exceed %d; growing the pools to %d",
+            needed,
+            self.rows,
+            rows,
+        )
+        self.rows = rows
+        return rows

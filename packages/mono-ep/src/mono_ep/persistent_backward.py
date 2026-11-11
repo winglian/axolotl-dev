@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+from . import workspace_bound
 from .ops import weight_grad_bf16, weight_grad_bf16_gpu_offsets
 
 OWNED_BLOCK_M = 128
@@ -117,6 +118,13 @@ class NativePersistentBackward:
         )
         self.experts = runtime.experts // self.world
         rows = self.world * capacity * runtime.topk + self.experts * 128
+        self.worst_rows = rows
+        self.bound = None
+        if self.arch == 10 and not self.blockwise and workspace_bound.mode() == "auto":
+            self.bound = workspace_bound.WorkspaceBound(
+                capacity, runtime.topk, self.experts, rows
+            )
+            rows = self.bound.rows
         scratch_rows = self.buffer.l1_acts.shape[0] if self.blockwise else rows
         self.pools = [
             torch.zeros(
@@ -224,15 +232,15 @@ class NativePersistentBackward:
         dy_sf, dy_sf_pointers = self._allocate(
             (capacity, runtime.hidden // 128), torch.int32
         )
-        rows = self.world * capacity * runtime.topk + self.experts * 128
-        if self.pools[0].shape[0] != rows:
-            raise RuntimeError("MXFP8 scale pools must span the BF16 pools")
+        # E4M3 pools follow the (possibly bounded) BF16 pools; the scale pools keep the worst-case
+        # row count, which the kernel's UTCCP-ordered scale layout is compiled for
+        rows = self.pools[0].shape[0]
         device = self.dy.device
         pools = [
             torch.zeros(rows, width, device=device, dtype=torch.float8_e4m3fn)
             for width in (runtime.hidden, runtime.hidden, 2 * runtime.intermediate)
         ] + [
-            torch.zeros(width // 128, rows, device=device, dtype=torch.int32)
+            torch.zeros(width // 128, self.worst_rows, device=device, dtype=torch.int32)
             for width in (runtime.hidden, runtime.hidden, 2 * runtime.intermediate)
         ]
         self._mx = types.SimpleNamespace(
@@ -287,6 +295,23 @@ class NativePersistentBackward:
         )
         return dx, ds
 
+    def _fit_pools(self, w1):
+        """Bounded workspace: grow the pools before a backward whose routed rows exceed them."""
+        if self.bound is None:
+            return
+        rows = self.bound.target(self.bound.required_rows(w1))
+        if rows is None:
+            return
+        self.pools[:4] = [
+            torch.zeros(rows, p.shape[1], device=p.device, dtype=p.dtype)
+            for p in self.pools[:4]
+        ]
+        if self._mx is not None:
+            self._mx.pools[:3] = [
+                torch.zeros(rows, p.shape[1], device=p.device, dtype=p.dtype)
+                for p in self._mx.pools[:3]
+            ]
+
     def _allocate(self, shape, dtype):
         allocator = torch if self.world == 1 else symm_mem
         local = allocator.empty(*shape, dtype=dtype, device="cuda")
@@ -316,6 +341,7 @@ class NativePersistentBackward:
         stream = torch.cuda.current_stream(x.device)
         if self.finished is not None:
             stream.wait_event(self.finished)
+        self._fit_pools(w1)
         if self.arch == 10 and not self.blockwise and self.precision() == "mxfp8":
             if self.inkernel_dw():
                 # Both reuse the kernel's shared-expert operand slots and need different BLOCK_K

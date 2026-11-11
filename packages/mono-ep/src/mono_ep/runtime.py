@@ -315,7 +315,25 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
         )
         forward(y, tw1, tw2, buffer, fast_math=False, saved_z=saved_z)
     else:
-        forward(y, tw1, tw2, buffer, fast_math=False)
+        bound = getattr(runtime._peer_backward, "bound", None)
+        if bound is not None and not os.getenv("MONO_EP_SM100_FORWARD_PHASE_TRACE"):
+            # Per-expert receive counts of this call size the matching backward's pools
+            counts = torch.zeros(
+                runtime.experts // dist.get_world_size(runtime.group),
+                dtype=torch.int32,
+                device=x.device,
+            )
+            forward(
+                y,
+                tw1,
+                tw2,
+                buffer,
+                fast_math=False,
+                cumulative_local_expert_recv_stats=counts,
+            )
+            bound.record(w1, counts)
+        else:
+            forward(y, tw1, tw2, buffer, fast_math=False)
     return y, saved_z
 
 
