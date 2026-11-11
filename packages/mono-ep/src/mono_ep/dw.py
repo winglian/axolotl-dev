@@ -47,46 +47,53 @@ def _requant_k_blocks(
     NUM_EXPERTS: tl.constexpr,
     EXPERTS_POW2: tl.constexpr,
     COLS: tl.constexpr,
-    BLOCK_C: tl.constexpr,
+    COL_BLOCKS: tl.constexpr,
     FROM_MX: tl.constexpr,
 ):
-    # One 128-row block and BLOCK_C columns of a pool: E4M3 values with one UE8M0 scale per 32 rows
-    # and column, packed per column into one int32 (rows 32 j .. 32 j + 31 in byte j). Rows outside
-    # the owning expert's [start, end) are written as zero. FROM_MX reads the backward's row-wise
-    # E4M3 pool and its packed scale words ([COLS / 128][SF_ROWS], UTCCP row order) instead of BF16.
+    # One 128-row block and COL_BLOCKS x 128 columns of a pool: E4M3 values with one UE8M0 scale per
+    # 32 rows and column, packed per column into one int32 (rows 32 j .. 32 j + 31 in byte j). Rows
+    # outside the owning expert's [start, end) are written as zero. FROM_MX reads the backward's
+    # row-wise E4M3 pool and its packed scale words ([COLS / 128][SF_ROWS], UTCCP row order)
+    # instead of BF16.
     block = tl.program_id(0)
+    # Pools are sized for the worst case; blocks past the last expert's rows are never read
+    if block * 128 >= tl.load(ENDS + NUM_EXPERTS - 1):
+        return
     experts = tl.arange(0, EXPERTS_POW2)
     starts = tl.load(STARTS + experts, experts < NUM_EXPERTS, other=2147483647)
     owner = tl.max(tl.where(starts <= block * 128, experts, -1), 0)
     end = tl.load(ENDS + tl.maximum(owner, 0))
-    col = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     if FROM_MX:
-        shift = (tl.arange(0, BLOCK_C) // 32) * 8
-    packed = tl.zeros([BLOCK_C], dtype=tl.int32)
-    for j in tl.static_range(4):
-        r = j * 32 + tl.arange(0, 32)
-        row = block.to(tl.int64) * 128 + r
-        valid = (row < end) & (owner >= 0)
-        value = tl.load(
-            X + row[:, None] * COLS + col[None, :], valid[:, None], other=0.0
-        ).to(tl.float32)
-        if FROM_MX:
-            sf_row = block.to(tl.int64) * 128 + (r % 32) * 4 + r // 32
-            word = tl.load(SW + tl.program_id(1).to(tl.int64) * SF_ROWS + sf_row)
-            # Stale words of masked rows may hold 255: keep the scale finite so 0 * scale stays 0
-            exponent = tl.minimum((word[:, None] >> shift[None, :]) & 255, 254)
-            value = value * (exponent << 23).to(tl.float32, bitcast=True)
-        amax = tl.maximum(tl.max(tl.abs(value), 0), 1.0e-4)
-        bits = (amax / 448.0).to(tl.int32, bitcast=True)
-        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-        exponent = tl.minimum(tl.maximum(exponent, 1), 254)
-        scale = (exponent << 23).to(tl.float32, bitcast=True)
-        quantized = tl.minimum(tl.maximum(value / scale[None, :], -448.0), 448.0)
-        tl.store(
-            Q + row[:, None] * COLS + col[None, :], quantized.to(Q.dtype.element_ty)
-        )
-        packed += exponent << (j * 8)
-    tl.store(S + block.to(tl.int64) * COLS + col, packed)
+        shift = (tl.arange(0, 128) // 32) * 8
+    for cb in tl.static_range(COL_BLOCKS):
+        col_block = tl.program_id(1) * COL_BLOCKS + cb
+        col = col_block * 128 + tl.arange(0, 128)
+        packed = tl.zeros([128], dtype=tl.int32)
+        for j in tl.static_range(4):
+            r = j * 32 + tl.arange(0, 32)
+            row = block.to(tl.int64) * 128 + r
+            valid = (row < end) & (owner >= 0)
+            value = tl.load(
+                X + row[:, None] * COLS + col[None, :], valid[:, None], other=0.0
+            ).to(tl.float32)
+            if FROM_MX:
+                sf_row = block.to(tl.int64) * 128 + (r % 32) * 4 + r // 32
+                word = tl.load(SW + col_block.to(tl.int64) * SF_ROWS + sf_row)
+                # Stale words of masked rows may hold 255: keep the scale finite so 0 * scale stays 0
+                exponent = tl.minimum((word[:, None] >> shift[None, :]) & 255, 254)
+                value = value * (exponent << 23).to(tl.float32, bitcast=True)
+            amax = tl.maximum(tl.max(tl.abs(value), 0), 1.0e-4)
+            bits = (amax / 448.0).to(tl.int32, bitcast=True)
+            exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+            exponent = tl.minimum(tl.maximum(exponent, 1), 254)
+            scale = (exponent << 23).to(tl.float32, bitcast=True)
+            quantized = tl.minimum(tl.maximum(value / scale[None, :], -448.0), 448.0)
+            tl.store(
+                Q + row[:, None] * COLS + col[None, :],
+                quantized.to(Q.dtype.element_ty),
+            )
+            packed += exponent << (j * 8)
+        tl.store(S + block.to(tl.int64) * COLS + col, packed)
 
 
 def requant_k_blocks(pool, starts, ends, scale_words=None):
@@ -106,7 +113,8 @@ def requant_k_blocks(pool, starts, ends, scale_words=None):
             raise ValueError("scale words must be a contiguous [C / 128, rows] tensor")
     q = torch.empty(rows, cols, device=pool.device, dtype=torch.float8_e4m3fn)
     s = torch.empty(rows // 128, cols, device=pool.device, dtype=torch.int32)
-    _requant_k_blocks[(rows // 128, cols // 128)](
+    col_blocks = 1
+    _requant_k_blocks[(rows // 128, cols // (128 * col_blocks))](
         pool,
         scale_words if scale_words is not None else pool,
         rows,
@@ -117,9 +125,9 @@ def requant_k_blocks(pool, starts, ends, scale_words=None):
         experts,
         triton.next_power_of_2(experts),
         cols,
-        128,
+        col_blocks,
         scale_words is not None,
-        num_warps=8,
+        num_warps=4,
     )
     return q, s
 
