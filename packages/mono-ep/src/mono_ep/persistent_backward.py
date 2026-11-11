@@ -103,7 +103,7 @@ class NativePersistentBackward:
             ),
             num_min_ring_tokens=floor,
             # the owned schedule keeps one block live per cluster, so the floor is all it needs
-            num_exact_ring_tokens=floor if self.bounded else 0,
+            num_exact_ring_tokens=self._bounded_ring(floor) if self.bounded else 0,
         )
         self.handles = []
         capacity = self.buffer.num_max_tokens_per_rank
@@ -256,6 +256,17 @@ class NativePersistentBackward:
             self.runtime.topk,
         )
         return dx, ds
+
+    def _bounded_ring(self, floor):
+        """Ring tokens under the workspace bound: the owned floor, four waves for the SM90 BF16 backward (one wave
+        costs it 3-4 % at Qwen3-30B-A3B on H200, four waves 0.5-2.4 %; blockwise FP8 is flat at one wave)."""
+        if (
+            self.arch == 9
+            and not self.blockwise
+            and "MONO_EP_BACKWARD_RING_WAVES" not in os.environ
+        ):
+            return 4 * floor
+        return floor
 
     def _build_pools(self, rows, scratch=None):
         """The x/dy/h/dz pools for ``rows`` routed rows; blockwise adds ring-sized BF16 scratch, the FP8 row
