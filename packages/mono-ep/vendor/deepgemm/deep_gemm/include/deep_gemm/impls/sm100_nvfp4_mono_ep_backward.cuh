@@ -626,6 +626,9 @@ sm100_nvfp4_mono_ep_backward_impl(void* y,
             row.src_topk_idx = src_token_topk_idx % kNumTopk;
             row.rank = current_rank_in_expert_idx;
             row.pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+            // The host sizes bounded pools from the matching forward's counts; past them is a host bug, never a drop
+            if (backward.pool_rows != 0 and (row.pool_token_idx / BLOCK_M + 1) * BLOCK_M > backward.pool_rows)
+                asm volatile("trap;");
             row.local_expert_idx = current_expert_idx;
             row.is_last_token = token_idx == expert_end_idx - 1;
             row.src_x = sym_buffer.map(

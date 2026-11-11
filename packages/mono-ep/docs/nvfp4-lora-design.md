@@ -300,12 +300,28 @@ step-keyed cache used by the kernel path lives in `mono_ep/nvfp4_lora.py`
 follow-up.
 
 The rebuild runs the SM100 CUDA kernel `include/nvfp4_requant_launch.cu`
-(`nvfp4_requant.cuda_nvfp4_requant`) by default: the Triton kernel's bytes
-with hardware E2M1 / E4M3 conversions, each weight and its transposed base in
-one paired pass. `MONO_EP_NVFP4_REQUANT=triton` keeps the vendored Triton
-kernel; `cuda_fused` builds w1t / w2t from the merged tile instead of from
-transposed bases (more accurate backward, different bytes, no transposed base
-in memory). `benchmarks.md` has the rebuild timings and the EP8 rows.
+(`nvfp4_requant.cuda_nvfp4_requant`). The default `MONO_EP_NVFP4_REQUANT=cuda_fused`
+builds w1t / w2t from the merged fp32 tile with fresh scales, so the layer stores
+no transposed copy of the packed base (the transposed base was read only by the
+paired requant; the backward kernel reads the merged w1t / w2t) and the backward
+is slightly closer to the fp32 reference. `cuda` is the paired pass (the Triton
+kernel's bytes with hardware E2M1 / E4M3 conversions, each weight and its stored
+transposed base), `triton` the vendored Triton kernel. `benchmarks.md` has the
+rebuild timings and the EP8 rows.
+
+Residency (`MONO_EP_NVFP4_MERGED_CACHE`, default `layer`): the forward asks the
+cache for the forward forms (`w1`, `w2`) and the backward for the backward forms
+(`w1`, `w1t`, `w2t`); `layer` builds each set just in time and keeps an LRU of
+the two most recent layers, so under non-reentrant checkpointing a layer is
+rebuilt three times per step (forward, recompute, backward) and the resident
+merged forms are two layers' worth instead of the whole model's; `all` keeps
+one four-form build per layer per step. Both modes are invalidated by the
+global optimizer post-step hook; the FSDP2 validator checks in both modes that
+the cached bytes equal a fresh requant of the live adapters after every step.
+The NVFP4 backward's pools and ring follow the bounded workspace
+(`MONO_EP_WORKSPACE_BOUND=auto`, receive counts recorded by the forward, keyed
+by the packed base storage) and the forward ring the routed-row budget
+(`MONO_EP_FORWARD_RING_ROWS`), like the SM100 BF16 path.
 
 - `nvfp4_lora` bypasses `weight_layouts` (the requant output already is the
   kernel layout). One `LayerRequant` per MoE layer builds `{w1, w2, w1t, w2t}`

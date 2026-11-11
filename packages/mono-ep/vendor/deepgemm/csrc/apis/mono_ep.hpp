@@ -537,11 +537,13 @@ static void nvfp4_mono_ep(
     const int& num_experts, const int& num_topk,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const int& num_ring_tokens
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(num_ring_tokens >= 0);
     DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16 and y.is_contiguous());
 
     // Activation checks
@@ -577,7 +579,7 @@ static void nvfp4_mono_ep(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        "nvfp4", activation, 0
+        "nvfp4", activation, 0, 0, num_ring_tokens
     );
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);

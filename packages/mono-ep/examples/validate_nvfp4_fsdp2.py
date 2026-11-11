@@ -60,8 +60,14 @@ class Adapters(nn.Module):
         )
 
 
-def merged_bytes(m):
-    return [m.w1, m.w1_atoms, m.w2, m.w2_atoms, m.w1t, m.w1t_atoms, m.w2t, m.w2t_atoms]
+FORMS = ("w1", "w1_atoms", "w2", "w2_atoms", "w1t", "w1t_atoms", "w2t", "w2t_atoms")
+
+
+def merged_bytes(m, like=None):
+    """The forms ``m`` holds (a ``layer`` cache holds the backward's forms after a step), or
+    the forms ``like`` holds, from ``m``."""
+    present = like if like is not None else m
+    return [getattr(m, f) for f in FORMS if getattr(present, f) is not None]
 
 
 def main():
@@ -205,7 +211,9 @@ def main():
         fresh = layer.merged(*full)
         bitwise = all(
             torch.equal(a, b)
-            for a, b in zip(merged_bytes(cached), merged_bytes(fresh), strict=True)
+            for a, b in zip(
+                merged_bytes(cached), merged_bytes(fresh, like=cached), strict=True
+            )
         )
         changed = prev_merged is None or not all(
             torch.equal(a, b)
@@ -263,7 +271,8 @@ def main():
                 or worst["y_vs_previous_step_weights"] > worst["y"]
             )
             and cache.version == step
-            and cache.builds == step + 1
+            # ``all``: one build per step; ``layer``: the forward's and the backward's
+            and cache.builds == (step + 1) * (1 if cache.mode == "all" else 2)
         )
         results.append(
             dict(
@@ -299,7 +308,10 @@ def main():
             reserved_sms=args.reserved_sms,
             nccl_max_ctas=os.environ.get("NCCL_MAX_CTAS"),
             requant_backend=layer.backend,
+            merged_cache=cache.mode,
+            workspace_bound=os.environ.get("MONO_EP_WORKSPACE_BOUND", "auto"),
         ),
+        cache=cache.stats(),
         steps=results,
         passed=all(r["passed"] for r in results),
     )

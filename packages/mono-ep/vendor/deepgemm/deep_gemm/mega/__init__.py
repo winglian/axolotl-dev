@@ -237,7 +237,8 @@ def nvfp4_mono_ep(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        sym_buffer.l1_acts.shape[0] if sym_buffer.bounded_ring else 0
     )
 
 def bf16_mono_ep(y: torch.Tensor,

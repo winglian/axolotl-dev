@@ -4,18 +4,24 @@
 """NVFP4 LoRA expert path on the SM100 persistent kernels (``precision="nvfp4_lora"``).
 
 The base experts stay packed NVFP4 and frozen; only the LoRA factors train.
-Per optimizer step the requant kernel rebuilds the merged forms the kernels
-consume (``w1`` with interleaved gate/up rows, ``w2``, and the transposed
-``w1t`` / ``w2t`` for the backward GEMMs). The forward runs block-scaled UMMA
-on them; the backward returns ``dx``, ``dscore`` and the adapter gradients
+The requant kernel builds the merged forms the kernels consume (``w1`` with
+interleaved gate/up rows and ``w2`` for the forward; ``w1``, and the transposed
+``w1t`` / ``w2t``, for the backward GEMMs) from the base bytes and the current
+adapters. ``MONO_EP_NVFP4_MERGED_CACHE=layer`` (default) builds a layer's forms
+right before its forward and again before its backward and keeps the forms of
+the last few layers only; ``all`` builds every form of every layer once per
+optimizer step and holds them across the step. The forward runs block-scaled
+UMMA on them; the backward returns ``dx``, ``dscore`` and the adapter gradients
 from rank-``r`` grouped GEMMs on the BF16 pools. No base-weight gradients and
 no fp32 masters of the base.
 """
 
 import functools
+import logging
 import os
 import socket
 import types
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -23,10 +29,27 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.autograd.function import once_differentiable
 
+from . import workspace_bound
 from .persistent_backward import owned_backward_ring_tokens
 
+LOG = logging.getLogger("mono_ep")
 POOL_BLOCK = 128
 OPTIONS_ENV = "MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS"
+MERGED_CACHE_ENV = "MONO_EP_NVFP4_MERGED_CACHE"
+MERGED_CACHE_MODES = ("layer", "all")
+# Layers whose merged forms a ``layer`` cache keeps: the checkpoint recompute and the backward of
+# one layer are adjacent, a second slot covers a layer called twice in a row
+MERGED_CACHE_LAYERS = 2
+
+
+def merged_cache_mode(mode=None):
+    """``layer`` (default: forms built just in time, the last ``MERGED_CACHE_LAYERS``
+    layers kept) or ``all`` (every layer's forms held across the optimizer step);
+    ``MONO_EP_NVFP4_MERGED_CACHE`` when not given."""
+    mode = mode or os.environ.get(MERGED_CACHE_ENV, "layer")
+    if mode not in MERGED_CACHE_MODES:
+        raise ValueError(f"{MERGED_CACHE_ENV} must be one of {MERGED_CACHE_MODES}")
+    return mode
 
 
 REQUANT_BACKENDS = ("triton", "cuda", "cuda_fused")
@@ -43,12 +66,19 @@ def requant_modules():
     )
 
 
+DEFAULT_REQUANT_BACKEND = "cuda_fused"
+
+
 def requant_backend(backend=None):
-    """``cuda`` (default: SM100 kernel, the Triton kernel's bytes), ``triton``
-    (the vendored Triton kernel) or ``cuda_fused`` (transposed forms quantized
-    from the merged tile: a numerics change); ``MONO_EP_NVFP4_REQUANT`` when
-    not given."""
-    backend = backend or os.environ.get("MONO_EP_NVFP4_REQUANT", "cuda")
+    """``cuda_fused`` (default: SM100 kernel; the transposed backward forms are
+    quantized from the merged tile, so no transposed copy of the base is stored),
+    ``cuda`` (SM100 kernel, the Triton kernel's bytes: the transposed forms come
+    from a stored transposed base, a second packed copy per layer) or ``triton``
+    (the vendored Triton kernel, same bytes as ``cuda``); ``MONO_EP_NVFP4_REQUANT``
+    when not given."""
+    backend = backend or os.environ.get(
+        "MONO_EP_NVFP4_REQUANT", DEFAULT_REQUANT_BACKEND
+    )
     if backend not in REQUANT_BACKENDS:
         raise ValueError(f"requant backend must be one of {REQUANT_BACKENDS}")
     return backend
@@ -70,7 +100,9 @@ def _atoms(result):
 @dataclass
 class MergedNvfp4Weights:
     """One step's merged experts in the kernel layouts (``u8`` packed FP4 and
-    ``int32`` UTCCP scale-atom views) with the per-expert scale tables."""
+    ``int32`` UTCCP scale-atom views) with the per-expert scale tables. A
+    ``layer`` cache fills the forward forms (``w1``, ``w2``) and the backward
+    forms (``w1``, ``w1t``, ``w2t``) separately, so a form may be ``None``."""
 
     w1: torch.Tensor
     w1_atoms: torch.Tensor
@@ -83,6 +115,30 @@ class MergedNvfp4Weights:
     scales_forward: torch.Tensor
     scales_backward: torch.Tensor
     version: int
+
+    @property
+    def has_forward(self):
+        return self.w1 is not None and self.w2 is not None
+
+    @property
+    def has_backward(self):
+        return self.w1 is not None and self.w1t is not None and self.w2t is not None
+
+    def nbytes(self):
+        return sum(
+            t.numel() * t.element_size()
+            for t in (
+                self.w1,
+                self.w1_atoms,
+                self.w2,
+                self.w2_atoms,
+                self.w1t,
+                self.w1t_atoms,
+                self.w2t,
+                self.w2t_atoms,
+            )
+            if t is not None
+        )
 
 
 class Nvfp4LoraExperts:
@@ -277,6 +333,48 @@ class Nvfp4LoraExperts:
         )
         return r1, r2, r1t, r2t
 
+    def requant_forward(self, a1, b1, a2, b2):
+        """The forward's forms only: ``(w1 interleaved, w2)``, one pass over each base."""
+        a1, b1, a2, b2 = (t.detach() for t in (a1, b1, a2, b2))
+        if self.backend == "triton":
+            r1 = self._requant(
+                self.q1i, self.s1i, self.pts1, a1, b1.index_select(1, self.perm)
+            )
+            return r1, self._requant(self.q2, self.s2, self.pts2, a2, b2)
+        natural = self.cuda_requant.requant_natural
+        bf = lambda t: t.to(torch.bfloat16)  # noqa: E731
+        r1 = natural(
+            self.q1,
+            self.s1,
+            self.pts1,
+            bf(a1),
+            bf(b1),
+            self.scaling,
+            self.pts1,
+            interleave=8,
+        )
+        r2 = natural(
+            self.q2, self.s2, self.pts2, bf(a2), bf(b2), self.scaling, self.pts2
+        )
+        return r1, r2
+
+    def requant_backward(self, a1, b1, a2, b2):
+        """The backward's forms: ``(w1 interleaved, w1t, w2t)``. The fused kernel
+        writes each transposed form next to its normal form from one merged
+        tile; the other backends build all four forms (``w2`` is dropped)."""
+        r1, r2, r1t, r2t = self.requant_all(a1, b1, a2, b2)
+        del r2
+        return r1, r1t, r2t
+
+    def transposed_base_bytes(self):
+        """Bytes of the stored transposed base (``cuda`` / ``triton`` backends; 0 for ``cuda_fused``)."""
+        return sum(
+            t.numel() * t.element_size()
+            for name in ("q1t", "s1t", "q2t", "s2t")
+            for t in (getattr(self, name, None),)
+            if t is not None
+        )
+
     def merged(self, a1, b1, a2, b2, version=0):
         r1, r2, r1t, r2t = self.requant_all(a1, b1, a2, b2)
         return MergedNvfp4Weights(
@@ -293,28 +391,145 @@ class Nvfp4LoraExperts:
             version,
         )
 
+    def merged_forward(self, a1, b1, a2, b2, version=0):
+        r1, r2 = self.requant_forward(a1, b1, a2, b2)
+        return MergedNvfp4Weights(
+            r1.qdata,
+            _atoms(r1),
+            r2.qdata,
+            _atoms(r2),
+            None,
+            None,
+            None,
+            None,
+            self.scales_forward,
+            self.scales_backward,
+            version,
+        )
+
+    def merged_backward(self, a1, b1, a2, b2, version=0):
+        r1, r1t, r2t = self.requant_backward(a1, b1, a2, b2)
+        return MergedNvfp4Weights(
+            r1.qdata,
+            _atoms(r1),
+            None,
+            None,
+            r1t.qdata,
+            _atoms(r1t),
+            r2t.qdata,
+            _atoms(r2t),
+            self.scales_forward,
+            self.scales_backward,
+            version,
+        )
+
 
 class RequantCache:
-    """Merged weights per layer, rebuilt lazily after every invalidation
-    (``attach_post_step_hook`` invalidates after ``optimizer.step``)."""
+    """Merged weights per layer (keyed by the layer's :class:`Nvfp4LoraExperts`),
+    invalidated by ``attach_post_step_hook`` after every ``optimizer.step``.
 
-    def __init__(self):
+    ``mode="all"``: a layer's four forms are built at its first use after an
+    invalidation and held until the next one. ``mode="layer"`` (default, see
+    :func:`merged_cache_mode`): :meth:`forward` builds ``w1`` / ``w2`` right
+    before a forward, :meth:`backward` builds ``w1`` / ``w1t`` / ``w2t`` right
+    before a backward, and only the ``capacity`` most recently used layers stay
+    resident, so the persistent footprint is a few layers instead of the model.
+    Under activation checkpointing the recompute forward rebuilds the forward
+    forms (counted in ``forward_builds``); every build is bitwise reproducible
+    from the same adapters, so a rebuilt form equals the evicted one.
+    """
+
+    def __init__(self, mode=None, capacity=MERGED_CACHE_LAYERS):
+        self.mode = merged_cache_mode(mode)
+        self.capacity = int(capacity) if self.mode == "layer" else None
         self.version = 0
-        self.entries = {}
+        self.entries = OrderedDict()
         self.builds = 0
+        self.forward_builds = 0
+        self.backward_builds = 0
+        self.hits = 0
+        self.evictions = 0
+        self.max_entries = 0
+        self.max_resident_bytes = 0
 
     def invalidate(self):
         self.version += 1
         self.entries.clear()
 
-    def get(self, experts, adapters):
+    def resident_bytes(self):
+        return sum(e.nbytes() for e in self.entries.values())
+
+    def stats(self):
+        return dict(
+            mode=self.mode,
+            version=self.version,
+            builds=self.builds,
+            forward_builds=self.forward_builds,
+            backward_builds=self.backward_builds,
+            hits=self.hits,
+            evictions=self.evictions,
+            entries=len(self.entries),
+            max_entries=self.max_entries,
+            resident_bytes=self.resident_bytes(),
+            max_resident_bytes=self.max_resident_bytes,
+        )
+
+    def _current(self, experts):
         entry = self.entries.get(id(experts))
-        if entry is None or entry.version != self.version:
-            full = [_full_tensor(t) for t in adapters]
-            entry = experts.merged(*full, version=self.version)
-            self.entries[id(experts)] = entry
-            self.builds += 1
+        if entry is not None and entry.version != self.version:
+            del self.entries[id(experts)]
+            entry = None
         return entry
+
+    def _store(self, experts, entry):
+        self.entries[id(experts)] = entry
+        self.entries.move_to_end(id(experts))
+        self.builds += 1
+        if self.capacity is not None:
+            while len(self.entries) > self.capacity:
+                self.entries.popitem(last=False)
+                self.evictions += 1
+        self.max_entries = max(self.max_entries, len(self.entries))
+        self.max_resident_bytes = max(self.max_resident_bytes, self.resident_bytes())
+        return entry
+
+    def get(self, experts, adapters):
+        """All four forms of a layer (built if any is missing)."""
+        entry = self._current(experts)
+        if entry is not None and entry.has_forward and entry.has_backward:
+            self.hits += 1
+            self.entries.move_to_end(id(experts))
+            return entry
+        full = [_full_tensor(t) for t in adapters]
+        return self._store(experts, experts.merged(*full, version=self.version))
+
+    def forward(self, experts, adapters):
+        """The forward forms (``w1``, ``w2``) of a layer."""
+        if self.mode == "all":
+            return self.get(experts, adapters)
+        entry = self._current(experts)
+        if entry is not None and entry.has_forward:
+            self.hits += 1
+            self.entries.move_to_end(id(experts))
+            return entry
+        full = [_full_tensor(t) for t in adapters]
+        self.forward_builds += 1
+        return self._store(experts, experts.merged_forward(*full, version=self.version))
+
+    def backward(self, experts, adapters):
+        """The backward forms (``w1``, ``w1t``, ``w2t``) of a layer."""
+        if self.mode == "all":
+            return self.get(experts, adapters)
+        entry = self._current(experts)
+        if entry is not None and entry.has_backward:
+            self.hits += 1
+            self.entries.move_to_end(id(experts))
+            return entry
+        full = [_full_tensor(t) for t in adapters]
+        self.backward_builds += 1
+        return self._store(
+            experts, experts.merged_backward(*full, version=self.version)
+        )
 
 
 def _full_tensor(t):
@@ -366,6 +581,10 @@ class Nvfp4PersistentBackward:
         dist.all_gather_object(hosts, socket.gethostname(), group=self.group)
         if len(set(hosts)) != 1:
             raise ValueError("Native persistent backward currently requires one host")
+        floor = owned_backward_ring_tokens(
+            runtime.num_sms, "MONO_EP_NVFP4_BACKWARD_RING_WAVES", default_waves=1
+        )
+        self.bounded = workspace_bound.mode() == "auto"
         self.buffer = deep_gemm.get_symm_buffer_for_mono_ep(
             self.group,
             runtime.experts,
@@ -374,13 +593,13 @@ class Nvfp4PersistentBackward:
             runtime.hidden,
             runtime.intermediate,
             mma_type="bf16xbf16",
-            num_min_ring_tokens=owned_backward_ring_tokens(
-                runtime.num_sms, "MONO_EP_NVFP4_BACKWARD_RING_WAVES", default_waves=1
-            ),
+            num_min_ring_tokens=floor,
+            # the owned schedule keeps one block live per cluster, so the floor is all it needs
+            num_exact_ring_tokens=floor if self.bounded else 0,
         )
         self.handles = []
         capacity = self.buffer.num_max_tokens_per_rank
-        hidden, inter = runtime.hidden, runtime.intermediate
+        hidden = runtime.hidden
         self.dy, self.dy_pointers = self._allocate((capacity, hidden), torch.bfloat16)
         self.ds_partials, self.ds_pointers = self._allocate(
             (capacity, runtime.topk, 2), torch.float32
@@ -388,8 +607,29 @@ class Nvfp4PersistentBackward:
         self.experts = runtime.experts // self.world
         rows = self.world * capacity * runtime.topk + self.experts * POOL_BLOCK
         rows = (rows + POOL_BLOCK - 1) // POOL_BLOCK * POOL_BLOCK
-        self.rows = rows
+        self.worst_rows = rows
+        self.bound = None
+        if self.bounded:
+            self.bound = workspace_bound.WorkspaceBound(
+                capacity, runtime.topk, self.experts, rows
+            )
+            rows = self.bound.rows
+            if runtime.forward_ring_budget:
+                self.bound.forward_budget = (
+                    runtime.forward_ring_budget + self.experts * POOL_BLOCK
+                )
         device = self.dy.device
+        self.starts = torch.empty(self.experts, device=device, dtype=torch.int32)
+        self.counts = torch.empty_like(self.starts)
+        self.finished = None
+        self._build_pools(rows)
+
+    def _build_pools(self, rows):
+        """BF16 x/dy/h/dz pools, packed FP4 x/dy/dz pools with ``[K / 64][rows]`` scale words,
+        and the per-row dy/dz scales, zero-initialised, for ``rows`` routed rows."""
+        hidden, inter = self.runtime.hidden, self.runtime.intermediate
+        device = self.dy.device
+        self.rows = rows
         zeros = lambda *shape, dtype: torch.zeros(*shape, device=device, dtype=dtype)  # noqa: E731
         self.pools = [
             zeros(rows, w, dtype=torch.bfloat16)
@@ -402,9 +642,31 @@ class Nvfp4PersistentBackward:
             zeros(w // 64, rows, dtype=torch.int32) for w in (hidden, hidden, 2 * inter)
         ]
         self.row_scales = [zeros(rows, dtype=torch.float32) for _ in range(2)]
-        self.starts = torch.empty(self.experts, device=device, dtype=torch.int32)
-        self.counts = torch.empty_like(self.starts)
-        self.finished = None
+
+    def pool_bytes(self):
+        return sum(
+            t.numel() * t.element_size()
+            for t in (*self.pools, *self.fp4_pools, *self.sf_pools, *self.row_scales)
+        )
+
+    def _fit_pools(self, key):
+        """Bounded workspace: grow every pool before a backward whose routed rows exceed them."""
+        if self.bound is None:
+            return
+        if key is None:
+            self.bound.unrecorded += 1
+            LOG.warning(
+                "mono_ep bounded workspace: an NVFP4 backward without a layer key; sizing "
+                "its pools for the worst case (%d rows)",
+                self.worst_rows,
+            )
+            rows = self.bound.target(self.worst_rows)
+        else:
+            rows = self.bound.target(self.bound.required_rows(key))
+        if rows is None:
+            return
+        del self.pools, self.fp4_pools, self.sf_pools, self.row_scales
+        self._build_pools(rows)
 
     def _allocate(self, shape, dtype):
         allocator = torch if self.world == 1 else symm_mem
@@ -418,7 +680,10 @@ class Nvfp4PersistentBackward:
             handle.get_buffer(r, shape, dtype).data_ptr() for r in range(self.world)
         ]
 
-    def backward(self, dy, x, indices, scores, merged):
+    def backward(self, dy, x, indices, scores, merged, key=None):
+        """``key`` is the layer's frozen base tensor (``Nvfp4LoraExperts.q1``) whose
+        forward recorded this rank's receive counts; without it a bounded backward
+        sizes its pools for the worst case."""
         import deep_gemm
 
         if (
@@ -434,6 +699,7 @@ class Nvfp4PersistentBackward:
         stream = torch.cuda.current_stream(x.device)
         if self.finished is not None:
             stream.wait_event(self.finished)
+        self._fit_pools(key)
         tokens = x.shape[0]
         self.buffer.x[:tokens].copy_(x)
         self.dy[:tokens].copy_(dy)
@@ -560,7 +826,10 @@ def backward_for(runtime):
 
 class _Nvfp4LoraMoE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, indices, scores, a1, b1, a2, b2, runtime, experts, merged):
+    def forward(
+        ctx, x, indices, scores, a1, b1, a2, b2, runtime, experts, cache, record
+    ):
+        merged = cache.forward(experts, (a1, b1, a2, b2))
         y = runtime.forward_nvfp4(
             x,
             indices,
@@ -570,9 +839,11 @@ class _Nvfp4LoraMoE(torch.autograd.Function):
             merged.w2,
             merged.w2_atoms,
             merged.scales_forward,
+            record_key=experts.q1 if record else None,
         )
         ctx.save_for_backward(x, indices, scores, a1, b1, a2, b2)
-        ctx.runtime, ctx.experts, ctx.merged = runtime, experts, merged
+        # the merged forms are fetched again in the backward (a layer cache rebuilds evicted ones)
+        ctx.runtime, ctx.experts, ctx.cache = runtime, experts, cache
         return y
 
     @staticmethod
@@ -580,7 +851,10 @@ class _Nvfp4LoraMoE(torch.autograd.Function):
     def backward(ctx, dy):
         x, indices, scores, a1, b1, a2, b2 = ctx.saved_tensors
         backward = backward_for(ctx.runtime)
-        dx, ds = backward.backward(dy.contiguous(), x, indices, scores, ctx.merged)
+        merged = ctx.cache.backward(ctx.experts, (a1, b1, a2, b2))
+        dx, ds = backward.backward(
+            dy.contiguous(), x, indices, scores, merged, key=ctx.experts.q1
+        )
         da1, db1, da2, db2 = lora_weight_grads(
             backward.pools,
             backward.starts,
@@ -602,6 +876,7 @@ class _Nvfp4LoraMoE(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -612,7 +887,11 @@ def nvfp4_lora_moe(x, indices, scores, a1, b1, a2, b2, runtime, experts, cache):
         raise ValueError(
             "nvfp4_lora_moe requires a PersistentMoE with compute_dtype='nvfp4_lora'"
         )
-    merged = cache.get(experts, (a1, b1, a2, b2))
+    record = workspace_bound.will_backward(x, scores, a1, b1, a2, b2)
+    if record:
+        # the backward's bounded pools are sized from counts this forward records, so its
+        # workspace (and the record keyed on the layer's base) must exist before the first forward
+        backward_for(runtime)
     return _Nvfp4LoraMoE.apply(
-        x, indices, scores, a1, b1, a2, b2, runtime, experts, merged
+        x, indices, scores, a1, b1, a2, b2, runtime, experts, cache, record
     )

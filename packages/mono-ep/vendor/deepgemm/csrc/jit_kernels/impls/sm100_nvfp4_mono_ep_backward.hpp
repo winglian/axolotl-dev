@@ -80,8 +80,10 @@ static void nvfp4_mono_ep_backward(
     const int widths[] = {hidden, hidden, inner, inner * 2};
     const int64_t required_rows = static_cast<int64_t>(world) * max_tokens * topk + experts * 128;
     DG_HOST_ASSERT(required_rows < std::numeric_limits<int>::max());
+    // Pools may be bounded below the worst case (the host sizes them from the forward's counts; the kernel traps
+    // past `pool_rows`)
     const int64_t rows = pools[0].size(0);
-    DG_HOST_ASSERT(rows >= required_rows and rows % 128 == 0 and rows < std::numeric_limits<int>::max());
+    DG_HOST_ASSERT(rows > 0 and rows % 128 == 0 and rows <= required_rows);
     for (int i = 0; i < 4; ++i) {
         check(pools[i], torch::kBFloat16);
         DG_HOST_ASSERT(pools[i].dim() == 2 and pools[i].size(0) == rows and pools[i].size(1) == widths[i]);
@@ -204,6 +206,7 @@ static void instantiate() {{
     buffers.nv_rdy = row_scales[0].data_ptr<float>();
     buffers.nv_rdz = row_scales[1].data_ptr<float>();
     buffers.nv_pool_rows = static_cast<uint32_t>(rows);
+    buffers.pool_rows = rows < required_rows ? static_cast<uint32_t>(rows) : 0u;
     jit->launch(kernel, {.num_smem_bytes = smem, .grid_dim = dim3(sms),
         .block_dim = dim3(512), .cluster_dim = dim3(2, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),

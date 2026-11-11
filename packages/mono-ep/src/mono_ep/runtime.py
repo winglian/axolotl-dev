@@ -105,11 +105,12 @@ class PersistentMoE:
         self.intermediate = intermediate
         self.fuse_activation = fuse_activation
         self.alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
-        # The SM100 BF16 forward gates L1 claims on its ring, so its ring can be sized for a routed-row budget
+        # The SM100 BF16 and NVFP4 forwards gate L1 claims on their ring (the same scheduler), so the
+        # ring can be sized for a routed-row budget
         self.forward_ring_budget = (
             workspace_bound.forward_ring_budget(max_tokens, topk)
             if arch == 10
-            and compute_dtype == "bf16"
+            and compute_dtype in ("bf16", "nvfp4_lora")
             and workspace_bound.mode() == "auto"
             else 0
         )
@@ -159,6 +160,7 @@ class PersistentMoE:
         w2_packed,
         w2_atoms,
         expert_scales,
+        record_key=None,
     ):
         """Forward on merged NVFP4 experts, no autograd.
 
@@ -166,6 +168,8 @@ class PersistentMoE:
         interleaved gate/up rows, ``w2_packed`` ``[E_local, H, I / 2]``; the atoms
         are the requant cache's ``scale_atoms`` (``[E_local, N / 128, K / 64, 512]``
         uint8); ``expert_scales`` is ``[E_local, 8]`` fp32 (see ``nvfp4_expert_scales``).
+        ``record_key`` (the layer's frozen base tensor) records this call's per-expert
+        receive counts for the bounded workspace of the matching backward.
         """
         import deep_gemm
 
@@ -182,6 +186,14 @@ class PersistentMoE:
         buffer.topk_idx[:tokens].copy_(indices)
         buffer.topk_weights[:tokens].copy_(scores)
         y = torch.empty_like(x)
+        bound = getattr(getattr(self, "_nvfp4_backward", None), "bound", None)
+        counts = None
+        if bound is not None and record_key is not None:
+            counts = torch.zeros(
+                self.experts // dist.get_world_size(self.group),
+                dtype=torch.int32,
+                device=x.device,
+            )
         deep_gemm.nvfp4_mono_ep(
             y,
             (
@@ -194,8 +206,11 @@ class PersistentMoE:
             ),
             expert_scales,
             buffer,
+            cumulative_local_expert_recv_stats=counts,
             fast_math=False,
         )
+        if counts is not None:
+            bound.record(record_key, counts)
         return y
 
     def __call__(self, x, indices, scores, w1, w2):
