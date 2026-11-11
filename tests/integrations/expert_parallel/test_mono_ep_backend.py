@@ -71,7 +71,8 @@ class _FakeRuntime:
         self.kwargs = kwargs
         self.calls = []
         self.destroyed = False
-        self.precision = "bf16"
+        precision = kwargs.get("precision", "auto")
+        self.precision = "bf16" if precision == "auto" else precision
         _FakeRuntime.instances.append(self)
 
     @staticmethod
@@ -387,6 +388,12 @@ class TestArgs:
         assert args.expert_parallel_backend == "mono_ep"
         assert args.expert_parallel_mono_ep_precision == "fp8"
         assert ExpertParallelArgs().expert_parallel_mono_ep_precision == "auto"
+        assert (
+            ExpertParallelArgs(
+                expert_parallel_mono_ep_precision="nvfp4_lora"
+            ).expert_parallel_mono_ep_precision
+            == "nvfp4_lora"
+        )
         with pytest.raises(ValueError):
             ExpertParallelArgs(expert_parallel_mono_ep_precision="fp4")
 

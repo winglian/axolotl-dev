@@ -450,8 +450,13 @@ class _MonoEPFusedBackend:
         num_experts_global,
         num_local_experts,
     ):
+        runtime = get_mono_ep_runtime()
+        if getattr(runtime, "precision", None) == "nvfp4_lora":
+            from .nvfp4_lora import forward as nvfp4_lora_forward
+
+            return nvfp4_lora_forward(runtime, experts, hidden_states, topk_idx, topk_w)
         w1, w2 = _local_expert_weights(experts)
-        return get_mono_ep_runtime().forward(hidden_states, topk_idx, topk_w, w1, w2)
+        return runtime.forward(hidden_states, topk_idx, topk_w, w1, w2)
 
 
 class _MonoEPDispatchBackend:

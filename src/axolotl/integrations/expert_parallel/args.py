@@ -56,12 +56,16 @@ class ExpertParallelArgs(BaseModel):
     re-runs that layer exactly."""
 
     expert_parallel_mono_ep_precision: Literal[
-        "auto", "bf16", "mxfp8", "fp8", "fp8_bwd"
+        "auto", "bf16", "mxfp8", "fp8", "fp8_bwd", "nvfp4_lora"
     ] = "auto"
     """Compute precision of the ``mono_ep`` backend's fused mode. ``auto``: ``bf16`` on SM90,
-    ``mxfp8`` on SM100. ``fp8`` is blockwise E4M3 forward and backward (SM90); ``fp8_bwd`` is
-    BF16 forward with blockwise FP8 backward. Master weights stay in their own dtype. The
-    dispatch mode moves BF16 rows and leaves compute precision to the local kernel."""
+    ``mxfp8`` on SM100, and ``nvfp4_lora`` on SM100 when the experts load as packed NVFP4 and a
+    LoRA adapter targets them. ``fp8`` is blockwise E4M3 forward and backward (SM90);
+    ``fp8_bwd`` is BF16 forward with blockwise FP8 backward. ``nvfp4_lora`` keeps the packed
+    NVFP4 experts frozen and trains a PEFT ``lora_target_parameters`` adapter on them (SM100;
+    ``adapter: lora`` with ``use_sonicmoe: true``, ``nvfp4_merge_aware: false`` and
+    ``lora_dropout: 0``). Master weights stay in their own dtype. The dispatch mode moves
+    BF16 rows and leaves compute precision to the local kernel."""
 
     expert_parallel_mono_ep_workspace_bound: Literal["auto", "max"] = "auto"
     """Fused mode on SM100: size the backward's per-rank row pools from the rows each layer's

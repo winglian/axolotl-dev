@@ -54,6 +54,8 @@ class MonoEPGeometry(NamedTuple):
     intermediate: int
     top_k: int
     activation_clamp: float | None
+    precision: str | None = None
+    """The precision the model resolved (``nvfp4_lora``), ``None`` when the config's stands."""
 
 
 class MonoEPDispatchGeometry(NamedTuple):
@@ -323,7 +325,7 @@ class ExpertParallelPlugin(BasePlugin):
             if self._mono_ep_mode(cfg) == "dispatch":
                 self._build_mono_ep_dispatch_runtime(cfg)
             else:
-                self._build_mono_ep_runtime(cfg)
+                self._build_mono_ep_runtime(cfg, model)
         if self._uses_torch_backend(cfg):
             self._install_required_checkpoint_policy(cfg, model)
 
@@ -515,7 +517,9 @@ class ExpertParallelPlugin(BasePlugin):
 
     def post_train_unload(self, cfg):
         from .experts_fn import set_mono_ep_runtime
+        from .nvfp4_lora import set_state
 
+        set_state(None)
         runtime = self.__dict__.pop("_mono_ep_runtime", None)
         set_mono_ep_runtime(None)
         if runtime is not None:
@@ -548,11 +552,29 @@ class ExpertParallelPlugin(BasePlugin):
     @staticmethod
     def _mono_ep_fused_config_reason(cfg) -> str | None:
         """Config-only reasons the fused mode cannot run (the dispatch mode can)."""
+        from .nvfp4_lora import (
+            PRECISION as NVFP4_LORA,
+            config_reason as nvfp4_lora_config_reason,
+        )
+
+        precision = getattr(cfg, "expert_parallel_mono_ep_precision", None) or "auto"
         if getattr(cfg, "adapter", None):
-            return (
-                f"adapter {cfg.adapter!r} is configured; the fused kernels train full "
-                "expert weights only"
+            # an adapter trains on the fused kernels only as nvfp4_lora (frozen packed NVFP4
+            # experts); ``auto`` takes that path when the config qualifies
+            reason = (
+                nvfp4_lora_config_reason(cfg)
+                if precision in ("auto", NVFP4_LORA)
+                else f"precision {precision} trains full expert weights only"
             )
+            if reason is not None:
+                if precision == NVFP4_LORA:
+                    return reason
+                return (
+                    f"adapter {cfg.adapter!r} is configured; the fused kernels train full "
+                    f"expert weights only ({reason})"
+                )
+        elif precision == NVFP4_LORA:
+            return "precision nvfp4_lora needs adapter: lora on the experts"
         quantized = [
             key
             for key in (
@@ -661,6 +683,19 @@ class ExpertParallelPlugin(BasePlugin):
             activation, clamp, reason = cls._expert_activation(experts)
             if reason is not None:
                 return None, f"{name}: {reason}"
+            precision = (
+                getattr(cfg, "expert_parallel_mono_ep_precision", None) or "auto"
+            )
+            resolved = None
+            if getattr(cfg, "adapter", None):
+                from .nvfp4_lora import PRECISION as NVFP4_LORA, experts_reason
+
+                # the config already qualified for nvfp4_lora; the experts must be the
+                # packed NVFP4 the kernels consume
+                reason = experts_reason(experts, name)
+                if reason is not None:
+                    return None, reason
+                precision = resolved = NVFP4_LORA
             from mono_ep import unsupported_reason
 
             reason = unsupported_reason(
@@ -670,13 +705,14 @@ class ExpertParallelPlugin(BasePlugin):
                 has_bias=bool(experts.has_bias),
                 activation=activation,
                 activation_clamp=clamp,
-                precision=getattr(cfg, "expert_parallel_mono_ep_precision", None)
-                or "auto",
+                precision=precision,
             )
             if reason is not None:
                 return None, f"{name}: {reason}"
             geometries.add(
-                MonoEPGeometry(num_experts, hidden, intermediate, top_k, clamp)
+                MonoEPGeometry(
+                    num_experts, hidden, intermediate, top_k, clamp, resolved
+                )
             )
         if len(geometries) != 1:
             return None, (
@@ -734,6 +770,8 @@ class ExpertParallelPlugin(BasePlugin):
             if fused_reason is None:
                 self._mono_ep_geometry = geometry
                 cfg.expert_parallel_mono_ep_mode = "fused"
+                if geometry is not None and geometry.precision is not None:
+                    cfg.expert_parallel_mono_ep_precision = geometry.precision
                 set_mono_ep_mode("fused")
                 return MONO_EP
             if mode == "fused":
@@ -812,7 +850,7 @@ class ExpertParallelPlugin(BasePlugin):
             / (getattr(cfg, "context_parallel_size", None) or 1)
         )
 
-    def _build_mono_ep_runtime(self, cfg) -> None:
+    def _build_mono_ep_runtime(self, cfg, model=None) -> None:
         """One runtime (and symmetric buffer) per process, shared by every MoE layer."""
         from mono_ep import DEFAULT_RESERVED_SMS, MonoEPRuntime
 
@@ -852,6 +890,17 @@ class ExpertParallelPlugin(BasePlugin):
         # the op saves only its inputs and recomputes in its own backward; SAC must keep
         # its output instead of replaying a collective kernel
         register_mandatory_save(ops={runtime.forward_op})
+        precision = getattr(runtime, "precision", None) or getattr(
+            cfg, "expert_parallel_mono_ep_precision", None
+        )
+        from .nvfp4_lora import PRECISION as NVFP4_LORA
+
+        if precision == NVFP4_LORA:
+            from .nvfp4_lora import Nvfp4LoraState, set_state, tag_layers
+
+            if model is not None:
+                tag_layers(model)
+            set_state(Nvfp4LoraState(repo_id=getattr(cfg, "base_model", None)))
         LOG.info(
             f"expert_parallel: mono_ep runtime, {tokens} tokens/rank, "
             f"{geometry.num_experts} experts, top-{geometry.top_k}, "
@@ -1145,8 +1194,18 @@ class ExpertParallelPlugin(BasePlugin):
                 continue
             fully_shard(module, **kwargs)
             wrapped.append(module)
+        from .nvfp4_lora import active as nvfp4_lora_active, expert_params
+
         for pw in outer_expert_pws:
-            fully_shard(pw, **kwargs)
+            pw_kwargs = kwargs
+            if nvfp4_lora_active():
+                # the frozen packed NVFP4 experts stay plain tensors on every rank: the
+                # persistent kernels and the requant read their bytes in place, and an
+                # all-gathered copy per forward would be freed under them
+                pw_kwargs = dict(
+                    kwargs, ignored_params=expert_params(_real_experts_base(pw))
+                )
+            fully_shard(pw, **pw_kwargs)
             wrapped.append(pw)
 
         for module in wrapped:

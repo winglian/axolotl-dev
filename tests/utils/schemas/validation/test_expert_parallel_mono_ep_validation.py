@@ -98,3 +98,14 @@ class TestMonoEPValidation:
     def test_rejects_unknown_precision(self, min_base_cfg):
         with pytest.raises(ValueError):
             _validate(min_base_cfg, expert_parallel_mono_ep_precision="fp4")
+
+    def test_nvfp4_lora_keeps_use_sonicmoe(self, min_base_cfg, warnings):
+        cfg = _validate(
+            min_base_cfg,
+            plugins=[EP_PLUGIN, KERNELS_PLUGIN],
+            use_sonicmoe=True,
+            expert_parallel_mono_ep_mode="fused",
+            expert_parallel_mono_ep_precision="nvfp4_lora",
+        )
+        assert cfg.expert_parallel_mono_ep_precision == "nvfp4_lora"
+        assert "local experts kernel" not in warnings()
