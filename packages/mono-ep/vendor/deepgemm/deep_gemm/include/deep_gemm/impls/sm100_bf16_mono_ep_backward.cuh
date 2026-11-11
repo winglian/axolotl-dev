@@ -14,6 +14,7 @@
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mono_ep.cuh>
 #include <deep_gemm/layout/moe_backward.cuh>
+#include <deep_gemm/layout/stored_z.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/epilogue/sm100_moe_backward.cuh>
 #include <deep_gemm/scheduler/mono_ep.cuh>
@@ -199,14 +200,25 @@ sm100_bf16_mono_ep_backward_impl(void* y,
         return kInkernelDw and (info.block_phase == sched::BlockPhase::BackwardDw1 or
                                 info.block_phase == sched::BlockPhase::BackwardDw2);
     };
-    // 4096: stored forward context. The forward saved z (BF16 gate/up pre-activations by source row,
-    // [ranks, max tokens, topk, 2I]) in `saved_z`; RecomputeLow/High tasks skip their loads and UMMAs and the
-    // epilogue reads z from there instead of TMEM. `saved_z` otherwise carries the phase trace.
+    // 4096: stored forward context (layout::StoredZ in `saved_z`, which otherwise carries the phase trace). Unless
+    // the storing forward overflowed the buffer, RecomputeLow/High tasks skip their loads and UMMAs and the epilogue
+    // reads z from the buffer instead of TMEM; every role reads the flag once, so all skip or none do.
     constexpr bool kStoredContext = kOptions & 4096u;
+    const int* stored_z_meta = reinterpret_cast<const int*>(saved_z);
+    const __nv_bfloat16* stored_z = kStoredContext ? reinterpret_cast<const __nv_bfloat16*>(
+        reinterpret_cast<const uint8_t*>(saved_z) + layout::stored_z_meta_bytes(kNumRanks, kNumMaxTokensPerRank, kNumTopk)) : nullptr;
+    // Read after the grid dependency sync below (the flag is written by the storing forward)
+    bool stored_z_valid = false;
+    const auto stored_z_row = [&](const layout::TokenSrcMetadata& src) {
+        const auto& [rank, token, slot] = src;
+        const auto pool_row = static_cast<uint64_t>(
+            stored_z_meta[layout::kStoredZHeaderInts + (rank * kNumMaxTokensPerRank + token) * kNumTopk + slot]);
+        return stored_z + pool_row * (2 * kIntermediateHidden);
+    };
     DG_STATIC_ASSERT(not (kStoredContext and (kPhaseTrace or kMXFP8 or kInkernelDw)),
                      "Stored context excludes the phase trace, the MXFP8 backward and in-kernel dW");
-    const auto is_stored_recompute = [](const auto& info) {
-        return kStoredContext and (info.block_phase == sched::BlockPhase::BackwardRecomputeLow or
+    const auto is_stored_recompute = [&](const auto& info) {
+        return kStoredContext and stored_z_valid and (info.block_phase == sched::BlockPhase::BackwardRecomputeLow or
                                    info.block_phase == sched::BlockPhase::BackwardRecomputeHigh);
     };
     DG_STATIC_ASSERT(not kMXFP8 or (kStagedPoolStores and not (kOptions & 4u) and not kLookaheadPull),
@@ -343,6 +355,8 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
+    if constexpr (kStoredContext)
+        stored_z_valid = ptx::ld_acq(reinterpret_cast<const uint32_t*>(stored_z_meta)) == 0;
 
     // Diagnostic per-CTA phase trace (kPhaseTrace only); the pointer rides in the unused saved_z argument.
     constexpr uint32_t kTraceHeader = 96, kTraceMBlockSlots = 64, kTraceMBlockFields = 8;
@@ -1236,10 +1250,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                 while (ptx::ld_acq(workspace.get_l1_full_count_ptr(ring_block_idx)) != expected);
                 const uint32_t n = task_info.get_n_block_idx(is_leader_cta) * 64;
                 for (uint32_t row = lane_idx; row < task_info.valid_m; row += 32) {
-                    const auto src = *workspace.get_token_src_metadata_ptr(pool_block_idx * BLOCK_M + row);
-                    const auto& [rank, token, slot] = src;
-                    const auto* z = saved_z + ((static_cast<uint64_t>(rank) * kNumMaxTokensPerRank + token) *
-                                               kNumTopk + slot) * (2 * kIntermediateHidden) + n;
+                    const auto* z = stored_z_row(*workspace.get_token_src_metadata_ptr(pool_block_idx * BLOCK_M + row)) + n;
                     asm volatile("prefetch.global.L2 [%0];" :: "l"(z));
                     asm volatile("prefetch.global.L2 [%0];" :: "l"(z + kIntermediateHidden));
                 }
@@ -1921,10 +1932,7 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                             const auto row = atom_row + (lane_idx % 4) * 2 + r;
                             nv_bfloat16 g[2] = {}, u[2] = {};
                             if (row < valid_m) {
-                                const auto src = *workspace.get_token_src_metadata_ptr(pool_m_idx + row);
-                                const auto& [rank, token, slot] = src;
-                                const auto* z = saved_z + ((static_cast<uint64_t>(rank) * kNumMaxTokensPerRank + token) *
-                                                           kNumTopk + slot) * (2 * kIntermediateHidden);
+                                const auto* z = stored_z_row(*workspace.get_token_src_metadata_ptr(pool_m_idx + row));
                                 #pragma unroll
                                 for (uint32_t col = 0; col < 2; ++col) {
                                     g[col] = z[n + col * 8];

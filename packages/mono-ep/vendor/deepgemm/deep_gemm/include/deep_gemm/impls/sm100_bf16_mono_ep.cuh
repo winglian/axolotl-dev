@@ -10,6 +10,7 @@
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mono_ep.cuh>
+#include <deep_gemm/layout/stored_z.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/epilogue/sm100_moe_backward.cuh>
 #include <deep_gemm/scheduler/mono_ep.cuh>
@@ -38,6 +39,7 @@ template <
     bool kPhaseTrace = false,
     uint32_t kDiagAblate = 0,
     bool kLookaheadPull = false,
+    bool kCompactZ = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1448,7 +1450,38 @@ sm100_bf16_mono_ep_impl(void* y,
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                             }
 
-                            if (saved_z != nullptr and not task_info.is_shared()) {
+                            if constexpr (kCompactZ) {
+                              if (not task_info.is_shared()) {
+                                // Stored context, compact layout (layout::StoredZ): z by this forward's pool row,
+                                // the source -> pool-row index, and an overflow flag for rows past the capacity
+                                const auto meta = reinterpret_cast<int*>(saved_z);
+                                const uint32_t capacity = static_cast<uint32_t>(meta[1]);
+                                const auto z_base = reinterpret_cast<__nv_bfloat16*>(
+                                    reinterpret_cast<uint8_t*>(saved_z) + layout::stored_z_meta_bytes(kNumRanks, kNumMaxTokensPerRank, kNumTopk));
+                                const uint32_t col = n_block_idx * L1_OUT_BLOCK_N + warp_idx_in_wg * 16 + lane_idx / 4 + k * 8;
+                                const uint32_t row = epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + (lane_idx % 4) * 2;
+                                const auto gates = __bfloat1622float2(bf16_gate);
+                                const auto ups = __bfloat1622float2(bf16_up);
+                                // A block past the capacity stores nothing; one thread per task raises the flag
+                                const bool overflow = pool_m_idx + valid_m > capacity;
+                                if (overflow and row == 0 and col == 0)
+                                    meta[0] = 1;
+                                for (uint32_t v = 0; v < 2 and not overflow; ++v) {
+                                    if (row + v < valid_m and col < kIntermediateHidden) {
+                                        const uint32_t pool_row = pool_m_idx + row + v;
+                                        const uint64_t offset = static_cast<uint64_t>(pool_row) * (2 * kIntermediateHidden);
+                                        z_base[offset + col] = __float2bfloat16(v == 0 ? gates.x : gates.y);
+                                        z_base[offset + kIntermediateHidden + col] = __float2bfloat16(v == 0 ? ups.x : ups.y);
+                                        if (col == 0) {
+                                            const auto src = *workspace.get_token_src_metadata_ptr(pool_row);
+                                            const auto& [rank, token, slot] = src;
+                                            meta[layout::kStoredZHeaderInts + (rank * kNumMaxTokensPerRank + token) * kNumTopk + slot] =
+                                                static_cast<int>(pool_row);
+                                        }
+                                    }
+                                }
+                              }
+                            } else if (saved_z != nullptr and not task_info.is_shared()) {
                                 const uint32_t col = n_block_idx * L1_OUT_BLOCK_N + warp_idx_in_wg * 16 + lane_idx / 4 + k * 8;
                                 const uint32_t row = epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + (lane_idx % 4) * 2;
                                 const auto gates = __bfloat1622float2(bf16_gate);

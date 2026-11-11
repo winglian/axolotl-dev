@@ -6,6 +6,7 @@
 #include <torch/python.h>
 
 #include <deep_gemm/layout/mono_ep.cuh>
+#include <deep_gemm/layout/stored_z.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
 #include "../../runtime/runtime.hpp"
@@ -112,12 +113,15 @@ static void sm100_bf16_mono_ep(
     const bool lookahead = forward_options & 1u;
     DG_HOST_ASSERT(not lookahead or config.num_bytes_per_pull == hidden * 2);
     const bool diag = phase_trace_ptr != 0 or diag_ablate != 0;
-    const std::string diag_suffix = (diag or lookahead)
+    // A 1-D byte buffer is the compact stored context (layout::StoredZ); the 4-D form keeps the source-indexed z
+    const bool compact_z = saved_z.has_value() and saved_z->dim() == 1;
+    const std::string diag_suffix = (diag or lookahead or compact_z)
         ? std::format(",\n        false, {}, {}u{}", phase_trace_ptr != 0 ? "true" : "false", diag_ablate,
-                      lookahead ? ", true" : "") : std::string();
+                      compact_z ? std::format(", {}, true", lookahead ? "true" : "false") : (lookahead ? ", true" : ""))
+        : std::string();
     const std::string diag_name = (diag
         ? std::format("_diag_t{}_a{}", phase_trace_ptr != 0 ? 1 : 0, diag_ablate) : std::string()) +
-        (lookahead ? "_look" : "");
+        (lookahead ? "_look" : "") + (compact_z ? "_ctxz" : "");
     if (phase_trace_ptr != 0) {
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats_ptr == nullptr);
         cumulative_local_expert_recv_stats_ptr = reinterpret_cast<int*>(phase_trace_ptr);

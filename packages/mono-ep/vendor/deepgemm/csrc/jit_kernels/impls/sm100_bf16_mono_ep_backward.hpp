@@ -10,6 +10,7 @@
 #include <string>
 #include <torch/python.h>
 #include <deep_gemm/layout/moe_backward.cuh>
+#include <deep_gemm/layout/stored_z.cuh>
 #include "../../runtime/runtime.hpp"
 #include "../heuristics/mono_ep.hpp"
 #include "runtime_utils.hpp"
@@ -196,11 +197,11 @@ static void bf16_mono_ep_backward_launch(
     const uint32_t options = selected | (dw.has_value() ? 512u : 0u) | (dw_wide ? 1024u : 0u) |
         (saved_z.has_value() ? 4096u : 0u);
     if (saved_z.has_value()) {
-        // Stored forward context: the forward's z by source row, [ranks, max tokens, topk, 2I] BF16
-        check(*saved_z, torch::kBFloat16);
+        // Stored forward context, layout::StoredZ bytes (capacity in the device header)
+        check(*saved_z, torch::kUInt8);
         DG_HOST_ASSERT(not dw.has_value());
-        DG_HOST_ASSERT(saved_z->dim() == 4 and saved_z->size(0) == world and saved_z->size(1) == max_tokens and
-                       saved_z->size(2) == topk and saved_z->size(3) == 2 * inner);
+        DG_HOST_ASSERT(saved_z->dim() == 1 and static_cast<uint64_t>(saved_z->numel()) >=
+                       layout::stored_z_meta_bytes(world, max_tokens, topk));
     }
     DG_HOST_ASSERT(not (options & 64u) or (options & 1u));
     DG_HOST_ASSERT(pull <= hidden * 2 or (options & 8u));

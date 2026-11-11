@@ -5,6 +5,7 @@
 #include <pybind11/functional.h>
 
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/layout/stored_z.cuh>
 #include <deep_gemm/scheduler/mono_ep.cuh>
 
 #include "../runtime/runtime.hpp"
@@ -420,10 +421,17 @@ static void bf16_mono_ep(
     if (saved_z.has_value()) {
         DG_HOST_ASSERT(not shared_l1_weights_opt.has_value() and not activation_clamp_opt.has_value());
         DG_HOST_ASSERT(saved_z->is_cuda() and saved_z->device() == y.device() and saved_z->is_contiguous());
-        DG_HOST_ASSERT(saved_z->scalar_type() == torch::kBFloat16);
-        const auto [ranks, tokens, slots, width] = get_shape<4>(*saved_z);
-        DG_HOST_ASSERT(ranks == sym_buffer_ptrs.size() and tokens == num_max_tokens_per_rank);
-        DG_HOST_ASSERT(slots == num_topk and width == 2 * intermediate_hidden);
+        if (saved_z->dim() == 1) {
+            // Compact stored context (layout::StoredZ); the capacity lives in the device header
+            DG_HOST_ASSERT(saved_z->scalar_type() == torch::kUInt8);
+            DG_HOST_ASSERT(static_cast<uint64_t>(saved_z->numel()) >= layout::stored_z_meta_bytes(
+                sym_buffer_ptrs.size(), num_max_tokens_per_rank, num_topk));
+        } else {
+            DG_HOST_ASSERT(saved_z->scalar_type() == torch::kBFloat16);
+            const auto [ranks, tokens, slots, width] = get_shape<4>(*saved_z);
+            DG_HOST_ASSERT(ranks == sym_buffer_ptrs.size() and tokens == num_max_tokens_per_rank);
+            DG_HOST_ASSERT(slots == num_topk and width == 2 * intermediate_hidden);
+        }
     }
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;

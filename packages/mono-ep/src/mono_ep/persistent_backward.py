@@ -169,16 +169,18 @@ class NativePersistentBackward:
         )
 
     def _take_context(self, x, indices, scores, w1, w2):
-        from .runtime import context_key
+        from .stored_context import context_key
 
-        runtime = self.runtime
-        key, runtime._context_key = runtime._context_key, None
+        stored = self.runtime._stored
+        if stored is None:
+            return None
+        key, stored.key = stored.key, None
         if key is None or key != context_key(x, indices, scores, w1, w2):
             if key is not None:
                 self.context_misses += 1
             return None
         self.context_hits += 1
-        return runtime._context_z
+        return stored.buffer
 
     def precision(self):
         """``MONO_EP_SM100_BACKWARD_PRECISION``: ``bf16`` (default) or ``mxfp8`` (SM100 BF16 runtimes)."""
@@ -566,6 +568,8 @@ class NativePersistentBackward:
         else:
             dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)
             dw2 = weight_grad_bf16(dy_pool, h_pool, ends, None, self.experts, True)
+        if self.runtime._stored is not None:
+            self.runtime._stored.record_rows(self.counts)
         self.finished = torch.cuda.Event()
         self.finished.record(stream)
         return dx, ds.to(scores.dtype), dw1, dw2
@@ -580,6 +584,8 @@ class NativePersistentBackward:
         else:
             dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)
             dw2 = weight_grad_bf16(dy_pool, h_pool, ends, None, self.experts, True)
+        if self.runtime._stored is not None:
+            self.runtime._stored.record_rows(self.counts)
         self.finished = torch.cuda.Event()
         self.finished.record(stream)
         return dx, ds.to(scores.dtype), dw1, dw2
