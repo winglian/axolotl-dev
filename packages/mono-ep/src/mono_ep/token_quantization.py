@@ -313,21 +313,22 @@ def _mx_words(exponent):
 
 
 def mxfp8_weight_form_builder():
-    """``MONO_EP_SM100_MXFP8_WEIGHT_FORMS``: build the MXFP8 backward weight forms with the one-read
-    tile kernel (``fused``, default), one Inductor graph (``compiled``) or the Triton per-group
-    kernel (``triton``); all three are bitwise identical. ``MONO_EP_SM100_MXFP8_COMPILED_QUANT``
-    (``1`` compiled, ``0`` triton) is honoured when the new selector is unset."""
+    """``MONO_EP_SM100_MXFP8_WEIGHT_FORMS``: build the MXFP8 backward weight forms with the SM100
+    CUDA tile kernel (``cuda``, default), the Triton one-read tile kernel (``fused``), one Inductor
+    graph (``compiled``) or the Triton per-group kernel (``triton``); all four are bitwise
+    identical. ``MONO_EP_SM100_MXFP8_COMPILED_QUANT`` (``1`` compiled, ``0`` triton) is honoured
+    when the new selector is unset."""
     value = os.getenv("MONO_EP_SM100_MXFP8_WEIGHT_FORMS")
     if value is None:
         legacy = os.getenv("MONO_EP_SM100_MXFP8_COMPILED_QUANT")
         if legacy is None:
-            return "fused"
+            return "cuda"
         if legacy not in ("0", "1"):
             raise ValueError("MONO_EP_SM100_MXFP8_COMPILED_QUANT must be 0 or 1")
         return "compiled" if legacy == "1" else "triton"
-    if value not in ("fused", "compiled", "triton"):
+    if value not in ("cuda", "fused", "compiled", "triton"):
         raise ValueError(
-            "MONO_EP_SM100_MXFP8_WEIGHT_FORMS must be fused, compiled or triton"
+            "MONO_EP_SM100_MXFP8_WEIGHT_FORMS must be cuda, fused, compiled or triton"
         )
     return value
 

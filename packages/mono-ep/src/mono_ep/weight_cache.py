@@ -57,12 +57,15 @@ the same entries through :func:`cached_weight_forms`, so one key, epoch and inva
 the BF16 layouts and the FP8 quantizations alike.
 """
 
+import logging
 import os
 import weakref
 from collections import OrderedDict
 
 import torch
 from torch.optim.optimizer import register_optimizer_step_post_hook
+
+logger = logging.getLogger(__name__)
 
 _ENTRIES: OrderedDict = OrderedDict()
 _GENERATION = 0
@@ -407,13 +410,15 @@ def mxfp8_backward_weight_forms(w1, w2):
     from .token_quantization import mxfp8_weight_form_builder
 
     builder = mxfp8_weight_form_builder()
-    if builder == "fused":
+    if builder in ("cuda", "fused"):
         from .mx_weight_forms import fused_mx_backward_forms
 
+        tile_forms = fused_mx_backward_forms
+        if builder == "cuda":
+            tile_forms = _cuda_mx_forms_or_fused(w1)
+
         def build(missing):
-            return dict(
-                zip(MXFP8_BACKWARD_FORMS, fused_mx_backward_forms(w1, w2), strict=True)
-            )
+            return dict(zip(MXFP8_BACKWARD_FORMS, tile_forms(w1, w2), strict=True))
 
     elif builder == "compiled":
         triton_build = build
@@ -430,6 +435,31 @@ def mxfp8_backward_weight_forms(w1, w2):
         built = build(MXFP8_BACKWARD_FORMS)
         return tuple(built[name] for name in MXFP8_BACKWARD_FORMS)
     return cached_weight_forms(w1, w2, MXFP8_BACKWARD_FORMS, build)
+
+
+_CUDA_MX: dict = {}
+
+
+def _cuda_mx_forms_or_fused(w):
+    """The CUDA tile builder, or the Triton one off SM100 or when the extension fails to build
+    (logged once, counted in ``compile_fallbacks``)."""
+    from . import mx_weight_forms
+
+    function = _CUDA_MX.get("fn")
+    if function is None:
+        function = mx_weight_forms.fused_mx_backward_forms
+        if mx_weight_forms.cuda_forms_available(w.device):
+            try:
+                mx_weight_forms._extension()
+                function = mx_weight_forms.cuda_mx_backward_forms
+            except Exception as exc:  # noqa: BLE001
+                _STATS["compile_fallbacks"] += 1
+                logger.warning(
+                    "mono_ep: CUDA MXFP8 weight-form builder unavailable (%s); using the Triton builder",
+                    exc,
+                )
+        _CUDA_MX["fn"] = function
+    return function
 
 
 def _mx_weight_form(w):
