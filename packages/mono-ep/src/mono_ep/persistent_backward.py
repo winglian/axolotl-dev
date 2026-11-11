@@ -11,7 +11,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from . import workspace_bound
-from .dw import direct_dw, weight_grad
+from .dw import direct_dw, dw_precision, weight_grad
 from .ops import weight_grad_bf16, weight_grad_bf16_gpu_offsets
 
 OWNED_BLOCK_M = 128
@@ -582,7 +582,7 @@ class NativePersistentBackward:
             dw2 = weight_grad_bf16_gpu_offsets(
                 dy_pool, h_pool, self.starts, ends, expected_k
             )
-        elif direct_dw():
+        elif direct_dw() or dw_precision() != "bf16":
             dw1 = weight_grad(dz_pool, x_pool, ends, self.counts, self.experts)
             dw2 = weight_grad(dy_pool, h_pool, ends, self.counts, self.experts)
         else:
@@ -598,7 +598,7 @@ class NativePersistentBackward:
         """SM100 BF16 weight gradients from the BF16 pools (the MXFP8 backward dequantizes x and dy into them)."""
         x_pool, dy_pool, h_pool, dz_pool = self.pools[:4]
         ends = self.starts + self.counts
-        if direct_dw():
+        if direct_dw() or dw_precision() != "bf16":
             dw1 = weight_grad(dz_pool, x_pool, ends, self.counts, self.experts)
             dw2 = weight_grad(dy_pool, h_pool, ends, self.counts, self.experts)
         else:
