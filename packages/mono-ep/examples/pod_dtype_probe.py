@@ -54,6 +54,8 @@ def main():
             "expert_parallel_size: 2", f"expert_parallel_size: {ep}"
         )
         config += extra
+        if ep == 2:
+            config += "dp_shard_size: 2\n"
         path = work / f"config_{name}.yaml"
         path.write_text(config)
         env = {
