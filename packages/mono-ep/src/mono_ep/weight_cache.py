@@ -404,9 +404,18 @@ def mxfp8_backward_weight_forms(w1, w2):
                 )
         return built
 
-    from .token_quantization import compiled_mxfp8_enabled
+    from .token_quantization import mxfp8_weight_form_builder
 
-    if compiled_mxfp8_enabled():
+    builder = mxfp8_weight_form_builder()
+    if builder == "fused":
+        from .mx_weight_forms import fused_mx_backward_forms
+
+        def build(missing):
+            return dict(
+                zip(MXFP8_BACKWARD_FORMS, fused_mx_backward_forms(w1, w2), strict=True)
+            )
+
+    elif builder == "compiled":
         triton_build = build
 
         def build(missing):

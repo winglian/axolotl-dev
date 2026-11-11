@@ -312,10 +312,26 @@ def _mx_words(exponent):
     return e[..., 0] | (e[..., 1] << 8) | (e[..., 2] << 16) | (e[..., 3] << 24)
 
 
+def mxfp8_weight_form_builder():
+    """``MONO_EP_SM100_MXFP8_WEIGHT_FORMS``: build the MXFP8 backward weight forms with the one-read
+    tile kernel (``fused``, default), one Inductor graph (``compiled``) or the Triton per-group
+    kernel (``triton``); all three are bitwise identical. ``MONO_EP_SM100_MXFP8_COMPILED_QUANT``
+    (``1`` compiled, ``0`` triton) is honoured when the new selector is unset."""
+    value = os.getenv("MONO_EP_SM100_MXFP8_WEIGHT_FORMS")
+    if value is None:
+        legacy = os.getenv("MONO_EP_SM100_MXFP8_COMPILED_QUANT")
+        if legacy is None:
+            return "fused"
+        if legacy not in ("0", "1"):
+            raise ValueError("MONO_EP_SM100_MXFP8_COMPILED_QUANT must be 0 or 1")
+        return "compiled" if legacy == "1" else "triton"
+    if value not in ("fused", "compiled", "triton"):
+        raise ValueError(
+            "MONO_EP_SM100_MXFP8_WEIGHT_FORMS must be fused, compiled or triton"
+        )
+    return value
+
+
 def compiled_mxfp8_enabled():
-    """``MONO_EP_SM100_MXFP8_COMPILED_QUANT``: build the MXFP8 backward weight forms with one
-    Inductor graph (``1``, default) or the Triton per-group kernel (``0``); both are bitwise identical."""
-    value = os.getenv("MONO_EP_SM100_MXFP8_COMPILED_QUANT", "1")
-    if value not in ("0", "1"):
-        raise ValueError("MONO_EP_SM100_MXFP8_COMPILED_QUANT must be 0 or 1")
-    return value == "1"
+    """Whether the Inductor weight-form builder is selected (see :func:`mxfp8_weight_form_builder`)."""
+    return mxfp8_weight_form_builder() == "compiled"
