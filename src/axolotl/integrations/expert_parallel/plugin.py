@@ -1188,11 +1188,21 @@ class ExpertParallelPlugin(BasePlugin):
         ]
         lora_wrapped_experts = {_real_experts_base(pw) for pw in outer_expert_pws}
 
+        def _shard(module, **shard_kwargs):
+            # FSDP2 moves CPU-resident wrapper-subclass params (packed NVFP4 experts an EP
+            # scatter left on the CPU) by re-wrapping them in a fresh nn.Parameter, which
+            # defaults to trainable; restore the frozen flag.
+            frozen = {n for n, p in module.named_parameters() if not p.requires_grad}
+            fully_shard(module, **shard_kwargs)
+            for n, p in module.named_parameters():
+                if n in frozen and p.requires_grad:
+                    p.requires_grad_(False)
+
         wrapped = []
         for _name, module in _detect_experts_modules(model):
             if module in lora_wrapped_experts:
                 continue
-            fully_shard(module, **kwargs)
+            _shard(module, **kwargs)
             wrapped.append(module)
         from .nvfp4_lora import (
             active as nvfp4_lora_active,
@@ -1210,7 +1220,7 @@ class ExpertParallelPlugin(BasePlugin):
                 ignored = expert_params(_real_experts_base(pw))
                 move_frozen_experts(_real_experts_base(pw), dp_shard_mesh.device_type)
                 pw_kwargs = dict(kwargs, ignored_params=ignored)
-            fully_shard(pw, **pw_kwargs)
+            _shard(pw, **pw_kwargs)
             wrapped.append(pw)
 
         for module in wrapped:

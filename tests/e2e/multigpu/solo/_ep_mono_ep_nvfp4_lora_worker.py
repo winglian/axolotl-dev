@@ -184,7 +184,8 @@ def main():
         generator = torch.Generator(device="cuda").manual_seed(7)
         for name, parameter in model.named_parameters():
             if "lora_" in name:
-                parameter.data = parameter.data.float()
+                # PEFT sized them on the CPU experts; FSDP would move them anyway
+                parameter.data = parameter.data.float().cuda()
                 parameter.data.normal_(std=0.02, generator=generator)
         assert all("lora_" in n for n, p in model.named_parameters() if p.requires_grad)
         model._ep_lora_group = ep_group
@@ -220,7 +221,7 @@ def main():
                     )
         # FSDP swapped the parameters for DTensors: collect the adapters after wrapping
         adapters = {n: p for n, p in model.named_parameters() if p.requires_grad}
-        assert adapters and all("lora_" in n for n in adapters)
+        assert adapters and all("lora_" in n for n in adapters), sorted(adapters)
         optimizer = torch.optim.AdamW(adapters.values(), lr=1e-3)
         starts = {n: p.to_local().detach().clone() for n, p in adapters.items()}
         losses, grads, builds = [], [], []
