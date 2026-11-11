@@ -92,6 +92,12 @@ def main():
     )
     parser.add_argument("--no-nccl", action="store_true")
     parser.add_argument(
+        "--weight-dtype",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help="mono-ep expert weight dtype (bf16 = what FSDP2 bf16 mixed precision gathers; MoK reads BF16)",
+    )
+    parser.add_argument(
         "--no-bump",
         action="store_true",
         help="keep weight versions between iterations (weight-form caches hit, as within one optimizer step)",
@@ -143,12 +149,17 @@ def main():
         ids = ids.contiguous()
     scores = torch.rand(tokens, topk, device="cuda")
     scores = scores / scores.sum(-1, keepdim=True)
+    weight_dtype = torch.bfloat16 if args.weight_dtype == "bf16" else torch.float32
     w1 = (
-        torch.randn(local_experts, 2 * inner, hidden, device="cuda") / hidden**0.5
-    ).requires_grad_()
+        (torch.randn(local_experts, 2 * inner, hidden, device="cuda") / hidden**0.5)
+        .to(weight_dtype)
+        .requires_grad_()
+    )
     w2 = (
-        torch.randn(local_experts, hidden, inner, device="cuda") / inner**0.5
-    ).requires_grad_()
+        (torch.randn(local_experts, hidden, inner, device="cuda") / inner**0.5)
+        .to(weight_dtype)
+        .requires_grad_()
+    )
     dy = torch.randn_like(x) * hidden**-0.5
     x = x.requires_grad_()
     scores = scores.requires_grad_()
@@ -448,6 +459,7 @@ def main():
         variants={n: e for n, e in variants},
         launch_env=launch_env,
         no_bump=args.no_bump,
+        weight_dtype=args.weight_dtype,
         warmup=args.warmup,
         iters=args.iters,
         compiled=not args.no_compile,
