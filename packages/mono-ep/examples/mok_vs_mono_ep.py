@@ -39,6 +39,12 @@ SHAPES = {
     "30b": dict(tokens=16384, hidden=2048, intermediate=768, experts=128),
     "235b": dict(tokens=16384, hidden=4096, intermediate=1536, experts=128),
     "beam": dict(tokens=16384, hidden=5120, intermediate=2560, experts=256),
+    # shape-rule probes and other published MoE shapes (top-8; no MoK knobs, run with --mok "")
+    "h2048_i1536": dict(tokens=16384, hidden=2048, intermediate=1536, experts=128),
+    "h3072_i1024": dict(tokens=16384, hidden=3072, intermediate=1024, experts=128),
+    "h4096_i768": dict(tokens=16384, hidden=4096, intermediate=768, experts=128),
+    "glm5": dict(tokens=16384, hidden=6144, intermediate=2048, experts=256),
+    "kimi": dict(tokens=16384, hidden=7168, intermediate=2048, experts=384),
 }
 # fwd comm SMs, bwd comm SMs, minibatch (the 2026-11-10 8xB200 sweep picks)
 MOK_KNOBS = {
@@ -447,6 +453,17 @@ def main():
             getattr(native, "context_hits", None),
             getattr(native, "context_misses", None),
         ],
+        stored_context_rank0=(
+            None
+            if getattr(runtime, "_stored", None) is None
+            else dict(
+                capacity_rows=runtime._stored.capacity,
+                high_water_rows=runtime._stored.high_water,
+                grows=runtime._stored.grows,
+                auto_ok=runtime._stored.auto_ok,
+                buffer_bytes=runtime._stored.nbytes(),
+            )
+        ),
         timing="per case: synchronized host-wall span (and CUDA events), max over ranks, median over iterations; cases interleaved, order reversed every other iteration",
     )
     if rank == 0:
