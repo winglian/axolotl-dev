@@ -88,8 +88,13 @@ has the full contract.
 `precision="nvfp4_lora"` (SM100 only) trains BF16 LoRA adapters on frozen packed NVFP4 experts.
 Each optimizer step rebuilds the merged NVFP4 weights (base plus the scaled LoRA delta,
 requantized) in a `RequantCache`, and the persistent forward and backward run FP4 GEMMs on
-them. It is reachable only through the package API for now; Axolotl configs cannot select it.
-The construction below follows the validated EP8 timing harness
+them. Axolotl selects it with `expert_parallel_mono_ep_precision: nvfp4_lora` (or `auto`) on a
+modelopt NVFP4 checkpoint with `adapter: lora` on the experts
+([configuration.md](configuration.md), the precision table and
+`examples/expert_parallel/qwen3_30ba3b_nvfp4_lora_mono_ep.yaml`); its
+`expert_parallel/nvfp4_lora.py` maps PEFT's `target_parameters` layouts onto the adapters below,
+reads the checkpoint's `input_scale` tensors and invalidates the cache from a global optimizer
+post-step hook. The construction below follows the validated EP8 timing harness
 [`examples/benchmark_nvfp4_lora_b200.py`](../examples/benchmark_nvfp4_lora_b200.py), which calls
 `nvfp4_lora_moe` on the runtime's engine, the function `forward_lora` wraps:
 

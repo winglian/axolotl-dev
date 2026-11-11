@@ -26,13 +26,24 @@ need; the environment variables exist for experiments and for restoring a previo
 | `mxfp8` | no | yes |
 | `fp8` (blockwise E4M3 forward and backward, the kernels timed in [benchmarks.md](benchmarks.md)) | yes | no |
 | `fp8_bwd` (BF16 forward, FP8 backward) | not implemented | no |
-| `nvfp4_lora` (frozen packed NVFP4 experts with BF16 LoRA adapters; hidden and intermediate multiples of 256; native backward only, one host) | no | yes, package API only |
+| `nvfp4_lora` (frozen packed NVFP4 experts with BF16 LoRA adapters; hidden and intermediate multiples of 256; native backward only, one host) | no | yes |
 
-`nvfp4_lora` is reachable today only through the package API: `MonoEPRuntime(precision="nvfp4_lora")`
-and `MonoEPRuntime.forward_lora(...)` with a `mono_ep.nvfp4_lora.Nvfp4LoraExperts` base and
-`A1 / B1 / A2 / B2` adapters ([trl-integration.md](trl-integration.md#nvfp4-lora)). The Axolotl
-key `expert_parallel_mono_ep_precision` does not accept it, and an Axolotl `adapter:` falls back
-to `torch` (table below).
+`auto` resolves to `nvfp4_lora` on SM100 when the experts load as packed NVFP4 (a modelopt NVFP4
+checkpoint through the kernels plugin) and `adapter: lora` targets them; `nvfp4_lora` can also be
+set explicitly. It is the one precision that trains with an adapter: the config needs
+`use_sonicmoe: true` (the NVFP4 checkpoint loader and the expert-LoRA forward of the kernels
+plugin), `nvfp4_merge_aware: false` (merge-aware training is the SonicMoE path),
+`lora_dropout: 0` and `lora_target_parameters` on both `experts.gate_up_proj` and
+`experts.down_proj`
+([examples/expert_parallel/qwen3_30ba3b_nvfp4_lora_mono_ep.yaml](../../../examples/expert_parallel/qwen3_30ba3b_nvfp4_lora_mono_ep.yaml)).
+Each rank keeps its EP slice of the packed experts frozen and outside FSDP (the dp_shard peers
+hold the same slice), builds a transposed copy once, and rebuilds the merged NVFP4 weights after
+every optimizer step: per rank and layer that is about one extra copy of the local experts for the
+transposed base plus two for the merged cache (logged at the first forward). The checkpoint's
+`input_scale` tensors set the static activation scales; a weight-only export runs with scale 1
+and a warning. Only the adapter is saved; merging it into the NVFP4 base is `merge-lora` through
+the SonicMoE merge-aware path. The package API is `MonoEPRuntime(precision="nvfp4_lora")` and
+`forward_lora(...)` ([trl-integration.md](trl-integration.md#nvfp4-lora)).
 
 ### Fallback conditions
 
@@ -42,12 +53,13 @@ when:
 | Condition | Checked |
 |---|---|
 | the `mono_ep` package or its DeepGEMM build is missing | config load |
-| an adapter (`adapter: lora`, `qlora`, ...) is configured | config load |
+| an adapter is configured and the config does not qualify for `nvfp4_lora` (not `adapter: lora`, no `use_sonicmoe`, `lora_dropout > 0`, an expert projection missing from `lora_target_parameters`, `nvfp4_merge_aware` on, or a base that is not a modelopt NVFP4 checkpoint); `nvfp4_lora` without an adapter | config load |
 | quantized loading (`load_in_4bit`, `load_in_8bit`, `gptq`, `model_quantization_config`) | config load |
 | no CUDA, or a compute capability other than SM90 / SM100 | after model build |
-| `hidden_size % 256 != 0` or expert intermediate size `% 128 != 0` | after model build |
+| `hidden_size % 256 != 0` or expert intermediate size `% 128 != 0` (`% 256` for `nvfp4_lora`) | after model build |
 | expert biases, a non-SiLU gate, a custom `_apply_gate` (e.g. `alpha`), or a clamped SwiGLU (`limit` / `swiglu_limit`) | after model build |
 | experts not in HF `gate_up_proj [E, 2I, H]` / `down_proj [E, H, I]` layout, or MoE layers with different shapes | after model build |
+| with an adapter: experts that are not torchao `NVFP4Tensor`s with row-major block-16 scales and a per-expert per-tensor scale, or not SM100 | after model build |
 | the precision does not match the architecture | after model build |
 
 The Axolotl side (checkpointing policy, the FSDP mesh, the runtime's lifetime) is described

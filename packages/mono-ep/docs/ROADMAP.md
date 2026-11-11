@@ -20,15 +20,17 @@ the benchmark logs, outside the package.
   wide experts only) and direct-write weight gradients (default on); MXFP8 weight gradients with
   the fused weight forms and the row requantization (opt-in, with the MXFP8 backward).
 - NVFP4 LoRA on SM100 (frozen packed NVFP4 experts with LoRA adapters, CUDA requant, lean
-  recompute tail), through the package API.
+  recompute tail), through the package API and the Axolotl precision `nvfp4_lora` (PEFT
+  `lora_target_parameters` adapters on modelopt NVFP4 checkpoints, the requant cache's
+  optimizer hook, adapter-only checkpoints).
 - Axolotl backend `expert_parallel_backend: mono_ep` (fused and dispatch modes, fallback to
   `torch`), a TRL `SFTTrainer` example, validators and the benchmarks in
   [benchmarks.md](benchmarks.md).
 
 ## Next
 
-- Axolotl wiring for NVFP4 LoRA (a precision value, adapter handling, the requant cache's
-  optimizer hook), then NVFP4 full fine-tuning.
+- NVFP4 full fine-tuning (the LoRA wiring ships; the merged cache of the LoRA path is the
+  seam for it).
 - The backward: the gap to Mixture of Kittens at every B200 shape, and to the dispatch paths at
   the widest shapes, is in the backward's weight gradients and recompute.
 - Backward pools: after the bounds, 2.1 / 4.2 / 5.9 GB per rank of x / dy / h / dz pools remain

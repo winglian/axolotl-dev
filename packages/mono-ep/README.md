@@ -70,6 +70,11 @@ fsdp_config:
 axolotl train examples/expert_parallel/qwen3_30ba3b_ep_mono_ep_fft_8gpu.yaml
 ```
 
+LoRA on a packed NVFP4 checkpoint (SM100) is the same backend with `adapter: lora`,
+`use_sonicmoe: true` and `nvfp4_merge_aware: false`, which `auto` resolves to the
+`nvfp4_lora` precision:
+[`examples/expert_parallel/qwen3_30ba3b_nvfp4_lora_mono_ep.yaml`](../../examples/expert_parallel/qwen3_30ba3b_nvfp4_lora_mono_ep.yaml).
+
 Every config key, the precision matrix, the fallback conditions and every environment
 selector with its default and restore value are in [docs/configuration.md](docs/configuration.md).
 

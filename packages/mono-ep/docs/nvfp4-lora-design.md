@@ -352,11 +352,15 @@ in memory). `benchmarks.md` has the rebuild timings and the EP8 rows.
   chunked 8192 / 4096 / 2048), `MONO_EP_NVFP4_BACKWARD_RING_WAVES` (ring floor
   in waves of CTA pairs, default 1, 0 = forward sizing),
   `MONO_EP_NVFP4_LORA_WGRAD=loop` (per-expert adapter-gradient fallback).
-- Axolotl seam: `expert_parallel/args.py` precision literal, `plugin.py`
-  accepts a LoRA adapter only for `nvfp4_lora` on a packed NVFP4 base and
-  wires the requant cache + post-step hook, `experts_fn.py` passes the
-  adapter tensors; this is the last step and only after the kernels pass
-  parity.
+- Axolotl seam (shipped): `expert_parallel/args.py` precision literal,
+  `plugin.py` accepts a LoRA adapter only for `nvfp4_lora` on a packed NVFP4
+  base (`auto` resolves to it) and builds the per-process
+  `expert_parallel/nvfp4_lora.py` state (requant cache, global optimizer
+  post-step hook, per-layer `Nvfp4LoraExperts` over the loaded `NVFP4Tensor`
+  bytes, `input_scale` lookup), `fully_shard_experts` keeps the frozen base
+  out of FSDP with `ignored_params`, and `experts_fn.py` routes the fused
+  forward to `forward_lora` with the PEFT `target_parameters` adapters mapped
+  to `A1 / B1 / A2 / B2`.
 - Checkpoints without `input_scale` (weight-only NVFP4 exports) run with
   `pts = 1` and a warning; a calibration pass that derives them is a
   follow-up, not part of this round.
