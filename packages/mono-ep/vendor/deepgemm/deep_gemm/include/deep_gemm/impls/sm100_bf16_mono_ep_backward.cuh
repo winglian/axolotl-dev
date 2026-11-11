@@ -2107,6 +2107,8 @@ sm100_bf16_mono_ep_backward_impl(void* y,
 
                         // Store into shared memory
                         // NOTES: each lane provides its own address for stmatrix; 2 warps share a BF16 swizzle atom
+                        if constexpr (kDiagAblate & 256u)
+                            continue;
                         uint32_t row = lane_idx % 8;
                         uint32_t col = (warp_idx_in_wg % 2) * 4 + lane_idx / 8;
                         const auto smem_ptr = shared_storage.smem_d.l2[epilogue_wg_idx] +
@@ -2147,7 +2149,12 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                             (lane_idx % 16 / 8) * STORE_BLOCK_M * (kSwizzleCDMode / sizeof(d_dtype_t)) +
                             row_in_store * (kSwizzleCDMode / sizeof(d_dtype_t)) +
                             (bank_group_idx ^ row_in_atom) * (kNumBankGroupBytes / sizeof(d_dtype_t));
+                        if constexpr (kDiagAblate & 256u)
+                            continue;
                         const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+                        // Diagnostic: the TMEM loads and the smem staging without the NVLink stores
+                        if constexpr (kDiagAblate & 128u)
+                            continue;
 
                         // Write into remote
                         const auto dst_token = buffer.combine_token_buffer.get_rank_buffer(dst_topk_idx)
