@@ -273,6 +273,27 @@ all-to-all baselines in the same process its 2F+B is slower at the larger shapes
 | 235B-A22B | 14.27 | 17.12 |
 | Beam | 11.03 | 13.61 |
 
+## SM90 BF16 at the Beam shape (8xH100)
+
+`precision: bf16` (the SM90 `auto` precision) against the blockwise FP8 path above, both from
+one strict-H100 allocation (ap-wiPJGlhb3XTlfmuInQej7M, NVIDIA H100 80GB HBM3), one process per
+row, fused path only, 16,384 tokens per GPU, max-rank median ms over 15 iterations after 5
+warmups; peak allocated / reserved GiB per rank is the maximum over the four scopes:
+
+| Precision | Routing | Forward | Backward | F+B (no checkpoint) | (c) checkpointed 2F+B | Peak GiB allocated / reserved |
+|---|---|---:|---:|---:|---:|---:|
+| SM90 BF16 | balanced | 34.73 | 110.91 | 145.72 | 179.50 | 51.7 / 57.7 |
+| SM90 BF16 | skewed | 43.91 | 144.83 | 189.02 | 233.56 | 51.7 / 57.7 |
+| SM90 blockwise FP8 | balanced | 15.71 | 54.25 | 69.07 | 85.79 | 49.2 / 55.1 |
+| SM90 blockwise FP8 | skewed | 19.70 | 69.29 | 88.30 | 107.18 | 49.2 / 55.1 |
+
+The BF16 forward combine at hidden 5120 runs in four chunks per token (one or two at hidden
+2048 / 4096: the smallest chunk count whose three per-warp slots fit the reusable shared memory,
+`impls/mono_ep_combine.cuh`). Blockwise FP8 stays the Hopper path for this shape: the BF16
+kernels are 2.1-2.2x slower and hold 2.5 GiB more. In the same allocation the Qwen3-30B-A3B BF16
+rows were timed on both builds of the kernels (balanced (c) 33.34 / 33.34 ms, skewed 43.00 /
+42.97 ms, after / before), whose SASS is identical.
+
 ## Hopper backward GEMM roofline
 
 The three backward GEMMs alone on one H100 (prepacked, balanced, blockwise FP8), ms:
@@ -315,6 +336,10 @@ The three backward GEMMs alone on one H100 (prepacked, balanced, blockwise FP8),
   optimizer steps.
 - The SM90 kernels are byte-identical in SASS to the pre-integration build; the SM100 default
   backward differs only by the padded-tail zeroing before the dW GEMMs.
+- The SM90 BF16 forward at the Beam shape against an FP32 reference on 2xH100 (64 experts, top-8,
+  4,096 tokens per rank, balanced and skewed with rank 0's ring wrapping): relative L2 0.00186,
+  next to 0.00172 / 0.00181 at the Qwen3-30B-A3B / 235B-A22B shapes in the same job; the two
+  smaller shapes are bitwise equal to the build before the chunk rule and their SASS is identical.
 - The Axolotl parity test `tests/e2e/multigpu/test_ep_mono_ep.py` (EP2 x FSDP2 against the
   `torch` backend with optimizer steps).
 - Long-training convergence has only a loss-curve check: 2xH100, a 739M Qwen3-MoE, 300
