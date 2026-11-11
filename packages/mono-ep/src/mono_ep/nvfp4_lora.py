@@ -92,9 +92,11 @@ class Nvfp4LoraExperts:
     the requant of the merged weights for given LoRA factors.
 
     ``input_scale`` is the checkpoint's ``(pts_x, pts_h)`` pair for the static
-    activation quantization of the forward (``(1, 1)`` for weight-only exports).
-    The dy and dz operands of the backward are scaled per row by the kernel.
-    ``backend`` picks the requant kernel (:func:`requant_backend`).
+    activation quantization of the forward (``(1, 1)`` for weight-only exports):
+    floats shared by every expert, or ``[E]`` tensors with one scale per expert
+    (the kernels read the scale table per local expert). The dy and dz operands
+    of the backward are scaled per row by the kernel. ``backend`` picks the
+    requant kernel (:func:`requant_backend`).
     """
 
     def __init__(
@@ -130,7 +132,8 @@ class Nvfp4LoraExperts:
         if self.backend != "cuda_fused":
             self.q1t, self.s1t = self._transposed(self.q1, self.s1, self.pts1)
             self.q2t, self.s2t = self._transposed(self.q2, self.s2, self.pts2)
-        pts_x, pts_h = (float(v) for v in input_scale)
+        pts_x, pts_h = (self._per_expert(v, device) for v in input_scale)
+        self.pts_x, self.pts_h = pts_x, pts_h
         fwd = torch.zeros(self.experts, 8, device=device, dtype=torch.float32)
         fwd[:, 0] = 1.0 / (6.0 * pts_x)
         fwd[:, 1] = 1.0 / pts_x
@@ -156,21 +159,40 @@ class Nvfp4LoraExperts:
     def s1i(self):
         return self.s1.index_select(1, self.perm).contiguous()
 
+    def _per_expert(self, value, device):
+        """An ``[E]`` fp32 scale table from a float or a per-expert tensor."""
+        if isinstance(value, torch.Tensor):
+            value = value.detach().to(device=device, dtype=torch.float32).reshape(-1)
+            if value.numel() == 1:
+                value = value.expand(self.experts)
+            if value.numel() != self.experts:
+                raise ValueError(
+                    f"input_scale needs one value per expert ({self.experts}), "
+                    f"got {value.numel()}"
+                )
+            return value.contiguous()
+        return torch.full(
+            (self.experts,), float(value), device=device, dtype=torch.float32
+        )
+
     def _transposed(self, q, s, pts):
+        """``(packed [E, K, N/2], scale [E, K, N/16])`` of the transposed base, built
+        one expert at a time: the fp32 round trip of a whole Beam layer would be GBs."""
         e, n, k2 = q.shape
         k = 2 * k2
-        dq = self.requant.dequantize_nvfp4_packed_ref(
-            q.view(e * n, k2),
-            s.view(e * n, k2 // 8),
-            pts.repeat_interleave(n),
-            torch.float32,
-        ).view(e, n, k)
-        packed, scale = self.requant.quantize_nvfp4_packed_ref(
-            dq.transpose(1, 2).reshape(e * k, n), pts.repeat_interleave(k)
-        )
-        return packed.view(e, k, n // 2).contiguous(), scale.view(
-            e, k, n // 16
-        ).contiguous()
+        packed = torch.empty(e, k, n // 2, device=q.device, dtype=torch.uint8)
+        scale = torch.empty(e, k, n // 16, device=q.device, dtype=torch.float8_e4m3fn)
+        for i in range(e):
+            dq = self.requant.dequantize_nvfp4_packed_ref(
+                q[i], s[i], pts[i].expand(n), torch.float32
+            )
+            packed_i, scale_i = self.requant.quantize_nvfp4_packed_ref(
+                dq.t().contiguous(), pts[i].expand(k)
+            )
+            packed[i].copy_(packed_i)
+            scale[i].copy_(scale_i.view(torch.float8_e4m3fn))
+            del dq, packed_i, scale_i
+        return packed, scale
 
     def dequantized(self, result, pts):
         """``[E, N, K]`` fp32 of a requant result (the oracle's view of the kernel's bytes)."""
