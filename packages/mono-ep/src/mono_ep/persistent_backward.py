@@ -143,7 +143,7 @@ class NativePersistentBackward:
         self.finished = None
         self.context_hits = self.context_misses = 0
         self.dw_state = None
-        self._mx = None
+        self._mx = {}
 
     def inkernel_dw(self):
         """SM100 BF16: compute dW1/dW2 inside the persistent backward (``MONO_EP_SM100_INKERNEL_DW``)."""
@@ -192,9 +192,13 @@ class NativePersistentBackward:
         return value
 
     def _mx_resources(self):
-        """E4M3 transport buffers and pools, allocated on the first MXFP8 call (collective on the EP group)."""
-        if self._mx is not None:
-            return self._mx
+        """E4M3 transport buffers and pools, allocated on the first MXFP8 call (collective on the EP group).
+
+        The transport buffer carries the same owned-backward ring floor as the BF16 one
+        (``MONO_EP_BACKWARD_RING_WAVES``); each wave count seen gets its own set."""
+        ring_floor = owned_backward_ring_tokens(self.num_sms)
+        if ring_floor in self._mx:
+            return self._mx[ring_floor]
         import types
 
         import deep_gemm
@@ -208,6 +212,7 @@ class NativePersistentBackward:
             runtime.hidden,
             runtime.intermediate,
             mma_type="fp8xbf16",
+            num_min_ring_tokens=ring_floor,
         )
         capacity = buffer.num_max_tokens_per_rank
         if capacity != self.buffer.num_max_tokens_per_rank:
@@ -231,7 +236,7 @@ class NativePersistentBackward:
             torch.zeros(width // 128, self.worst_rows, device=device, dtype=torch.int32)
             for width in (runtime.hidden, runtime.hidden, 2 * runtime.intermediate)
         ]
-        self._mx = types.SimpleNamespace(
+        self._mx[ring_floor] = mx = types.SimpleNamespace(
             buffer=buffer,
             dy=dy,
             dy_pointers=dy_pointers,
@@ -239,7 +244,7 @@ class NativePersistentBackward:
             dy_sf_pointers=dy_sf_pointers,
             pools=pools,
         )
-        return self._mx
+        return mx
 
     def _backward_mxfp8(self, dy, x, indices, scores, w1, w2, stored_z=None):
         import deep_gemm
