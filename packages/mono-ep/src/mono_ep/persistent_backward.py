@@ -22,6 +22,8 @@ from .dw import (
 from .ops import weight_grad_bf16, weight_grad_bf16_gpu_offsets
 
 LOG = logging.getLogger("mono_ep")
+# Placeholder until mono-ep has its own repository
+ISSUES_URL = "https://github.com/axolotl-ai-cloud/axolotl/issues"
 
 OWNED_BLOCK_M = 128
 
@@ -224,15 +226,19 @@ class NativePersistentBackward:
         if value == "mxfp8" and self.runtime.hidden % 512:
             if explicit:
                 raise ValueError(
-                    f"The MXFP8 persistent backward requires hidden % 512 == 0 (hidden "
-                    f"{self.runtime.hidden}); set MONO_EP_SM100_BACKWARD_PRECISION=bf16"
+                    f"The MXFP8 persistent backward currently supports hidden sizes that are "
+                    f"multiples of 512 (hidden {self.runtime.hidden}); set "
+                    f"MONO_EP_SM100_BACKWARD_PRECISION=bf16, or open an issue at {ISSUES_URL} "
+                    f"if you need an odd multiple of 256"
                 )
             if not self._mx_fallback_logged:
                 self._mx_fallback_logged = True
                 LOG.warning(
-                    "mono_ep: hidden %d is not a multiple of 512, so the MXFP8 runtime's backward "
-                    "runs the BF16 persistent backward",
+                    "mono_ep: the MXFP8 persistent backward currently supports hidden sizes that "
+                    "are multiples of 512, so hidden %d runs the BF16 persistent backward; open an "
+                    "issue at %s if you need an odd multiple of 256",
                     self.runtime.hidden,
+                    ISSUES_URL,
                 )
             return "bf16"
         return value

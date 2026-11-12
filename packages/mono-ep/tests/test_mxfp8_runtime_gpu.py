@@ -119,5 +119,6 @@ def test_mxfp8_runtime_falls_back_to_bf16_backward_off_512(group, monkeypatch, c
         assert mx._peer_backward.precision() == "bf16"
         y, dx, _, _ = _step(mx, _inputs(hidden=768))
     assert "BF16 persistent backward" in caplog.text
+    assert "odd multiple of 256" in caplog.text
     assert torch.isfinite(dx.float()).all() and torch.isfinite(y.float()).all()
     mx.close()

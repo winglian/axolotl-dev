@@ -214,5 +214,5 @@ def test_sm100_backward_precision_follows_the_runtime(
 
 def test_sm100_explicit_mxfp8_backward_rejects_hidden_not_multiple_of_512(monkeypatch):
     monkeypatch.setenv("MONO_EP_SM100_BACKWARD_PRECISION", "mxfp8")
-    with pytest.raises(ValueError, match="hidden % 512"):
+    with pytest.raises(ValueError, match="multiples of 512"):
         _backward_precision("bf16", 2304)

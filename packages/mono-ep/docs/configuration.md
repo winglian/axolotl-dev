@@ -34,7 +34,9 @@ persistent backward. That backward recomputes the gate/up context (the MXFP8 for
 stored-context output, so `MONO_EP_STORED_CONTEXT` does not apply), keeps BF16 weight gradients
 unless `MONO_EP_SM100_DW_PRECISION=mxfp8` opts in to MXFP8 dW, and falls back to the BF16 fused
 persistent backward with one warning when `hidden % 512 != 0` (an explicit
-`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8` raises there instead). Its forward, backward and weight
+`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8` raises there instead): the MXFP8 backward currently
+supports hidden sizes that are multiples of 512, and if you need an odd multiple of 256, open an
+issue at https://github.com/axolotl-ai-cloud/axolotl/issues. Its forward, backward and weight
 gradients carry about 6-7 % relative error against an FP32 reference (BF16: 0.2 %); set
 `expert_parallel_mono_ep_precision: bf16` for the BF16 kernels.
 
