@@ -86,6 +86,25 @@ all-to-all restage of `x` and `dy` and grouped GEMMs), which is correct and slow
   launch it, and `torch.cuda._sleep(1)`, once before the timed loop.
   `CUDA_MODULE_LOADING=EAGER` can help confirm a suspected case but is not the fix: it does
   not cover Triton kernels, which load on first launch regardless.
+- **Compile on every rank before the first cross-rank wait.** A persistent kernel waits for
+  its peers inside the kernel and traps after 60 s (`comm/barrier.cuh`), and each rank
+  JIT-compiles it at its first call, so a rank that starts the kernel while a peer still
+  compiles (cold cache on one rank, a loaded host, a slow first step) traps once the gap
+  passes 60 s (`DeepGEMM grid sync timeout`, then 719). Concurrent compiles of one kernel
+  do not wait for each other: DeepJIT builds into a private directory and publishes with an
+  atomic rename, so every rank with a miss compiles. `mono_ep.prepare.launch` therefore
+  guards the first forward and the first backward launch of each runtime:
+  `deep_gemm._C.set_mono_ep_prepare_only(True)` makes the persistent entry points compile
+  and load their kernel and return before the launch, the ranks meet on the host (an
+  all-reduce read back with `.item()`), then the kernel launches. The first launch per
+  direction is the same collective instance on every rank, so the rendezvous is symmetric;
+  later variants (another token count's tile choice, the stored-context kernels) compile at
+  their first call without one, which only exposes that one compile's skew.
+  `MonoEPRuntime.prepare(num_tokens=..., weight_dtype=..., lora_rank=..., lora_dtype=...)`
+  runs one guarded forward and backward on synthetic inputs (private generator, weight
+  caches invalidated afterwards) and ends with one host barrier, so the first training
+  step compiles and loads nothing; the Axolotl seam calls it at train begin. It is
+  collective over the EP group and returns at once when repeated with the same arguments.
 
 ## Weight layout cache
 
