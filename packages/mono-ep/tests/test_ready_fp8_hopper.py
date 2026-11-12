@@ -81,6 +81,9 @@ def test_ready_grouped_fp8_hopper(counts, width, compiled):
     old_sms = deep_gemm.get_num_sms()
     deep_gemm.set_num_sms(32)
     try:
+        # Lazy module loading of a producer kernel waits for the spinning consumer to exit
+        publish[(2,)](queue)
+        torch.cuda._sleep(1)
         operation(*arguments)
         torch.cuda.synchronize()
         delayed = set(os.environ.get("ULTRA_FP8_DELAY", "all").split(","))
