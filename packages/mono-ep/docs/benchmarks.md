@@ -294,6 +294,11 @@ fused output (or the dispatch / combine ops) saved under SAC.
 | Beam | balanced | 27.88 / 23.96 | 30.54 / 26.43 | 54.07 / 50.92 | 48.51 / 36.50 | 55.35 / 43.40 | 16.8 / 22.1 / 62.8 | 1.78 / 1.33 |
 | Beam | skewed | 34.19 / 29.06 | 37.48 / 32.12 | 62.47 / 60.52 | 59.96 / 45.44 | 68.40 / 55.34 | 16.8 / 22.1 / 62.8 | |
 
+These rows predate the follow-ups (merge fused into the MXFP8 forms builder, Triton adapter-gradient
+kernels, E4M3 pools with lazy BF16 pools as the `mxfp8_lora` default). The shipped `mxfp8_lora`
+default on the same pod: SAC step 5.81 / 11.58 / 21.54 ms, 2F+B 7.32 / 14.11 / 25.62 ms, peak 1.92 /
+4.42 / 9.36 GiB per rank (30B-A3B / 235B-A22B / Beam, balanced).
+
 The fused LoRA step is 1.75-2.2x faster than the dispatch mode it replaces under SAC and uses a
 fifth to a quarter of its memory. Against the fused full fine-tune it costs the merge and the
 rank-r adapter GEMMs but skips the dW GEMMs: about +0.1-0.2 ms at 30B-A3B, where both are

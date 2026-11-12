@@ -203,10 +203,13 @@ selective activation checkpointing saves the fused output exactly as it does for
 `persistent_forward`.
 
 The adapter gradients default to two Triton passes on SM100 (`mono_ep.lora_grads`: rank-r
-projections per 128-row block, then FP32 row contractions per expert). `mxfp8_lora` can feed them
-the MXFP8 backward's E4M3 x / dy / dz pools instead of BF16 copies (`MONO_EP_LORA_MXFP8_POOLS=fp8`,
-opt-in): the E4M3 bytes are read as int32 words and each byte lane is its own K slice of the dot
-product, decoded by placing the byte's bits in an FP32 and two power-of-two multiplies.
+projections per 128-row block, then FP32 row contractions per expert). `mxfp8_lora` feeds them
+the MXFP8 backward's E4M3 x / dy / dz pools instead of BF16 copies by default
+(`MONO_EP_LORA_MXFP8_POOLS=fp8`; `bf16` restores the copies): the E4M3 bytes are read as int32 words
+and each byte lane is its own K slice of the dot product, decoded by placing the byte's bits in an
+FP32 and two power-of-two multiplies. With the lazy BF16 pools the copies are then never allocated
+(1.8 / 3.7 / 5.1 GiB per rank at the EP8 shapes, about 1 % step time at 30B-A3B / 235B-A22B), and
+the adapter gradients sit at the MXFP8 full fine-tune dW envelope.
 
 Declined: computing the rank-r projections in the backward epilogue. Of the four projections only
 `P1 = dZ B1` and `Q2 = H A2ᵀ` see their pool operand in an epilogue (the recompute epilogue holds

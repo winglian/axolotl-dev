@@ -493,3 +493,40 @@ def test_e4m3_pool_route_reads_the_dequantized_values(group, monkeypatch):
             for compiled in cache[0].values():
                 ttgir = compiled.asm["ttgir"]
                 assert "i8" not in ttgir and "f8E4M3" not in ttgir
+
+
+def test_mxfp8_lora_pool_modes_and_wgrad_routes(group, monkeypatch):
+    """mxfp8_lora defaults to the E4M3 pools (no BF16 x / dy / dz allocated); ``bf16`` restores the
+    BF16 copies and the grouped route; ``grouped`` on the E4M3 pools fails with the fix in the message."""
+    _require("mxfp8")
+    from mono_ep.lora import LoraExperts, MergedWeightCache
+
+    monkeypatch.setenv("MONO_EP_STORED_CONTEXT", "off")
+    monkeypatch.delenv("MONO_EP_LORA_MXFP8_POOLS", raising=False)
+    monkeypatch.delenv("MONO_EP_LORA_WGRAD", raising=False)
+    monkeypatch.delenv("MONO_EP_SM100_BF16_POOLS", raising=False)
+    tokens, topk = 256, 4
+    inputs = _inputs(tokens, topk)
+    runtime = _runtime(group, "mxfp8", tokens, topk)
+    native = runtime._peer_backward
+
+    def step():
+        adapters = [a.clone().requires_grad_() for a in inputs[5]]
+        cache = MergedWeightCache(mode="layer")
+        return _lora_step(
+            runtime, cache, LoraExperts(scaling=SCALING), inputs, adapters
+        )
+
+    _, dx_fp8, _, grads_fp8 = step()
+    assert all(native.pools[i].numel() == 0 for i in (0, 1, 3))
+    monkeypatch.setenv("MONO_EP_LORA_WGRAD", "grouped")
+    with pytest.raises(ValueError, match="MONO_EP_LORA_MXFP8_POOLS=bf16"):
+        step()
+    monkeypatch.setenv("MONO_EP_LORA_MXFP8_POOLS", "bf16")
+    _, dx_bf16, _, grads_bf16 = step()
+    assert all(native.pools[i].numel() > 0 for i in (0, 1, 3))
+    runtime.close()
+    assert torch.equal(dx_fp8, dx_bf16)
+    # dA2 / dB2 read h and dy, which both routes see identically up to rounding of the routes
+    for got, want in zip(grads_fp8[2:], grads_bf16[2:], strict=True):
+        assert rel(got, want) < 5e-3

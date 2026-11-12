@@ -314,10 +314,10 @@ def mxfp8_forms_mode():
 
 
 def mxfp8_pools_mode():
-    """``MONO_EP_LORA_MXFP8_POOLS``: ``bf16`` (default: the MXFP8 backward also writes BF16 x / dy /
-    dz copies for the adapter gradients) or ``fp8`` (it skips them and the adapter gradients read
-    the E4M3 pools, dz included, which the BF16 route reads before its E4M3 rounding)."""
-    value = os.environ.get("MONO_EP_LORA_MXFP8_POOLS", "bf16")
+    """``MONO_EP_LORA_MXFP8_POOLS``: ``fp8`` (default: the MXFP8 backward writes no BF16 x / dy / dz
+    copies and the Triton adapter-gradient kernels read the E4M3 pools, dz after its E4M3 rounding)
+    or ``bf16`` (it also writes BF16 copies, read by ``MONO_EP_LORA_WGRAD``'s route)."""
+    value = os.environ.get("MONO_EP_LORA_MXFP8_POOLS", "fp8")
     if value not in ("bf16", "fp8"):
         raise ValueError("MONO_EP_LORA_MXFP8_POOLS must be bf16 or fp8")
     return value
@@ -469,6 +469,12 @@ def lora_backward(
     mxfp8 = native.arch == 10 and not native.blockwise and native.precision() == "mxfp8"
     if mxfp8:
         fp8 = mxfp8_pools_mode() == "fp8"
+        if fp8 and wgrad_mode("triton") != "triton":
+            raise ValueError(
+                f"MONO_EP_LORA_WGRAD={wgrad_mode()} needs the BF16 pools; mxfp8_lora reads the "
+                "E4M3 pools with the Triton kernels by default, set MONO_EP_LORA_MXFP8_POOLS=bf16 "
+                "for the grouped or loop route"
+            )
         mx_forms = None
         if isinstance(merged, MergedMxfp8Forms):
             f = merged.forms
