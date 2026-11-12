@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Axolotl AI
 
-"""Fused LoRA on the SM100 BF16 and MXFP8 runtimes: adapter gradients against an FP32
-merge-aware reference (next to the full fine-tune dW envelope of the same runtime),
-frozen base, merged-weight rebuild per optimizer step, ring wrap and skewed routing."""
+"""Fused LoRA on the SM100 BF16 / MXFP8 and SM90 BF16 / blockwise FP8 runtimes: adapter
+gradients against an FP32 merge-aware reference (next to the full fine-tune dW envelope of
+the same runtime), frozen base, merged-weight rebuild per optimizer step, ring wrap and skewed routing."""
 
 import json
 
@@ -18,8 +18,11 @@ HIDDEN, INNER, EXPERTS, RANK, SCALING = 1024, 512, 8, 16, 2.0
 
 @pytest.fixture
 def group(tmp_path):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("the fused LoRA path is validated on SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (
+        9,
+        10,
+    ):
+        pytest.skip("the fused LoRA path needs SM90 or SM100")
     pytest.importorskip("deep_gemm")
     import torch.distributed as dist
 
@@ -32,6 +35,14 @@ def group(tmp_path):
     )
     yield dist.group.WORLD
     dist.destroy_process_group()
+
+
+ARCH_DTYPES = {9: ("bf16", "blockwise"), 10: ("bf16", "mxfp8")}
+
+
+def _require(dtype):
+    if dtype not in ARCH_DTYPES[torch.cuda.get_device_capability()[0]]:
+        pytest.skip(f"{dtype} does not run on this architecture")
 
 
 def _runtime(group, compute_dtype, tokens, topk):
@@ -149,6 +160,9 @@ CASES = [
     # more routed rows than the forward ring and the backward's one-wave ring floor
     ("bf16", 4096, 8, "skewed", "off"),
     ("mxfp8", 4096, 8, "balanced", "off"),
+    ("blockwise", 256, 4, "balanced", "off"),
+    ("blockwise", 256, 4, "skewed", "off"),
+    ("blockwise", 4096, 8, "skewed", "off"),
 ]
 
 
@@ -158,6 +172,7 @@ def test_lora_grads_match_fp32_reference(
 ):
     from mono_ep.lora import LoraExperts, MergedWeightCache
 
+    _require(dtype)
     monkeypatch.setenv("MONO_EP_STORED_CONTEXT", stored)
     if tokens > 1024:
         monkeypatch.setenv("MONO_EP_FORWARD_RING_ROWS", "8192")
@@ -199,7 +214,7 @@ def test_lora_grads_match_fp32_reference(
     assert errs["dx"] < (2e-2 if dtype == "bf16" else 0.1), errs
 
 
-@pytest.mark.parametrize("dtype", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "blockwise"])
 def test_base_frozen_and_merge_rebuilt_per_step(group, monkeypatch, dtype):
     from mono_ep.lora import (
         LoraExperts,
@@ -208,6 +223,7 @@ def test_base_frozen_and_merge_rebuilt_per_step(group, monkeypatch, dtype):
         merge,
     )
 
+    _require(dtype)
     monkeypatch.setenv("MONO_EP_STORED_CONTEXT", "off")
     tokens, topk = 256, 4
     inputs = _inputs(tokens, topk)
@@ -237,3 +253,93 @@ def test_base_frozen_and_merge_rebuilt_per_step(group, monkeypatch, dtype):
     assert not w1.requires_grad and w1.grad is None and w2.grad is None
     assert not torch.equal(outputs[0], outputs[1])
     assert not torch.equal(outputs[1], outputs[2])
+
+
+def _stack(runtime, cache, layers, inputs, adapters, checkpoint_policy=None):
+    """``len(layers)`` MoE layers in sequence on one runtime, each with its own adapters."""
+    import functools
+
+    from mono_ep.lora import lora_moe
+    from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
+
+    x, ids, scores, w1, w2, _, dy = inputs
+    h = x.clone().requires_grad_()
+    out = h
+    for layer, factors in zip(layers, adapters, strict=True):
+
+        def run(t, layer=layer, factors=factors):
+            return lora_moe(t, ids, scores, w1, w2, *factors, runtime, layer, cache)
+
+        if checkpoint_policy is None:
+            out = run(out)
+        else:
+            out = checkpoint(
+                run,
+                out,
+                use_reentrant=False,
+                context_fn=functools.partial(
+                    create_selective_checkpoint_contexts, checkpoint_policy
+                ),
+            )
+    out.backward(dy)
+    torch.cuda.synchronize()
+    return out.detach(), h.grad, [[a.grad for a in f] for f in adapters]
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "blockwise"])
+def test_layer_cache_eviction_and_sac(group, monkeypatch, dtype):
+    import mono_ep.runtime as runtime_mod
+    from mono_ep.lora import LoraExperts, MergedWeightCache
+    from torch.utils.checkpoint import CheckpointPolicy
+
+    _require(dtype)
+    monkeypatch.setenv("MONO_EP_STORED_CONTEXT", "off")
+    tokens, topk = 256, 4
+    inputs = _inputs(tokens, topk)
+    runtime = _runtime(group, dtype, tokens, topk)
+    layers = [LoraExperts(scaling=SCALING) for _ in range(3)]
+
+    def fresh_adapters():
+        return [
+            [(a * (1 + 0.1 * i)).clone().requires_grad_() for a in inputs[5]]
+            for i in range(3)
+        ]
+
+    # every layer's forms held across the step: the reference
+    all_cache = MergedWeightCache(mode="all")
+    y_ref, dx_ref, grads_ref = _stack(
+        runtime, all_cache, layers, inputs, fresh_adapters()
+    )
+    # two layers resident: the first layer's backward rebuilds its evicted merge
+    layer_cache = MergedWeightCache(mode="layer")
+    y, dx, grads = _stack(runtime, layer_cache, layers, inputs, fresh_adapters())
+    assert layer_cache.evictions >= 1 and layer_cache.backward_builds >= 1
+    assert torch.equal(y, y_ref) and torch.equal(dx, dx_ref)
+    for got, want in zip(sum(grads, []), sum(grads_ref, []), strict=True):
+        assert rel(got, want) < 1e-3
+
+    # SAC saves the fused LoRA forward: its recompute does not launch it again
+    calls = []
+    forward_impl = runtime_mod._forward_impl
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return forward_impl(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_mod, "_forward_impl", counting)
+    saved = {torch.ops.mono_ep.lora_forward.default}
+
+    def policy(ctx, op, *args, **kwargs):
+        if op in saved:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    sac_cache = MergedWeightCache(mode="layer")
+    y_sac, dx_sac, grads_sac = _stack(
+        runtime, sac_cache, layers, inputs, fresh_adapters(), checkpoint_policy=policy
+    )
+    runtime.close()
+    assert len(calls) == 3
+    assert torch.equal(y_sac, y_ref) and torch.equal(dx_sac, dx_ref)
+    for got, want in zip(sum(grads_sac, []), sum(grads_ref, []), strict=True):
+        assert rel(got, want) < 1e-3
