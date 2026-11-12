@@ -33,7 +33,8 @@ rows from an earlier launch, possibly non-finite, would otherwise reach dW as 0 
 (`MONO_EP_SM90_FP8_TAIL_SCHEDULE`) so the CTA tail is short.
 
 On SM90 FP8 the x/dy transport, the dX combine and the weight-gradient operands are all E4M3
-with 128-element scale groups (1x128 activations, 128x128 weights); outputs are BF16 and
+with 128-element scale groups (1x128 activations, 128x128 weights; `MONO_EP_SM90_FP8_TRANSPORT=0`
+keeps the transport and combine BF16); outputs are BF16 and
 weight gradients come back in the master dtype. The SM100 BF16 backward uses two-CTA pairs,
 a six-stage pipeline with two-row pulls, and a recompute SwiGLU-derivative epilogue that
 emits `h`, `dz` and the score partials without storing `z`. An opt-in MXFP8 variant

@@ -343,3 +343,34 @@ def test_sm100_dw_precision_rejects_unknown_values(monkeypatch):
     monkeypatch.setenv("MONO_EP_SM100_DW_PRECISION", "fp8")
     with pytest.raises(ValueError, match="bf16 or mxfp8"):
         resolve_dw_precision("mxfp8", "mxfp8")
+
+
+@pytest.mark.parametrize(
+    "transport,combine,expected",
+    [
+        (None, None, (True, True)),
+        ("1", None, (True, True)),
+        ("0", None, (False, False)),
+        ("1", "0", (True, False)),
+        ("0", "0", (False, False)),
+        ("0", "1", "requires SM90 FP8 transport"),
+        ("2", None, "TRANSPORT must be 0 or 1"),
+        (None, "yes", "COMBINE must be 0 or 1"),
+    ],
+)
+def test_sm90_fp8_transport_defaults(monkeypatch, transport, combine, expected):
+    from mono_ep.persistent_backward import sm90_fp8_transport
+
+    for name, value in (
+        ("MONO_EP_SM90_FP8_TRANSPORT", transport),
+        ("MONO_EP_SM90_FP8_COMBINE", combine),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
+            sm90_fp8_transport()
+    else:
+        assert sm90_fp8_transport() == expected

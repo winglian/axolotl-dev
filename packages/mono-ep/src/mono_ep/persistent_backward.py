@@ -70,6 +70,21 @@ def owned_backward_ring_tokens(
     return waves * (num_sms // ctas_per_cluster) * OWNED_BLOCK_M
 
 
+def sm90_fp8_transport():
+    """``(transport, combine)`` for the SM90 blockwise backward: E4M3 x/dy transport and E4M3
+    dX combine, both on by default. ``MONO_EP_SM90_FP8_TRANSPORT=0`` restores BF16 transport
+    (and with it the BF16 combine); ``MONO_EP_SM90_FP8_COMBINE=0`` keeps only the combine BF16."""
+    transport = os.getenv("MONO_EP_SM90_FP8_TRANSPORT", "1")
+    if transport not in ("0", "1"):
+        raise ValueError("MONO_EP_SM90_FP8_TRANSPORT must be 0 or 1")
+    combine = os.getenv("MONO_EP_SM90_FP8_COMBINE", transport)
+    if combine not in ("0", "1"):
+        raise ValueError("MONO_EP_SM90_FP8_COMBINE must be 0 or 1")
+    if combine == "1" and transport == "0":
+        raise ValueError("SM90 FP8 combine requires SM90 FP8 transport")
+    return transport == "1", combine == "1"
+
+
 class NativePersistentBackward:
     ready_gather = False
     fused_peer_return = True
@@ -82,16 +97,9 @@ class NativePersistentBackward:
             "bf16_mono_ep_backward_sm90" if self.arch == 9 else "bf16_mono_ep_backward"
         )
         self.blockwise = runtime.compute_dtype == "blockwise"
-        transport = os.getenv("MONO_EP_SM90_FP8_TRANSPORT")
-        if transport not in (None, "0", "1"):
-            raise ValueError("MONO_EP_SM90_FP8_TRANSPORT must be 0 or 1")
-        self.fp8_transport = self.blockwise and transport == "1"
-        combine = os.getenv("MONO_EP_SM90_FP8_COMBINE")
-        if combine not in (None, "0", "1"):
-            raise ValueError("MONO_EP_SM90_FP8_COMBINE must be 0 or 1")
-        self.fp8_combine = self.blockwise and combine == "1"
-        if self.fp8_combine and not self.fp8_transport:
-            raise ValueError("SM90 FP8 combine requires SM90 FP8 transport")
+        transport, combine = sm90_fp8_transport()
+        self.fp8_transport = self.blockwise and transport
+        self.fp8_combine = self.blockwise and combine
         if self.blockwise:
             if self.arch != 9:
                 raise ValueError("Native blockwise FP8 requires SM90")

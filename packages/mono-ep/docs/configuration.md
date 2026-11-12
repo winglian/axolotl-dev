@@ -155,7 +155,7 @@ before it was made the default; setting that value restores the previous behavio
 | `MONO_EP_SM90_FP8_WEIGHT_CACHE` | `1` | `0` | SM90 FP8: cache the quantized weight forms per optimizer step. |
 | `MONO_EP_SM90_FP8_FUSED_PREP` | `1` | `0` | SM90 FP8: fused token quantization and prefix preparation. |
 | `MONO_EP_SM90_FP8_FUSED_WEIGHT_QUANT` | `1` | `0` | SM90 FP8: one launch for the per-expert transpose, scale reduction and FP8 conversion of the weights. |
-| `MONO_EP_SM90_FP8_TRANSPORT`, `MONO_EP_SM90_FP8_COMBINE` | unset (BF16) | | SM90 FP8 backward: FP8 x/dy transport and FP8 dX combine; the benchmarks set both to `1`. |
+| `MONO_EP_SM90_FP8_TRANSPORT`, `MONO_EP_SM90_FP8_COMBINE` | `1` (the combine follows the transport) | `0` (BF16) | SM90 blockwise FP8 backward (`fp8`, `fp8_lora`): E4M3 x/dy transport and E4M3 dX combine. `MONO_EP_SM90_FP8_TRANSPORT=0` restores BF16 transport and combine; `MONO_EP_SM90_FP8_COMBINE=0` keeps only the combine BF16. The combine needs the transport. BF16 runtimes ignore both. |
 | `MONO_EP_SM90_FP8_FORWARD_STAGES` | `5` | `2`..`4` | SM90 FP8 forward TMA pipeline stages. |
 | `MONO_EP_SM90_FP8_BACKWARD_STAGES` | `3` | `0`..`8` | SM90 FP8 backward stages with the cached-dZ layout. |
 | `MONO_EP_SM90_FP8_FORWARD_MAINLOOP` | `1` | `0` | Forward mainloop variant (register allocation and accumulator handling). |

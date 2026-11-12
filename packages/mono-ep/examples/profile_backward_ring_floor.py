@@ -31,16 +31,20 @@ VARIANTS = {
     10: {"bf16": ("bf16", {})},
     9: {
         "bf16": ("bf16", {}),
-        "blockwise": ("blockwise", {}),
+        "blockwise": ("blockwise", {"MONO_EP_SM90_FP8_TRANSPORT": "0"}),
         "blockwise_fp8_transport": (
             "blockwise",
-            {"MONO_EP_SM90_FP8_TRANSPORT": "1"},
+            {"MONO_EP_SM90_FP8_TRANSPORT": "1", "MONO_EP_SM90_FP8_COMBINE": "0"},
         ),
     },
 }
 WAVES = (0, 1, 2, 3)
 WARMUP, SAMPLES = 5, 15
-ENV_KEYS = ("MONO_EP_BACKWARD_RING_WAVES", "MONO_EP_SM90_FP8_TRANSPORT")
+ENV_KEYS = (
+    "MONO_EP_BACKWARD_RING_WAVES",
+    "MONO_EP_SM90_FP8_TRANSPORT",
+    "MONO_EP_SM90_FP8_COMBINE",
+)
 
 
 def timed(fn):

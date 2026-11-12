@@ -26,8 +26,11 @@ from validate_nvfp4_forward import routing  # noqa: E402
 WARMUP, SAMPLES = 5, 15
 DTYPES = {
     "bf16": ("bf16", {}),
-    "blockwise": ("blockwise", {}),
-    "blockwise_fp8_transport": ("blockwise", {"MONO_EP_SM90_FP8_TRANSPORT": "1"}),
+    "blockwise": ("blockwise", {"MONO_EP_SM90_FP8_TRANSPORT": "0"}),
+    "blockwise_fp8_transport": (
+        "blockwise",
+        {"MONO_EP_SM90_FP8_TRANSPORT": "1", "MONO_EP_SM90_FP8_COMBINE": "0"},
+    ),
 }
 
 

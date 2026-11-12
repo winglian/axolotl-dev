@@ -39,6 +39,7 @@ def run():
     runtimes = []
     for enabled in ("0", "1"):
         os.environ["MONO_EP_SM90_FP8_TRANSPORT"] = enabled
+        os.environ["MONO_EP_SM90_FP8_COMBINE"] = "0"
         runtimes.append(
             PersistentMoE(
                 dist.group.WORLD,

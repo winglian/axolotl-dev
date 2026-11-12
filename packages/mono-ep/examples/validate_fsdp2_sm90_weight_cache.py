@@ -237,9 +237,8 @@ def main():
         raise RuntimeError(f"expected H100 or H200, got {torch.cuda.get_device_name()}")
     dist.init_process_group("nccl", device_id=device)
     world = dist.get_world_size()
-    os.environ.setdefault("MONO_EP_SM90_FP8_TRANSPORT", "1")
-    os.environ.setdefault("MONO_EP_SM90_FP8_COMBINE", "1")
     import deep_gemm
+    from mono_ep.persistent_backward import sm90_fp8_transport
     from mono_ep.runtime import PersistentMoE
 
     physical = torch.cuda.get_device_properties(device).multi_processor_count
@@ -280,6 +279,7 @@ def main():
             env_defaults_overridden={
                 k: v for k, v in os.environ.items() if k.startswith("MONO_EP_")
             },
+            fp8_transport_combine=sm90_fp8_transport(),
             tokens_per_rank=args.tokens,
             steps=args.steps,
             lr=args.lr,
