@@ -265,8 +265,8 @@ def _dw_precision(compute_dtype, hidden):
 @pytest.mark.parametrize(
     "compute_dtype,backward_env,hidden,dw_env,defaults,expected",
     [
-        # shipped defaults: BF16 dW on both runtimes
-        ("mxfp8", None, 2048, None, {}, "bf16"),
+        # shipped defaults: MXFP8 dW on the MXFP8 runtime, BF16 dW on the BF16 runtime
+        ("mxfp8", None, 2048, None, {}, "mxfp8"),
         ("bf16", "mxfp8", 2048, None, {}, "bf16"),
         ("bf16", None, 2048, None, {}, "bf16"),
         # the explicit selector wins in both directions
@@ -303,11 +303,11 @@ def test_sm100_dw_precision_resolution(
     assert _dw_precision(compute_dtype, hidden) == expected
 
 
-def test_sm100_dw_precision_defaults_stay_bf16():
+def test_sm100_dw_precision_defaults():
     pytest.importorskip("triton")
     from mono_ep.dw import MXFP8_BACKWARD_DW_DEFAULTS
 
-    assert MXFP8_BACKWARD_DW_DEFAULTS == {"bf16": "bf16", "mxfp8": "bf16"}
+    assert MXFP8_BACKWARD_DW_DEFAULTS == {"bf16": "bf16", "mxfp8": "mxfp8"}
 
 
 def test_sm100_dw_precision_rejects_unknown_values(monkeypatch):

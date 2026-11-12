@@ -31,7 +31,7 @@ def direct_dw():
 # dW precision of the SM100 MXFP8 persistent backward when ``MONO_EP_SM100_DW_PRECISION`` is unset,
 # by the runtime's compute dtype (``mxfp8`` is ``precision: mxfp8``, ``bf16`` the BF16 runtime with
 # ``MONO_EP_SM100_BACKWARD_PRECISION=mxfp8``)
-MXFP8_BACKWARD_DW_DEFAULTS = {"bf16": "bf16", "mxfp8": "bf16"}
+MXFP8_BACKWARD_DW_DEFAULTS = {"bf16": "bf16", "mxfp8": "mxfp8"}
 
 
 def dw_precision_override():
