@@ -491,6 +491,15 @@ struct MonoEPScheduler {
             #pragma unroll
             for (uint32_t i = 0; i < kNumLocalityDomains; ++ i)
                 while (ptx::ld_volatile(workspace.get_l1_task_count_ptr() + i) < num_required_l1_tasks) {}
+
+            // `l2_full_mask` only carries the slot generation's parity: an L2 task that starts while L1 of the block
+            // one ring generation back is unfinished reads the mask two generations stale as ready. The gate lets
+            // that happen, so hold the task until that L1 block has finished (it was claimed earlier, no deadlock)
+            const uint32_t generation_idx = task_info.pool_block_idx / kNumRingBlocks;
+            if (generation_idx > 0) {
+                const auto empty_ptr = workspace.get_l1_empty_count_ptr(task_info.pool_block_idx % kNumRingBlocks);
+                while (ptx::ld_acq(empty_ptr) < generation_idx * kNumL1BlockNs) {}
+            }
             return task_info;
         }
         return task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0);
