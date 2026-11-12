@@ -215,18 +215,27 @@ def run_case(args, case, mesh, flat, runner_factory, device):
 
         weight_cache.weight_layouts = frozen_layouts
     original_mx_forms = getattr(weight_cache, "mxfp8_backward_weight_forms", None)
+    original_mx_forward = getattr(weight_cache, "mxfp8_forward_weight_forms", None)
     if case.get("freeze_mx"):
         frozen_mx = {}
 
-        def frozen_mx_forms(w1, w2):
-            key = (w1.untyped_storage()._cdata, w2.untyped_storage()._cdata)
-            if key not in frozen_mx:
-                frozen_mx[key] = tuple(
-                    tuple(t.clone() for t in form) for form in original_mx_forms(w1, w2)
-                )
-            return frozen_mx[key]
+        def freezer(original, tag):
+            def frozen_mx_forms(w1, w2):
+                key = (tag, w1.untyped_storage()._cdata, w2.untyped_storage()._cdata)
+                if key not in frozen_mx:
+                    frozen_mx[key] = tuple(
+                        tuple(t.clone() for t in form) for form in original(w1, w2)
+                    )
+                return frozen_mx[key]
 
-        weight_cache.mxfp8_backward_weight_forms = frozen_mx_forms
+            return frozen_mx_forms
+
+        weight_cache.mxfp8_backward_weight_forms = freezer(original_mx_forms, "bwd")
+        if original_mx_forward is not None:
+            # the MXFP8 runtime's forward reads its forms from the same cache
+            weight_cache.mxfp8_forward_weight_forms = freezer(
+                original_mx_forward, "fwd"
+            )
     ep, dp = mesh["ep"].size(), mesh["dp_shard"].size()
     local = EXPERTS // ep
     ep_rank, dp_rank = mesh["ep"].get_local_rank(), mesh["dp_shard"].get_local_rank()
@@ -360,6 +369,8 @@ def run_case(args, case, mesh, flat, runner_factory, device):
     weight_cache.weight_layouts = original_layouts
     if original_mx_forms is not None:
         weight_cache.mxfp8_backward_weight_forms = original_mx_forms
+        if original_mx_forward is not None:
+            weight_cache.mxfp8_forward_weight_forms = original_mx_forward
     if hasattr(weight_cache, "set_weight_cache_epoch"):
         weight_cache.set_weight_cache_epoch(None)
     for k, v in saved_env.items():
@@ -529,9 +540,15 @@ def main():
     parser.add_argument("--only", default="")
     parser.add_argument(
         "--precision",
+        choices=("bf16", "mxfp8", "default"),
+        default="bf16",
+        help="MONO_EP_SM100_BACKWARD_PRECISION for every case; default leaves it unset",
+    )
+    parser.add_argument(
+        "--compute-dtype",
         choices=("bf16", "mxfp8"),
         default="bf16",
-        help="MONO_EP_SM100_BACKWARD_PRECISION for every case",
+        help="runtime compute dtype (mxfp8: the MXFP8 forward with its fused MXFP8 backward)",
     )
     parser.add_argument(
         "--reserved-sms",
@@ -541,7 +558,10 @@ def main():
     )
     args = parser.parse_args()
     fused = args.backend == "fused"
-    os.environ["MONO_EP_SM100_BACKWARD_PRECISION"] = args.precision
+    if args.precision == "default":
+        os.environ.pop("MONO_EP_SM100_BACKWARD_PRECISION", None)
+    else:
+        os.environ["MONO_EP_SM100_BACKWARD_PRECISION"] = args.precision
     rank = int(os.environ.get("LOCAL_RANK", "0"))
     if fused:
         torch.cuda.set_device(rank)
@@ -573,7 +593,7 @@ def main():
             TOPK,
             HIDDEN,
             INNER,
-            compute_dtype="bf16",
+            compute_dtype=args.compute_dtype,
             fuse_activation=True,
             backward_backend="native",
             reserved_sms=args.reserved_sms,
@@ -632,6 +652,7 @@ def main():
                     tolerance=args.tolerance,
                     reserved_sms=args.reserved_sms,
                     backward_precision=args.precision,
+                    compute_dtype=args.compute_dtype,
                     nccl_max_ctas=os.environ.get("NCCL_MAX_CTAS"),
                     inkernel_dw=os.environ.get("MONO_EP_SM100_INKERNEL_DW", "0"),
                     cases=outputs,

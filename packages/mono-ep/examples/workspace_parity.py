@@ -23,7 +23,9 @@ from mok_vs_mono_ep import SHAPES, _skewed_routing
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
-    parser.add_argument("--dtype", choices=("bf16", "blockwise"), default="bf16")
+    parser.add_argument(
+        "--dtype", choices=("bf16", "blockwise", "mxfp8"), default="bf16"
+    )
     args = parser.parse_args()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)

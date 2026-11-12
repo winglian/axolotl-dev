@@ -104,6 +104,12 @@ def main():
     )
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument(
+        "--compute-dtype",
+        choices=("bf16", "mxfp8"),
+        default="bf16",
+        help="mono-ep runtime precision (mxfp8: MXFP8 forward with the fused MXFP8 backward)",
+    )
+    parser.add_argument(
         "--reference", action="store_true", help="FP32 reference parity"
     )
     parser.add_argument("--tokens", type=int, default=0, help="override tokens per GPU")
@@ -179,7 +185,7 @@ def main():
         topk,
         hidden,
         inner,
-        compute_dtype="bf16",
+        compute_dtype=args.compute_dtype,
         fuse_activation=True,
         retain_activations=False,
         reserved_sms=reserved_sms,
@@ -472,6 +478,7 @@ def main():
         launch_env=launch_env,
         no_bump=args.no_bump,
         weight_dtype=args.weight_dtype,
+        compute_dtype=args.compute_dtype,
         reserved_sms=reserved_sms,
         warmup=args.warmup,
         iters=args.iters,
