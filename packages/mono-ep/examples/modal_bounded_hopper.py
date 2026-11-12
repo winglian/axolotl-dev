@@ -79,13 +79,15 @@ def _run(args, nproc, extra_env, timeout=1800):
     )
 
 
-def _suite(shapes, dtypes, parts):
+def _suite(shapes, dtypes, parts, expected):
+    import torch
+
+    devices = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+    if not all(expected in name for name in devices):
+        return dict(returncode=2, devices=devices, runs=[], error="wrong devices")
     runs = []
     for dtype in dtypes.split(","):
         for shape in shapes.split(","):
-            # The SM90 BF16 forward does not compile at hidden 5120
-            if dtype == "bf16" and shape == "beam":
-                continue
             if "parity" in parts:
                 runs.append(
                     _run(
@@ -135,17 +137,19 @@ def _suite(shapes, dtypes, parts):
                     2400,
                 )
             )
-    return dict(returncode=max(r["returncode"] for r in runs), runs=runs)
+    return dict(
+        returncode=max(r["returncode"] for r in runs), devices=devices, runs=runs
+    )
 
 
 @app.function(image=image, gpu="H100!:8", cpu=32, memory=262144, timeout=10800)
 def suite_h100(shapes: str, dtypes: str, parts: str):
-    return _suite(shapes, dtypes, parts)
+    return _suite(shapes, dtypes, parts, "H100")
 
 
 @app.function(image=image, gpu="H200:8", cpu=32, memory=262144, timeout=10800)
 def suite_h200(shapes: str, dtypes: str, parts: str):
-    return _suite(shapes, dtypes, parts)
+    return _suite(shapes, dtypes, parts, "H200")
 
 
 @app.local_entrypoint()
@@ -161,6 +165,7 @@ def main(
     result["modal_app_id"] = app.app_id
     if out:
         Path(out).write_text(json.dumps(result, indent=1) + "\n")
+    print("devices", result.get("devices"))
     for run in result["runs"]:
         print(run["returncode"], run["args"], run["env"])
     if result["returncode"]:
