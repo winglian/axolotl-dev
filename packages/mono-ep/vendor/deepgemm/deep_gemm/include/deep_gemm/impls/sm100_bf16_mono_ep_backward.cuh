@@ -2002,8 +2002,9 @@ sm100_bf16_mono_ep_backward_impl(void* y,
                     task_info.n_cluster_idx + 1 == kIntermediateHidden / (2 * BLOCK_N);
                 // The weight-gradient GEMMs reduce over each expert's padded pool rows: zero the x/dy tail of the
                 // expert's last block (stale, possibly non-finite rows from earlier launches) before its h/dz are
-                // published, so 0 * stale never reaches dW; CTA c clears column half c
-                if (task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
+                // published, so 0 * stale never reaches dW; CTA c clears column half c. Without BF16 copies the
+                // BF16 x/dy pools may be unallocated (the MXFP8 dW reads mask rows by expert range)
+                if (not kNoBF16Copies and task_info.block_phase == sched::BlockPhase::BackwardRecomputeHigh and
                     task_info.n_cluster_idx + 1 == kIntermediateHidden / (2 * BLOCK_N) and valid_m < BLOCK_M) {
                     constexpr uint32_t kHalfChunks = kHidden / 2 / 8;
                     const uint32_t col_offset = is_leader_cta ? 0u : kHidden / 2;

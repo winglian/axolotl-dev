@@ -144,6 +144,11 @@ buffer (the forward's E4M3 rows live in the forward ring, which the recompute ov
 recomputes z: the MXFP8 forward does not write the compact stored-z layout. Hidden sizes that are
 not multiples of 512 fall back to the BF16 persistent backward with one log line. Before this the
 MXFP8 runtime's backward was the generic NCCL path, about ten times slower.
+With MXFP8 dW the kernel writes no BF16 x / dy / dz copies, and by default
+(`MONO_EP_SM100_BF16_POOLS=lazy`) the backward does not allocate them either: they appear at the
+first backward that writes them (BF16 dW, the BF16 backward, LoRA on BF16 pools), and the launcher
+refuses empty copies for any launch that would. That frees 1.8 / 3.7 / 5.1 GiB per rank at the
+30B-A3B / 235B-A22B / Beam EP8 shapes.
 This is what `precision: auto` runs on SM100. MXFP8 dW is the default there
 (`MONO_EP_SM100_DW_PRECISION=bf16` restores BF16 dW), and stored-context
 `auto` does not store for an MXFP8 backward on either runtime: its recompute is one FP8 GEMM and

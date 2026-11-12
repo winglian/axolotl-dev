@@ -173,3 +173,44 @@ def test_mxfp8_runtime_falls_back_to_bf16_backward_off_512(group, monkeypatch, c
     assert "odd multiple of 256" in caplog.text
     assert torch.isfinite(dx.float()).all() and torch.isfinite(y.float()).all()
     mx.close()
+
+
+def test_lazy_bf16_pools_stay_unallocated_under_mxfp8_dw(group, monkeypatch):
+    """Lazy BF16 pools: the MXFP8 backward with MXFP8 dW never allocates the BF16 x / dy / dz copies
+    (dx bitwise, dW to run-to-run rounding against eager pools), BF16 dW allocates them on demand,
+    and a launch that would write them while they are absent fails in the launcher."""
+    monkeypatch.delenv("MONO_EP_SM100_BACKWARD_PRECISION", raising=False)
+    monkeypatch.delenv("MONO_EP_SM100_DW_PRECISION", raising=False)
+    monkeypatch.setenv("MONO_EP_STORED_CONTEXT", "off")
+    inputs = _inputs()
+
+    def gap(got, want):
+        return (got.float() - want.float()).norm() / want.float().norm()
+
+    monkeypatch.setenv("MONO_EP_SM100_BF16_POOLS", "eager")
+    eager = _runtime(group, "mxfp8")
+    _, dx_eager, dw1_eager, dw2_eager = _step(eager, inputs)
+    assert eager._peer_backward.pools[0].numel() > 0
+    eager.close()
+
+    monkeypatch.setenv("MONO_EP_SM100_BF16_POOLS", "lazy")
+    lazy = _runtime(group, "mxfp8")
+    native = lazy._peer_backward
+    _, dx, dw1, dw2 = _step(lazy, inputs)
+    assert all(native.pools[i].numel() == 0 for i in (0, 1, 3))
+    assert native.pools[2].numel() > 0
+    assert torch.equal(dx, dx_eager)
+    assert gap(dw1, dw1_eager) < 1e-3 and gap(dw2, dw2_eager) < 1e-3
+
+    # the launcher refuses absent copies when the launch would write them
+    monkeypatch.setenv("MONO_EP_SM100_DW_PRECISION", "bf16")
+    ensure = native._ensure_copies
+    monkeypatch.setattr(native, "_ensure_copies", lambda: None)
+    with pytest.raises(RuntimeError):
+        _step(lazy, inputs)
+    monkeypatch.setattr(native, "_ensure_copies", ensure)
+    _, dx_bf, dw1_bf, _ = _step(lazy, inputs)
+    assert all(native.pools[i].numel() > 0 for i in (0, 1, 3))
+    assert torch.equal(dx_bf, dx_eager)
+    assert torch.isfinite(dw1_bf).all()
+    lazy.close()

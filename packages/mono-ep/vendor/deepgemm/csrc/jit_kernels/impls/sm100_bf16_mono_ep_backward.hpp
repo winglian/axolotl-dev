@@ -367,16 +367,19 @@ static void mxfp8_mono_ep_backward_launch(
         DG_HOST_ASSERT(sf.stride(1) == 1 and sf.stride(2) == w.size(1) and sf.stride(0) == w.size(1) * (w.size(2) / 128));
     }
 
-    // Pools: BF16 x, dy, h, dz (weight gradients), E4M3 x, dy, dz and their packed scales [K / 128][rows]
+    // Pools: BF16 x, dy, h, dz (weight gradients), E4M3 x, dy, dz and their packed scales [K / 128][rows].
+    // With MXFP8 dW (8192) the kernel writes no BF16 x/dy/dz, which may then be empty [0, width] tensors.
     DG_HOST_ASSERT(pools.size() == 10);
     const int64_t sf_rows = static_cast<int64_t>(world) * max_tokens * topk + experts * 128;
     DG_HOST_ASSERT(sf_rows < std::numeric_limits<int>::max() and sf_rows % 128 == 0);
-    const int64_t rows = pools[0].size(0);
+    const int64_t rows = pools[2].size(0);
     DG_HOST_ASSERT(rows > 0 and rows % 128 == 0 and rows <= sf_rows);
     const int widths[] = {hidden, hidden, inner, inner * 2, hidden, hidden, inner * 2};
     for (int i = 0; i < 7; ++i) {
         check(pools[i], i < 4 ? torch::kBFloat16 : torch::kFloat8_e4m3fn);
-        DG_HOST_ASSERT(pools[i].dim() == 2 and pools[i].size(0) == rows and pools[i].size(1) == widths[i]);
+        const bool absent_copy = (i == 0 or i == 1 or i == 3) and pools[i].size(0) == 0;
+        DG_HOST_ASSERT(not absent_copy or mxfp8_dw);
+        DG_HOST_ASSERT(pools[i].dim() == 2 and (absent_copy or pools[i].size(0) == rows) and pools[i].size(1) == widths[i]);
     }
     const int sf_widths[] = {hidden / 128, hidden / 128, inner * 2 / 128};
     for (int i = 0; i < 3; ++i) {

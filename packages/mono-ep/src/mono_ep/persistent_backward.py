@@ -27,6 +27,18 @@ LOG = logging.getLogger("mono_ep")
 ISSUES_URL = "https://github.com/axolotl-ai-cloud/axolotl/issues"
 
 OWNED_BLOCK_M = 128
+BF16_POOLS_ENV = "MONO_EP_SM100_BF16_POOLS"
+
+
+def bf16_pools_mode():
+    """``MONO_EP_SM100_BF16_POOLS``: ``lazy`` (default) allocates the SM100 BF16 x / dy / dz pools at
+    the first backward that writes them, so the MXFP8 backward with MXFP8 dW (and ``mxfp8_lora``
+    reading the E4M3 pools) never holds them; ``eager`` allocates them up front. h is always
+    allocated."""
+    value = os.getenv(BF16_POOLS_ENV, "lazy")
+    if value not in ("lazy", "eager"):
+        raise ValueError(f"{BF16_POOLS_ENV} must be lazy or eager")
+    return value
 
 
 # MONO_EP_BACKWARD_SEGMENT_TIMING=1: (name, host seconds, CUDA event) at the MXFP8 backward's segment boundaries,
@@ -167,7 +179,12 @@ class NativePersistentBackward:
         )
         self.counts = torch.empty_like(self.starts)
         self.padded_counts = torch.empty_like(self.starts) if self.blockwise else None
-        self.pools = self._build_pools(rows)
+        self.lazy_copies = (
+            self.arch == 10 and not self.blockwise and bf16_pools_mode() == "lazy"
+        )
+        self._copies_logged = False
+        self.rows = rows
+        self.pools = self._build_pools(rows, copies=not self.lazy_copies)
         self.finished = None
         self.context_hits = self.context_misses = 0
         self.dw_state = None
@@ -280,7 +297,7 @@ class NativePersistentBackward:
         )
         # E4M3 pools follow the (possibly bounded) BF16 pools; the scale pools keep the worst-case
         # row count, which the kernel's UTCCP-ordered scale layout is compiled for
-        rows = self.pools[0].shape[0]
+        rows = self.rows
         device = self.dy.device
         pools = [
             torch.zeros(rows, width, device=device, dtype=torch.float8_e4m3fn)
@@ -370,9 +387,10 @@ class NativePersistentBackward:
             return 4 * floor
         return floor
 
-    def _build_pools(self, rows, scratch=None):
+    def _build_pools(self, rows, scratch=None, copies=True):
         """The x/dy/h/dz pools for ``rows`` routed rows; blockwise adds ring-sized BF16 scratch, the FP8 row
-        caches and the packed column-major wgrad operands with their scales."""
+        caches and the packed column-major wgrad operands with their scales. ``copies=False`` leaves the
+        BF16 x / dy / dz pools empty (``[0, width]``) until :meth:`_ensure_copies`."""
         runtime = self.runtime
         device = self.dy.device
         widths = (
@@ -384,8 +402,13 @@ class NativePersistentBackward:
         if scratch is None:
             scratch_rows = self.buffer.l1_acts.shape[0] if self.blockwise else rows
             scratch = [
-                torch.zeros(scratch_rows, width, device=device, dtype=torch.bfloat16)
-                for width in widths
+                torch.zeros(
+                    scratch_rows if copies or i == 2 else 0,
+                    width,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                for i, width in enumerate(widths)
             ]
         pools = list(scratch)
         if not self.blockwise:
@@ -413,6 +436,29 @@ class NativePersistentBackward:
         )
         return pools
 
+    def _ensure_copies(self):
+        """Allocate the BF16 x / dy / dz pools of a lazy backward the first time a launch writes them."""
+        if self.pools[0].numel() or not self.rows:
+            return
+        runtime = self.runtime
+        device = self.dy.device
+        for i, width in (
+            (0, runtime.hidden),
+            (1, runtime.hidden),
+            (3, 2 * runtime.intermediate),
+        ):
+            self.pools[i] = torch.zeros(
+                self.rows, width, device=device, dtype=torch.bfloat16
+            )
+        if not self._copies_logged:
+            self._copies_logged = True
+            LOG.warning(
+                "mono_ep: this backward writes BF16 x / dy / dz pool copies (BF16 backward or BF16 dW); "
+                "allocated %.2f GiB of them (%s=eager allocates them up front)",
+                sum(self.pools[i].nbytes for i in (0, 1, 3)) / 2**30,
+                BF16_POOLS_ENV,
+            )
+
     def _fit_pools(self, w1):
         """Bounded workspace: grow the pools before a backward whose routed rows exceed them."""
         if self.bound is None:
@@ -420,10 +466,12 @@ class NativePersistentBackward:
         rows = self.bound.target(self.bound.required_rows(w1))
         if rows is None:
             return
-        # Blockwise keeps its ring-sized BF16 scratch; every row-sized pool is rebuilt
+        # Blockwise keeps its ring-sized BF16 scratch; every row-sized pool is rebuilt (BF16 copies only if held)
         scratch = self.pools[:4] if self.blockwise else None
+        copies = self.pools[0].numel() > 0 or not self.lazy_copies
         del self.pools
-        self.pools = self._build_pools(rows, scratch)
+        self.rows = rows
+        self.pools = self._build_pools(rows, scratch, copies=copies)
         # One MXFP8 resource set per owned-ring floor seen; each one's E4M3 pools follow the BF16 rows
         for mx in self._mx.values():
             mx.pools[:3] = [
@@ -496,6 +544,8 @@ class NativePersistentBackward:
                 dw = resolve_dw_precision(self.runtime.compute_dtype, "mxfp8")
             else:
                 dw = "mxfp8" if fp8_pools else "bf16"
+            if dw != "mxfp8":
+                self._ensure_copies()
             dx, ds = self._backward_mxfp8(
                 dy,
                 x,
@@ -510,6 +560,7 @@ class NativePersistentBackward:
             if not weight_grads:
                 return self._finish_pools(dx, ds, scores, stream)
             return self._finish_mxfp8(dx, ds, scores, stream, self._mx_resources(), dw)
+        self._ensure_copies()
         tokens = x.shape[0]
         from .sm90_prep import enabled as fused_prep
 
