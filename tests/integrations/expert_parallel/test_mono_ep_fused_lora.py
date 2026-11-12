@@ -76,13 +76,19 @@ class TestConfigReason:
 
 class TestModelResolution:
     @pytest.mark.parametrize(
-        "precision,resolved",
-        [("auto", "mxfp8_lora"), ("mxfp8", "mxfp8_lora"), ("bf16", "bf16_lora")],
+        "capability,precision,resolved",
+        [
+            ((10, 0), "auto", "mxfp8_lora"),
+            ((10, 0), "mxfp8", "mxfp8_lora"),
+            ((10, 0), "bf16", "bf16_lora"),
+            ((9, 0), "auto", "bf16_lora"),
+            ((9, 0), "fp8", "fp8_lora"),
+        ],
     )
     def test_bf16_experts_resolve_the_lora_precision(
-        self, mono_ep_package, cuda_capability, precision, resolved
+        self, mono_ep_package, cuda_capability, capability, precision, resolved
     ):
-        cuda_capability((10, 0))
+        cuda_capability(capability)
         cfg = _bf16_lora_cfg(expert_parallel_mono_ep_precision=precision)
         ExpertParallelPlugin().post_model_build(cfg, _qwen3_model())
         assert cfg.expert_parallel_backend == "mono_ep"
@@ -92,8 +98,8 @@ class TestModelResolution:
     @pytest.mark.parametrize(
         "capability,precision,build,match",
         [
-            ((9, 0), "bf16", _qwen3_model, "currently requires SM100"),
-            ((9, 0), "fp8", _qwen3_model, "not implemented yet"),
+            ((9, 0), "mxfp8", _qwen3_model, "requires SM100"),
+            ((10, 0), "fp8", _qwen3_model, "requires SM90"),
             ((10, 0), "mxfp8", _nvfp4_model, "packed NVFP4"),
         ],
     )
