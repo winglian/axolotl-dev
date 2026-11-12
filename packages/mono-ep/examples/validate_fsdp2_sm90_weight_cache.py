@@ -233,8 +233,8 @@ def main():
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    if "H100" not in torch.cuda.get_device_name():
-        raise RuntimeError(f"expected H100, got {torch.cuda.get_device_name()}")
+    if not any(name in torch.cuda.get_device_name() for name in ("H100", "H200")):
+        raise RuntimeError(f"expected H100 or H200, got {torch.cuda.get_device_name()}")
     dist.init_process_group("nccl", device_id=device)
     world = dist.get_world_size()
     os.environ.setdefault("MONO_EP_SM90_FP8_TRANSPORT", "1")
