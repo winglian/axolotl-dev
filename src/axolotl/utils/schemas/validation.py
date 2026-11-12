@@ -2327,10 +2327,19 @@ class ModelCompatibilityValidationMixin:
             return self
         mode = getattr(self, "expert_parallel_mono_ep_mode", None) or "auto"
         precision = getattr(self, "expert_parallel_mono_ep_precision", None) or "auto"
-        # nvfp4_lora runs on the fused kernels but needs use_sonicmoe for its loader
-        # and expert-LoRA forward, so that flag is not an ignored local kernel there
-        nvfp4_lora = precision == "nvfp4_lora" or (
-            precision == "auto" and getattr(self, "adapter", None) == "lora"
+        # the fused LoRA precisions need use_sonicmoe for the expert-LoRA forward (and
+        # nvfp4_lora for its loader), so that flag is not an ignored local kernel there
+        lora = getattr(self, "adapter", None) == "lora"
+        nvfp4_lora = precision.endswith("_lora") or (
+            lora
+            and (
+                precision == "auto"
+                or (
+                    precision in ("bf16", "mxfp8", "fp8")
+                    and getattr(self, "expert_parallel_mono_ep_fused_lora", True)
+                    is not False
+                )
+            )
         )
         ignored = [
             key

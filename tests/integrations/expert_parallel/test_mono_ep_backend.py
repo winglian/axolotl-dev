@@ -143,6 +143,7 @@ def mono_ep_package(monkeypatch):
         "MODES",
         "check_nccl_env",
         "dispatch_unsupported_reason",
+        "lora_precision",
         "nccl_env",
         "resolve_precision",
         "unsupported_reason",

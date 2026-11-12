@@ -56,7 +56,15 @@ class ExpertParallelArgs(BaseModel):
     re-runs that layer exactly."""
 
     expert_parallel_mono_ep_precision: Literal[
-        "auto", "bf16", "mxfp8", "fp8", "fp8_bwd", "nvfp4_lora"
+        "auto",
+        "bf16",
+        "mxfp8",
+        "fp8",
+        "fp8_bwd",
+        "nvfp4_lora",
+        "bf16_lora",
+        "mxfp8_lora",
+        "fp8_lora",
     ] = "auto"
     """Compute precision of the ``mono_ep`` backend's fused mode. ``auto``: ``bf16`` on SM90,
     ``mxfp8`` on SM100, and ``nvfp4_lora`` on SM100 when the experts load as packed NVFP4 and a
@@ -64,8 +72,26 @@ class ExpertParallelArgs(BaseModel):
     ``fp8_bwd`` is BF16 forward with blockwise FP8 backward. ``nvfp4_lora`` keeps the packed
     NVFP4 experts frozen and trains a PEFT ``lora_target_parameters`` adapter on them (SM100;
     ``adapter: lora`` with ``use_sonicmoe: true``, ``nvfp4_merge_aware: false`` and
-    ``lora_dropout: 0``). Master weights stay in their own dtype. The dispatch mode moves
-    BF16 rows and leaves compute precision to the local kernel."""
+    ``lora_dropout: 0``). With an expert LoRA adapter on a BF16 base, ``auto``, ``bf16`` and
+    ``mxfp8`` select ``bf16_lora`` / ``mxfp8_lora`` (see ``expert_parallel_mono_ep_fused_lora``);
+    ``fp8_lora`` is not implemented yet. Master weights stay in their own dtype. The dispatch
+    mode moves BF16 rows and leaves compute precision to the local kernel."""
+
+    expert_parallel_mono_ep_fused_lora: bool = True
+    """Fused mode with a LoRA adapter on BF16 experts: train it on the fused kernels
+    (``bf16_lora`` / ``mxfp8_lora`` on SM100: the frozen base merged with the adapter once per
+    optimizer step, adapter gradients from rank-r GEMMs on the backward's pools). Needs
+    ``adapter: lora`` on ``experts.gate_up_proj`` and ``experts.down_proj``
+    (``lora_target_parameters``), ``use_sonicmoe: true``, ``lora_dropout: 0`` and no DoRA.
+    ``false`` keeps today's behavior: an adapter runs the dispatch mode with the local
+    kernel."""
+
+    expert_parallel_mono_ep_lora_merged_cache: Literal["layer", "all"] = "layer"
+    """Fused LoRA precisions (``bf16_lora``, ``mxfp8_lora``): when the merged BF16 expert
+    weights are built (exported as ``MONO_EP_LORA_MERGED_CACHE``). ``layer`` merges one layer
+    right before its forward and again before its backward when evicted, keeping the last two
+    layers resident; ``all`` merges every layer once per optimizer step and holds the merges
+    across the step (one BF16 copy of the routed experts more memory)."""
 
     expert_parallel_mono_ep_workspace_bound: Literal["auto", "max"] = "auto"
     """Fused mode on SM100: size the backward's per-rank row pools from the rows each layer's

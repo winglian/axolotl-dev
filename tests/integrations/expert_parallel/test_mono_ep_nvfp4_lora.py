@@ -158,12 +158,16 @@ class TestConfigReason:
             # ``auto`` with an adapter falls back to the dispatch mode with the same cause
             cfg = _lora_cfg(**extra)
             auto_reason = ExpertParallelPlugin._mono_ep_fused_config_reason(cfg)
-            assert "train full expert weights only" in auto_reason
+            assert "the fused kernels cannot train it" in auto_reason
             assert match in auto_reason
 
     def test_non_nvfp4_base_is_refused(self, mono_ep_package):
-        reason = ExpertParallelPlugin._mono_ep_fused_config_reason(_lora_cfg())
+        reason = ExpertParallelPlugin._mono_ep_fused_config_reason(
+            _lora_cfg(expert_parallel_mono_ep_precision="nvfp4_lora")
+        )
         assert "modelopt NVFP4 base" in reason
+        # ``auto`` trains the adapter on the merged BF16 experts instead
+        assert ExpertParallelPlugin._mono_ep_fused_config_reason(_lora_cfg()) is None
 
     def test_other_precisions_keep_the_adapter_rule(
         self,
@@ -173,7 +177,7 @@ class TestConfigReason:
         reason = ExpertParallelPlugin._mono_ep_fused_config_reason(
             _lora_cfg(expert_parallel_mono_ep_precision="mxfp8")
         )
-        assert "precision mxfp8 trains full expert weights only" in reason
+        assert "packed NVFP4 base trains LoRA only as nvfp4_lora" in reason
 
     def test_precision_without_adapter_is_refused(self, mono_ep_package):
         reason = ExpertParallelPlugin._mono_ep_fused_config_reason(
@@ -182,7 +186,10 @@ class TestConfigReason:
         assert "needs adapter: lora" in reason
 
     def test_forced_fused_falls_back_or_raises(self, mono_ep_package):
-        cfg = _lora_cfg(expert_parallel_mono_ep_mode="fused")
+        cfg = _lora_cfg(
+            expert_parallel_mono_ep_mode="fused",
+            expert_parallel_mono_ep_fused_lora=False,
+        )
         assert ExpertParallelPlugin._resolve_backend(cfg) == "torch"
         cfg = _lora_cfg(
             expert_parallel_mono_ep_mode="fused",

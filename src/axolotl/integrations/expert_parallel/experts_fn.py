@@ -456,6 +456,14 @@ class _MonoEPFusedBackend:
 
             return nvfp4_lora_forward(runtime, experts, hidden_states, topk_idx, topk_w)
         w1, w2 = _local_expert_weights(experts)
+        from .fused_lora import PRECISIONS as FUSED_LORA_PRECISIONS
+
+        if getattr(runtime, "precision", None) in FUSED_LORA_PRECISIONS:
+            from .fused_lora import forward as fused_lora_forward
+
+            return fused_lora_forward(
+                runtime, experts, hidden_states, topk_idx, topk_w, w1, w2
+            )
         return runtime.forward(hidden_states, topk_idx, topk_w, w1, w2)
 
 

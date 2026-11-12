@@ -516,10 +516,12 @@ class ExpertParallelPlugin(BasePlugin):
         return backend in ("torch", MONO_EP)
 
     def post_train_unload(self, cfg):
+        from . import fused_lora
         from .experts_fn import set_mono_ep_runtime
         from .nvfp4_lora import set_state
 
         set_state(None)
+        fused_lora.set_state(None)
         runtime = self.__dict__.pop("_mono_ep_runtime", None)
         set_mono_ep_runtime(None)
         if runtime is not None:
@@ -552,29 +554,23 @@ class ExpertParallelPlugin(BasePlugin):
     @staticmethod
     def _mono_ep_fused_config_reason(cfg) -> str | None:
         """Config-only reasons the fused mode cannot run (the dispatch mode can)."""
+        from . import fused_lora
         from .nvfp4_lora import (
             PRECISION as NVFP4_LORA,
-            config_reason as nvfp4_lora_config_reason,
         )
 
         precision = getattr(cfg, "expert_parallel_mono_ep_precision", None) or "auto"
         if getattr(cfg, "adapter", None):
-            # an adapter trains on the fused kernels only as nvfp4_lora (frozen packed NVFP4
-            # experts); ``auto`` takes that path when the config qualifies
-            reason = (
-                nvfp4_lora_config_reason(cfg)
-                if precision in ("auto", NVFP4_LORA)
-                else f"precision {precision} trains full expert weights only"
-            )
+            reason = ExpertParallelPlugin._mono_ep_lora_config_reason(cfg, precision)
             if reason is not None:
-                if precision == NVFP4_LORA:
+                if precision == NVFP4_LORA or precision in fused_lora.PRECISIONS:
                     return reason
                 return (
-                    f"adapter {cfg.adapter!r} is configured; the fused kernels train full "
-                    f"expert weights only ({reason})"
+                    f"adapter {cfg.adapter!r} is configured; the fused kernels cannot "
+                    f"train it ({reason})"
                 )
-        elif precision == NVFP4_LORA:
-            return "precision nvfp4_lora needs adapter: lora on the experts"
+        elif precision == NVFP4_LORA or precision in fused_lora.PRECISIONS:
+            return f"precision {precision} needs adapter: lora on the experts"
         quantized = [
             key
             for key in (
@@ -588,6 +584,50 @@ class ExpertParallelPlugin(BasePlugin):
         if quantized:
             return f"quantized model loading ({', '.join(quantized)}) is unsupported"
         return None
+
+    @staticmethod
+    def _mono_ep_lora_route(cfg, precision: str) -> str | None:
+        """Which fused path trains the adapter: ``nvfp4_lora`` (frozen packed NVFP4 experts;
+        ``auto`` takes it when the config qualifies), ``fused_lora`` (merged BF16 experts on
+        the configured precision's kernels), or ``None`` when neither applies."""
+        from . import fused_lora
+        from .nvfp4_lora import (
+            PRECISION as NVFP4_LORA,
+            base_is_nvfp4_modelopt,
+            config_reason as nvfp4_lora_config_reason,
+        )
+
+        if precision == NVFP4_LORA:
+            return NVFP4_LORA
+        if precision == "auto" and nvfp4_lora_config_reason(cfg) is None:
+            return NVFP4_LORA
+        if not fused_lora.enabled(cfg) or base_is_nvfp4_modelopt(cfg):
+            return None
+        return "fused_lora"
+
+    @staticmethod
+    def _mono_ep_lora_config_reason(cfg, precision: str) -> str | None:
+        """Why the fused mode cannot train the configured adapter (``None`` = it can)."""
+        from . import fused_lora
+        from .nvfp4_lora import (
+            PRECISION as NVFP4_LORA,
+            base_is_nvfp4_modelopt,
+            config_reason as nvfp4_lora_config_reason,
+        )
+
+        route = ExpertParallelPlugin._mono_ep_lora_route(cfg, precision)
+        if route == NVFP4_LORA:
+            return nvfp4_lora_config_reason(cfg)
+        if route == "fused_lora":
+            return fused_lora.config_reason(cfg)
+        if not fused_lora.enabled(cfg):
+            return (
+                "expert_parallel_mono_ep_fused_lora is false, so precision "
+                f"{precision} trains full expert weights only"
+            )
+        if base_is_nvfp4_modelopt(cfg) and precision == "auto":
+            return nvfp4_lora_config_reason(cfg)
+        return f"precision {precision} on a packed NVFP4 base trains LoRA only as nvfp4_lora"
 
     @staticmethod
     def _mono_ep_fallback(cfg, reason: str) -> str:
@@ -688,14 +728,25 @@ class ExpertParallelPlugin(BasePlugin):
             )
             resolved = None
             if getattr(cfg, "adapter", None):
+                from . import fused_lora
                 from .nvfp4_lora import PRECISION as NVFP4_LORA, experts_reason
 
-                # the config already qualified for nvfp4_lora; the experts must be the
-                # packed NVFP4 the kernels consume
-                reason = experts_reason(experts, name)
+                # the config already qualified for a fused LoRA route; the experts must be
+                # what that route's kernels consume
+                if cls._mono_ep_lora_route(cfg, precision) == NVFP4_LORA:
+                    reason = experts_reason(experts, name)
+                    resolved = NVFP4_LORA
+                else:
+                    from mono_ep import lora_precision
+
+                    reason = fused_lora.experts_reason(experts, name)
+                    try:
+                        resolved = lora_precision(precision, capability)
+                    except ValueError as exc:
+                        return None, str(exc)
                 if reason is not None:
                     return None, reason
-                precision = resolved = NVFP4_LORA
+                precision = resolved
             from mono_ep import unsupported_reason
 
             reason = unsupported_reason(
@@ -896,6 +947,7 @@ class ExpertParallelPlugin(BasePlugin):
         precision = getattr(runtime, "precision", None) or getattr(
             cfg, "expert_parallel_mono_ep_precision", None
         )
+        from . import fused_lora
         from .nvfp4_lora import PRECISION as NVFP4_LORA
 
         if precision == NVFP4_LORA:
@@ -904,6 +956,12 @@ class ExpertParallelPlugin(BasePlugin):
             if model is not None:
                 tag_layers(model)
             set_state(Nvfp4LoraState(repo_id=getattr(cfg, "base_model", None)))
+        elif precision in fused_lora.PRECISIONS:
+            os.environ["MONO_EP_LORA_MERGED_CACHE"] = (
+                getattr(cfg, "expert_parallel_mono_ep_lora_merged_cache", None)
+                or "layer"
+            )
+            fused_lora.set_state(fused_lora.FusedLoraState())
         LOG.info(
             f"expert_parallel: mono_ep runtime, {tokens} tokens/rank, "
             f"{geometry.num_experts} experts, top-{geometry.top_k}, "
