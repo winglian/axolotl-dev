@@ -328,6 +328,8 @@ def test_reduce_scatter_publish(rows, masked, width, compiled):
         operation = torch.compile(operation, fullgraph=True)
     for task in range(2):
         operation(partial, indices, destination, queue, task)
+    # A first _sleep launch behind the spinning consumer would wait on it
+    torch.cuda._sleep(1)
     torch.cuda.synchronize()
     producers = [torch.cuda.Stream(), torch.cuda.Stream()]
     consumer = torch.cuda.Stream()
