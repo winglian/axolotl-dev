@@ -569,6 +569,38 @@ class MonoEPRuntime:
             cache,
         )
 
+    def prepare(
+        self,
+        *,
+        num_tokens: int | None = None,
+        weight_dtype: torch.dtype = torch.bfloat16,
+        lora_rank: int | None = None,
+        lora_dtype: torch.dtype = torch.float32,
+        lora_scaling: float = 1.0,
+        nvfp4_backend: str | None = None,
+    ) -> None:
+        """Compile and load every kernel of a training step on every rank, then wait for
+        all of them, so no rank enters a cross-rank wait while a peer still compiles.
+
+        Collective over the expert-parallel group. ``num_tokens`` (default the token
+        capacity) is the per-rank token count of the steps to come: the fused kernels'
+        tiling depends on it. ``weight_dtype`` is the dtype :meth:`forward` will see for
+        the (base) expert weights; ``lora_rank`` (required by the LoRA precisions),
+        ``lora_dtype`` and ``nvfp4_backend`` describe the adapters :meth:`forward_lora`
+        will see. Without it, the first forward and the first backward each compile and
+        meet the other ranks right before their launch (see :mod:`mono_ep.prepare`)."""
+        from .prepare import prepare
+
+        prepare(
+            self,
+            num_tokens=num_tokens,
+            weight_dtype=weight_dtype,
+            lora_rank=lora_rank,
+            lora_dtype=lora_dtype,
+            lora_scaling=lora_scaling,
+            nvfp4_backend=nvfp4_backend,
+        )
+
     def destroy(self) -> None:
         """Release the workspace; call only after every graph using it has finished."""
         if self._moe is None:

@@ -21,6 +21,7 @@ from .dw import (
     weight_grad_quantized,
 )
 from .ops import weight_grad_bf16, weight_grad_bf16_gpu_offsets
+from .prepare import BACKWARD, launch
 
 LOG = logging.getLogger("mono_ep")
 # Placeholder until mono-ep has its own repository
@@ -353,12 +354,15 @@ class NativePersistentBackward:
         _mark("weight_forms")
         dx = torch.empty_like(x)
         ds = torch.empty_like(scores, dtype=torch.float32)
-        getattr(
-            deep_gemm._C,
-            "mxfp8_mono_ep_backward"
-            if stored_z is None
-            else "mxfp8_mono_ep_backward_ctx",
-        )(
+        launch(
+            self.runtime,
+            BACKWARD,
+            getattr(
+                deep_gemm._C,
+                "mxfp8_mono_ep_backward"
+                if stored_z is None
+                else "mxfp8_mono_ep_backward_ctx",
+            ),
             dx,
             ds,
             *[f[0] for f in forms],
@@ -680,7 +684,10 @@ class NativePersistentBackward:
             if stored_z is not None:
                 dw_args += (stored_z,)
                 native_name = "bf16_mono_ep_backward_dw_ctx"
-        getattr(deep_gemm._C, native_name)(
+        launch(
+            self.runtime,
+            BACKWARD,
+            getattr(deep_gemm._C, native_name),
             dx,
             ds,
             interleaved,

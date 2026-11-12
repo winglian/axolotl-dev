@@ -40,6 +40,7 @@ from .lora import (  # noqa: F401
     padded_offsets,
 )
 from .persistent_backward import owned_backward_ring_tokens
+from .prepare import BACKWARD, launch
 
 LOG = logging.getLogger("mono_ep")
 OPTIONS_ENV = "MONO_EP_SM100_NVFP4_BACKWARD_OPTIONS"
@@ -607,7 +608,10 @@ class Nvfp4PersistentBackward:
     def _launch(self, dx, ds, merged):
         import deep_gemm
 
-        deep_gemm._C.nvfp4_mono_ep_backward(
+        launch(
+            self.runtime,
+            BACKWARD,
+            deep_gemm._C.nvfp4_mono_ep_backward,
             dx,
             ds,
             merged.w1.view(torch.int8),

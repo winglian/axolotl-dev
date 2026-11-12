@@ -9,7 +9,7 @@ bash ./cicd/prepare_hf_cache.sh
 
 uv pip install --python "$(command -v python)" --no-deps packages/mono-ep
 python -m pytest -q packages/mono-ep/tests -m gpu
-python -m pytest -q packages/mono-ep/tests/test_api.py packages/mono-ep/tests/test_quantization.py packages/mono-ep/tests/test_mono_ep.py packages/mono-ep/tests/test_persistent_selection.py packages/mono-ep/tests/test_sonic_loader.py -m "not gpu"
+python -m pytest -q packages/mono-ep/tests/test_api.py packages/mono-ep/tests/test_quantization.py packages/mono-ep/tests/test_mono_ep.py packages/mono-ep/tests/test_persistent_selection.py packages/mono-ep/tests/test_prepare.py packages/mono-ep/tests/test_sonic_loader.py -m "not gpu"
 
 # Keep process-wide model patching isolated from kernel parity tests.
 python cicd/pytest_testmon.py -v --durations=10 --maxfail=10 \

@@ -9,6 +9,7 @@ Native backward currently requires recomputation and a single host.
 """
 
 import os
+from functools import partial
 from itertools import count
 
 import torch
@@ -17,6 +18,7 @@ import torch.distributed._functional_collectives as funcol
 from torch.autograd.function import once_differentiable
 
 from . import workspace_bound
+from .prepare import FORWARD, launch
 
 _RUNTIMES: dict[int, "PersistentMoE"] = {}
 _RUNTIME_KEYS = count(1)
@@ -92,6 +94,8 @@ class PersistentMoE:
                 "call deep_gemm.set_num_sms(physical_sms - reserved_sms) before constructing PersistentMoE"
             )
         self._fixed_capacity_backward = True
+        self.launched = set()
+        self.prepared = set()
         self._peer_backward = None
         # Stored forward context (MONO_EP_STORED_CONTEXT): one z buffer per runtime and the key of the
         # forward call that last filled it; the native backward consumes it once.
@@ -195,7 +199,10 @@ class PersistentMoE:
                 dtype=torch.int32,
                 device=x.device,
             )
-        deep_gemm.nvfp4_mono_ep(
+        launch(
+            self,
+            FORWARD,
+            deep_gemm.nvfp4_mono_ep,
             y,
             (
                 w1_packed.view(torch.int8),
@@ -311,7 +318,10 @@ def _forward_impl(x, indices, scores, w1, w2, runtime, record_key=None, mx_forms
                 dtype=torch.int32,
                 device=x.device,
             )
-        deep_gemm._C.fp8_mono_ep_forward_sm90(
+        launch(
+            runtime,
+            FORWARD,
+            deep_gemm._C.fp8_mono_ep_forward_sm90,
             y,
             prepared[0][0],
             prepared[1][0],
@@ -354,10 +364,13 @@ def _forward_impl(x, indices, scores, w1, w2, runtime, record_key=None, mx_forms
     buffer.topk_idx[:tokens].copy_(indices)
     buffer.topk_weights[:tokens].copy_(scores)
     y = torch.empty_like(x)
-    forward = (
+    forward = partial(
+        launch,
+        runtime,
+        FORWARD,
         deep_gemm.fp8_fp4_mono_ep
         if runtime.compute_dtype == "mxfp8"
-        else deep_gemm.bf16_mono_ep
+        else deep_gemm.bf16_mono_ep,
     )
     saved_z = None
     if _store_context(runtime):
