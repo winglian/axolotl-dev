@@ -199,6 +199,14 @@ Every kernel selector is part of the JIT key, so changing one compiles a new ker
 
 ## Troubleshooting
 
+- **`TypeError: <function>(): incompatible function arguments` from `deep_gemm._C`.** The
+  installed extension is older than the Python package, usually an object reused from an
+  existing `vendor/deepgemm/build` after a header-only change. Remove the build directory and
+  reinstall (`rm -rf packages/mono-ep/vendor/deepgemm/build`, then the install command in the
+  [README](../README.md#installation)). `DG_FORCE_BUILD=1` does not clean it: it only skips the
+  prebuilt-wheel download. The JIT kernel cache (`DG_JIT_CACHE_DIR`, default `~/.dj`) is keyed by
+  the generated source, the contents of every included header, the compiler flags and version, so
+  it cannot serve a kernel built from older installed headers; removing it only costs recompiles.
 - **The first step takes minutes.** Every kernel variant compiles on first use and is cached
   under `DG_JIT_CACHE_DIR`; point it at a persistent, shared directory so later runs and other
   ranks reuse the builds. Changing a kernel selector or the layer shape compiles a new variant.

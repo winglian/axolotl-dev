@@ -45,6 +45,25 @@ DG_USE_LOCAL_VERSION=0 DG_FORCE_BUILD=1 CC=gcc-13 CXX=g++-13 \
 The kernels compile on first use and are cached under `DG_JIT_CACHE_DIR`; the first forward
 and backward of a new shape take a few minutes.
 
+To rebuild an existing tree (after pulling or editing `vendor/deepgemm`), remove the build
+directory first, then run the same install:
+
+```bash
+rm -rf packages/mono-ep/vendor/deepgemm/build
+DG_USE_LOCAL_VERSION=0 DG_FORCE_BUILD=1 CC=gcc-13 CXX=g++-13 \
+  pip install --no-build-isolation --no-deps packages/mono-ep/vendor/deepgemm
+```
+
+The extension now lists its headers as build dependencies, but the clean build stays the safe
+procedure: a reused object from before a header-only change surfaces at run time as
+`incompatible function arguments` from a `deep_gemm._C` function. `DG_FORCE_BUILD=1` only makes
+the install build from source instead of downloading a prebuilt wheel; it does not force
+recompiling objects in an existing build directory. The JIT kernel cache needs no clearing:
+its key hashes the generated kernel source, every header it includes (read from the installed
+`deep_gemm/include`), the compiler flags and the compiler version, so an edited header or launcher
+compiles a new kernel once it is installed. To reclaim space or start cold, remove
+`$DG_JIT_CACHE_DIR` (default `~/.dj`).
+
 ## Quickstart
 
 ### Axolotl
