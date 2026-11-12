@@ -169,7 +169,9 @@ def main():
     from mono_ep.runtime import PersistentMoE
 
     physical = torch.cuda.get_device_properties(device).multi_processor_count
-    deep_gemm.set_num_sms(physical)
+    # SMs left free as the Axolotl seam does for FSDP2's NCCL kernels; 0 keeps every SM
+    reserved_sms = int(os.getenv("MONO_EP_BENCH_RESERVED_SMS", "0"))
+    deep_gemm.set_num_sms(physical - reserved_sms)
     runtime = PersistentMoE(
         dist.group.WORLD,
         experts,
@@ -180,6 +182,7 @@ def main():
         compute_dtype="bf16",
         fuse_activation=True,
         retain_activations=False,
+        reserved_sms=reserved_sms,
     )
     native = NativePersistentBackward(runtime)
     operation = runtime if args.no_compile else torch.compile(runtime, fullgraph=True)
@@ -377,7 +380,8 @@ def main():
     # Timing loop
     host = {label: [] for label, *_ in cases}
     event = {label: [] for label, *_ in cases}
-    gathered = torch.empty(2 * world, device=device, dtype=torch.float64)
+    peak = dict.fromkeys(host, 0.0)
+    gathered = torch.empty(3 * world, device=device, dtype=torch.float64)
     captured = {}
     for iteration in range(args.warmup + args.iters):
         order = cases if iteration % 2 == 0 else cases[::-1]
@@ -385,6 +389,7 @@ def main():
             state = prepare()
             dist.barrier()
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(device)
             begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
             start = time.perf_counter()
             begin.record()
@@ -393,13 +398,20 @@ def main():
             torch.cuda.synchronize()
             wall = (time.perf_counter() - start) * 1000
             local = torch.tensor(
-                [wall, begin.elapsed_time(end)], device=device, dtype=torch.float64
+                [
+                    wall,
+                    begin.elapsed_time(end),
+                    torch.cuda.max_memory_allocated(device) / 2**30,
+                ],
+                device=device,
+                dtype=torch.float64,
             )
             dist.all_gather_into_tensor(gathered, local)
-            values = gathered.view(world, 2)
+            values = gathered.view(world, 3)
             if iteration >= args.warmup:
                 host[label].append(values[:, 0].max().item())
                 event[label].append(values[:, 1].max().item())
+            peak[label] = max(peak[label], values[:, 2].max().item())
             if (
                 iteration == args.warmup
                 and label.startswith("mono/")
@@ -460,6 +472,7 @@ def main():
         launch_env=launch_env,
         no_bump=args.no_bump,
         weight_dtype=args.weight_dtype,
+        reserved_sms=reserved_sms,
         warmup=args.warmup,
         iters=args.iters,
         compiled=not args.no_compile,
@@ -474,7 +487,8 @@ def main():
         parity_first_measured=parity,
         fp32_reference=fp32,
         kernel_ms_rank0=kernels,
-        peak_alloc_gib=torch.cuda.max_memory_allocated(device) / 2**30,
+        peak_alloc_gib=max(peak.values(), default=0.0),
+        peak_alloc_gib_by_case=peak,
         stored_context_hits_misses_rank0=[
             getattr(native, "context_hits", None),
             getattr(native, "context_misses", None),
