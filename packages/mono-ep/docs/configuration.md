@@ -40,12 +40,11 @@ issue at https://github.com/axolotl-ai-cloud/axolotl/issues. Its forward, backwa
 gradients carry about 6-7 % relative error against an FP32 reference (BF16: 0.2 %); set
 `expert_parallel_mono_ep_precision: bf16` for the BF16 kernels.
 
-`MONO_EP_STORED_CONTEXT=auto` on the BF16 runtime (`precision: bf16`) also engages when the opt-in
-MXFP8 backward is selected (`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`) and the shape rule holds.
-There storing measured slower than recomputing in the checkpointed 2F+B step (8xB200, 16 reserved
-SMs): 235B-A22B 21.00 ms with `auto` vs 19.42 ms with `off`, Beam 44.83 vs 41.83 ms. Set
-`MONO_EP_STORED_CONTEXT=off` (Axolotl `expert_parallel_mono_ep_stored_context: off`) for that
-combination.
+`MONO_EP_STORED_CONTEXT=auto` does not store when the backward is MXFP8, which is the SM100
+default under `precision: mxfp8` / `auto` and the opt-in `MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`
+on the BF16 runtime: the MXFP8 recompute is one FP8 GEMM and costs less than gathering the
+scattered BF16 z (8xB200 checkpointed 2F+B, storing vs recomputing: 235B-A22B 21.00 vs 19.42 ms,
+Beam 44.83 vs 41.83 ms). `recompute` and `always` still force storing.
 
 `auto` resolves to `nvfp4_lora` on SM100 when the experts load as packed NVFP4 (a modelopt NVFP4
 checkpoint through the kernels plugin) and `adapter: lora` targets them; `nvfp4_lora` can also be

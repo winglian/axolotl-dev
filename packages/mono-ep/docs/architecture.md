@@ -144,9 +144,9 @@ buffer (the forward's E4M3 rows live in the forward ring, which the recompute ov
 recomputes z: the MXFP8 forward does not write the compact stored-z layout. Hidden sizes that are
 not multiples of 512 fall back to the BF16 persistent backward with one log line. Before this the
 MXFP8 runtime's backward was the generic NCCL path, about ten times slower.
-This is what `precision: auto` runs on SM100. MXFP8 dW stays opt-in there, and the
-stored-context policy does not apply (with the BF16 runtime's opt-in MXFP8 backward,
-`MONO_EP_STORED_CONTEXT=auto` does engage, and measured slower than recomputing; see
+This is what `precision: auto` runs on SM100. MXFP8 dW stays opt-in there, and stored-context
+`auto` does not store for an MXFP8 backward on either runtime: its recompute is one FP8 GEMM and
+costs less than gathering the scattered BF16 z (see
 [configuration.md](configuration.md#axolotl-config-keys)).
 
 ## NVFP4 LoRA path and the CUDA requant (SM100)
