@@ -391,6 +391,44 @@ def mxfp8_backward_weight_forms(w1, w2):
     Scales run along each form's GEMM K (H for W1 and W2^T, 2I for W1^T); the forms share the
     ``(w1, w2)`` cache entry, key and epoch of the BF16 layouts.
     """
+    build = _mx_backward_build(w1, w2)
+    if _mode() != "1":
+        built = build(MXFP8_BACKWARD_FORMS)
+        return tuple(built[name] for name in MXFP8_BACKWARD_FORMS)
+    return cached_weight_forms(w1, w2, MXFP8_BACKWARD_FORMS, build)
+
+
+MXFP8_FORWARD_FORMS = ("sm100_mx_w1", "sm100_mx_w2")
+
+
+def mxfp8_forward_weight_forms(w1, w2):
+    """E4M3 values and packed UE8M0 scales of the interleaved W1 and of W2 for the SM100 MXFP8 forward.
+
+    The interleaved W1 is the MXFP8 backward's ``sm100_mx_w1`` (the same bytes), so the first forward
+    of a step builds the backward's W2^T and W1^T in the same pass and the recompute and backward hit.
+    """
+    from .token_quantization import prepare_persistent_mxfp8
+
+    backward_build = _mx_backward_build(w1, w2)
+
+    def build(missing):
+        built = {}
+        if "sm100_mx_w1" in missing:
+            built.update(backward_build(MXFP8_BACKWARD_FORMS))
+        if "sm100_mx_w2" in missing:
+            built["sm100_mx_w2"] = prepare_persistent_mxfp8(
+                w2.contiguous(), weights=True
+            )
+        return built
+
+    if _mode() != "1":
+        built = build(MXFP8_FORWARD_FORMS)
+        return tuple(built[name] for name in MXFP8_FORWARD_FORMS)
+    return cached_weight_forms(w1, w2, MXFP8_FORWARD_FORMS, build)
+
+
+def _mx_backward_build(w1, w2):
+    """``build(missing)`` for the three MXFP8 backward forms with the selected builder."""
     from .token_quantization import prepare_persistent_mxfp8
 
     def build(missing):
@@ -431,10 +469,7 @@ def mxfp8_backward_weight_forms(w1, w2):
                 else triton_build(missing)
             )
 
-    if _mode() != "1":
-        built = build(MXFP8_BACKWARD_FORMS)
-        return tuple(built[name] for name in MXFP8_BACKWARD_FORMS)
-    return cached_weight_forms(w1, w2, MXFP8_BACKWARD_FORMS, build)
+    return build
 
 
 _CUDA_MX: dict = {}

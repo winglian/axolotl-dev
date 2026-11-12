@@ -43,10 +43,11 @@ class PersistentMoE:
         if backward_backend not in ("nccl", "native"):
             raise ValueError("backward_backend must be nccl or native")
         if backward_backend == "native" and (
-            compute_dtype not in ("bf16", "blockwise") or retain_activations
+            compute_dtype not in ("bf16", "blockwise", "mxfp8") or retain_activations
         ):
             raise ValueError(
-                "Native persistent backward requires recomputing BF16 or Hopper blockwise FP8"
+                "Native persistent backward requires recomputing BF16, SM100 MXFP8 or Hopper "
+                "blockwise FP8"
             )
         if compute_dtype == "blockwise" and retain_activations:
             raise ValueError("blockwise persistent FP8 requires recomputation")
@@ -334,8 +335,15 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
         qx, sx = prepare_persistent_mxfp8(x)
         buffer.x[:tokens].copy_(qx)
         buffer.x_sf[:tokens].copy_(sx)
-        tw1 = prepare_persistent_mxfp8(w1, weights=True, interleave=True)
-        tw2 = prepare_persistent_mxfp8(w2, weights=True)
+        backward = runtime._peer_backward
+        if hasattr(backward, "precision") and backward.precision() == "mxfp8":
+            from .weight_cache import mxfp8_forward_weight_forms
+
+            # W1's forward form is the MXFP8 backward's: one cached build serves the step
+            tw1, tw2 = mxfp8_forward_weight_forms(w1, w2)
+        else:
+            tw1 = prepare_persistent_mxfp8(w1, weights=True, interleave=True)
+            tw2 = prepare_persistent_mxfp8(w2, weights=True)
     else:
         from .weight_cache import weight_layouts
 

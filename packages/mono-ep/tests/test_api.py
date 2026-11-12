@@ -98,6 +98,7 @@ def _fake_device(monkeypatch, arch, *, native=True, current=132):
     if native:
         c_ext.bf16_mono_ep_backward_sm90 = object()
         c_ext.bf16_mono_ep_backward = object()
+        c_ext.mxfp8_mono_ep_backward = object()
     deep_gemm = SimpleNamespace(
         _C=c_ext, get_num_sms=lambda: state["num_sms"], set_num_sms=set_num_sms
     )
@@ -122,7 +123,8 @@ def _fake_device(monkeypatch, arch, *, native=True, current=132):
     [
         (9, "auto", True, 768, "native", "bf16"),
         (10, "bf16", True, 768, "native", "bf16"),
-        (10, "auto", True, 768, "nccl", "mxfp8"),
+        (10, "auto", True, 768, "native", "mxfp8"),
+        (10, "mxfp8", False, 768, "nccl", "mxfp8"),
         (9, "bf16", False, 768, "nccl", "bf16"),
         (9, "bf16", True, 640, "nccl", "bf16"),
     ],

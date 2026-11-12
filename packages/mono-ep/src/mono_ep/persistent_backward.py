@@ -3,6 +3,7 @@
 
 """Native single-host persistent BF16 backward and grouped weight gradients."""
 
+import logging
 import os
 import socket
 
@@ -19,6 +20,8 @@ from .dw import (
     weight_grad_quantized,
 )
 from .ops import weight_grad_bf16, weight_grad_bf16_gpu_offsets
+
+LOG = logging.getLogger("mono_ep")
 
 OWNED_BLOCK_M = 128
 
@@ -81,11 +84,13 @@ class NativePersistentBackward:
         if self.arch not in (9, 10) or not hasattr(deep_gemm._C, self.native_name):
             raise RuntimeError("Rebuild vendored DeepGEMM with native MonoEP backward")
         if (
-            runtime.compute_dtype not in ("bf16", "blockwise")
+            runtime.compute_dtype not in ("bf16", "blockwise", "mxfp8")
+            or (runtime.compute_dtype == "mxfp8" and self.arch != 10)
             or runtime.retain_activations
         ):
             raise ValueError(
-                "Native persistent backward requires recomputing BF16 or Hopper blockwise FP8"
+                "Native persistent backward requires recomputing BF16, SM100 MXFP8 or Hopper "
+                "blockwise FP8"
             )
         if deep_gemm.get_mk_alignment_for_contiguous_layout() != 128:
             raise ValueError(
@@ -164,6 +169,7 @@ class NativePersistentBackward:
         self.context_hits = self.context_misses = 0
         self.dw_state = None
         self._mx = {}
+        self._mx_fallback_logged = False
 
     def inkernel_dw(self):
         """SM100 BF16: compute dW1/dW2 inside the persistent backward (``MONO_EP_SM100_INKERNEL_DW``)."""
@@ -201,14 +207,34 @@ class NativePersistentBackward:
         return stored.buffer
 
     def precision(self):
-        """``MONO_EP_SM100_BACKWARD_PRECISION``: ``bf16`` (default) or ``mxfp8`` (SM100 BF16 runtimes)."""
-        value = os.getenv("MONO_EP_SM100_BACKWARD_PRECISION", "bf16")
+        """``MONO_EP_SM100_BACKWARD_PRECISION``: ``bf16`` or ``mxfp8``; unset, the SM100 MXFP8 runtime
+        takes ``mxfp8`` and the BF16 runtime ``bf16``. The MXFP8 backward needs hidden % 512 == 0: an
+        MXFP8 runtime without the selector falls back to the BF16 backward there (logged once), an
+        explicit ``mxfp8`` raises."""
+        value = os.getenv("MONO_EP_SM100_BACKWARD_PRECISION")
+        explicit = value is not None
+        if not explicit:
+            value = "mxfp8" if self.runtime.compute_dtype == "mxfp8" else "bf16"
         if value not in ("bf16", "mxfp8"):
             raise ValueError("MONO_EP_SM100_BACKWARD_PRECISION must be bf16 or mxfp8")
         if value == "mxfp8" and (self.arch != 10 or self.blockwise):
             raise ValueError(
-                "The MXFP8 persistent backward requires SM100 and a BF16 runtime"
+                "The MXFP8 persistent backward requires SM100 and a BF16 or MXFP8 runtime"
             )
+        if value == "mxfp8" and self.runtime.hidden % 512:
+            if explicit:
+                raise ValueError(
+                    f"The MXFP8 persistent backward requires hidden % 512 == 0 (hidden "
+                    f"{self.runtime.hidden}); set MONO_EP_SM100_BACKWARD_PRECISION=bf16"
+                )
+            if not self._mx_fallback_logged:
+                self._mx_fallback_logged = True
+                LOG.warning(
+                    "mono_ep: hidden %d is not a multiple of 512, so the MXFP8 runtime's backward "
+                    "runs the BF16 persistent backward",
+                    self.runtime.hidden,
+                )
+            return "bf16"
         return value
 
     def _mx_resources(self):

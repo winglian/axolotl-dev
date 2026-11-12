@@ -44,13 +44,19 @@ _COMPUTE_DTYPES = {
 _NATIVE_BACKWARD = {
     (9, "bf16"): "bf16_mono_ep_backward_sm90",
     (10, "bf16"): "bf16_mono_ep_backward",
+    (10, "mxfp8"): "mxfp8_mono_ep_backward",
     (9, "fp8"): "fp8_mono_ep_backward_sm90",
     (10, "nvfp4_lora"): "nvfp4_mono_ep_backward",
 }
 
 
 def resolve_precision(precision: str, capability: tuple[int, int]) -> str:
-    """``auto`` is BF16 on SM90 and MXFP8 on SM100; explicit values pass through."""
+    """``auto`` is BF16 on SM90 and MXFP8 on SM100; explicit values pass through.
+
+    SM100 ``mxfp8`` is the MXFP8 forward with the fused MXFP8 persistent backward (the forward and
+    backward share the cached MXFP8 weight forms); ``MONO_EP_SM100_BACKWARD_PRECISION=bf16`` selects
+    the BF16 persistent backward instead, and hidden sizes that are not multiples of 512 take it
+    automatically."""
     if precision != "auto":
         return precision
     return "mxfp8" if capability[0] == 10 else "bf16"

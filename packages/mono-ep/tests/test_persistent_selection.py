@@ -68,7 +68,10 @@ def test_invalid_sm_reservation_before_allocation(
             {"compute_dtype": "blockwise", "retain_activations": True},
             "requires recomputation",
         ),
-        ({"backward_backend": "native", "compute_dtype": "mxfp8"}, "recomputing BF16"),
+        (
+            {"backward_backend": "native", "compute_dtype": "nvfp4_lora"},
+            "recomputing BF16",
+        ),
         (
             {"backward_backend": "native", "retain_activations": True},
             "recomputing BF16",
@@ -170,3 +173,46 @@ def test_owned_backward_ring_floor_counts_clusters(monkeypatch, arch, num_sms, w
     monkeypatch.setenv("MONO_EP_BACKWARD_RING_WAVES", "-1")
     with pytest.raises(ValueError, match=">= 0"):
         owned_backward_ring_tokens(num_sms)
+
+
+def _backward_precision(compute_dtype, hidden):
+    pytest.importorskip("triton")
+    from mono_ep.persistent_backward import NativePersistentBackward
+
+    backend = SimpleNamespace(
+        arch=10,
+        blockwise=False,
+        runtime=SimpleNamespace(compute_dtype=compute_dtype, hidden=hidden),
+        _mx_fallback_logged=False,
+    )
+    return NativePersistentBackward.precision(backend), backend
+
+
+@pytest.mark.parametrize(
+    "compute_dtype,hidden,env,expected",
+    [
+        ("bf16", 2048, None, "bf16"),
+        ("bf16", 2048, "mxfp8", "mxfp8"),
+        ("mxfp8", 2048, None, "mxfp8"),
+        ("mxfp8", 2048, "bf16", "bf16"),
+        ("mxfp8", 2304, None, "bf16"),
+    ],
+)
+def test_sm100_backward_precision_follows_the_runtime(
+    monkeypatch, compute_dtype, hidden, env, expected
+):
+    monkeypatch.delenv("MONO_EP_SM100_BACKWARD_PRECISION", raising=False)
+    if env is not None:
+        monkeypatch.setenv("MONO_EP_SM100_BACKWARD_PRECISION", env)
+    value, backend = _backward_precision(compute_dtype, hidden)
+    assert value == expected
+    # the MXFP8 runtime's automatic fallback for hidden % 512 is logged once
+    assert backend._mx_fallback_logged == (
+        compute_dtype == "mxfp8" and hidden % 512 != 0
+    )
+
+
+def test_sm100_explicit_mxfp8_backward_rejects_hidden_not_multiple_of_512(monkeypatch):
+    monkeypatch.setenv("MONO_EP_SM100_BACKWARD_PRECISION", "mxfp8")
+    with pytest.raises(ValueError, match="hidden % 512"):
+        _backward_precision("bf16", 2304)
