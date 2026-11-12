@@ -9,7 +9,8 @@ from, ``before`` overlays the headers in ``MONO_EP_BEFORE_HEADERS`` (the pre-cha
 
 stage=compile: nvcc/ptxas report (registers, spills, stack, C7510) for both kernels at hidden
 2048 / 4096 / 5120 / 7168, both builds.
-stage=validate: ``validate_sm90_bf16_forward.py`` (FP32 reference, forced ring wrap) at the
+stage=validate: ``validate_sm90_bf16_forward.py`` and, with ``--kinds forward,backward``,
+``validate_sm90_bf16_backward.py`` (FP32 reference, forced ring wrap) at the
 Qwen3-30B-A3B, Qwen3-235B-A22B and Beam shapes on two strict H100s, both builds; outputs
 compared bitwise across builds and the JIT cache cubins compared by hash and SASS.
 stage=timing: ``benchmark_persistent_training.py`` on eight strict H100s, one process per pass
@@ -40,6 +41,10 @@ if modal.is_local():
         )
         .add_local_file(
             root / "examples/validate_sm90_bf16_forward.py", "/probe/validate.py"
+        )
+        .add_local_file(
+            root / "examples/validate_sm90_bf16_backward.py",
+            "/probe/validate_backward.py",
         )
         .add_local_file(
             root / "examples/benchmark_persistent_training.py", "/probe/benchmark.py"
@@ -97,10 +102,14 @@ def _select_build(build):
 
 
 def _records(stdout, prefix):
+    # Two ranks' prints can share a line; decode each JSON object after every prefix
+    decoder = json.JSONDecoder()
     out = []
-    for line in stdout.splitlines():
-        if line.startswith(prefix):
-            out.append(json.loads(line[len(prefix) :]))
+    for chunk in stdout.split(prefix)[1:]:
+        try:
+            out.append(decoder.raw_decode(chunk)[0])
+        except json.JSONDecodeError:
+            continue
     return out
 
 
@@ -275,16 +284,21 @@ VALIDATE_SHAPES = {
 
 
 @app.function(image=image, gpu="H100!:2", cpu=16, memory=65536, timeout=3600)
-def validate(shapes):
+def validate(shapes, kinds=("forward",)):
     import torch
 
     names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
     if not all("H100" in n for n in names):
         return dict(returncode=2, devices=names, error="wrong devices")
     runs = []
+    scripts = {
+        "forward": ("/probe/validate.py", "SM90_BF16_FORWARD "),
+        "backward": ("/probe/validate_backward.py", "SM90_BF16_BACKWARD "),
+    }
     for build in BUILDS:
         _select_build(build)
-        for shape in shapes:
+        for kind, shape in ((k, s) for k in kinds for s in shapes):
+            script, prefix = scripts[kind]
             hidden, inner, experts, topk, tokens = VALIDATE_SHAPES[shape]
             out_dir = f"/tmp/y-{build}"  # nosec B108
             result = subprocess.run(  # nosec B603 B607
@@ -294,7 +308,7 @@ def validate(shapes):
                     "torch.distributed.run",
                     "--standalone",
                     "--nproc-per-node=2",
-                    "/probe/validate.py",
+                    script,
                     "--shape-name",
                     shape,
                     "--hidden",
@@ -323,15 +337,16 @@ def validate(shapes):
                 timeout=1500,
                 check=False,
             )
-            print(f"VALIDATE {build} {shape} rc={result.returncode}", flush=True)
+            print(f"VALIDATE {build} {kind} {shape} rc={result.returncode}", flush=True)
             print(result.stdout[-20000:], flush=True)
             print(result.stderr[-6000:], flush=True)
             runs.append(
                 dict(
                     build=build,
+                    kind=kind,
                     shape=shape,
                     returncode=result.returncode,
-                    records=_records(result.stdout, "SM90_BF16_FORWARD "),
+                    records=_records(result.stdout, prefix),
                     configs=[
                         ln for ln in result.stdout.splitlines() if "MonoEPConfig(" in ln
                     ],
@@ -493,6 +508,7 @@ def main(
     shapes: str = "",
     passes: str = "",
     routings: str = "balanced,skewed",
+    kinds: str = "forward",
 ):
     """stage: compile | validate | timing.
 
@@ -524,12 +540,13 @@ def main(
             )
     elif stage == "validate":
         selected = shapes.split(",") if shapes else list(VALIDATE_SHAPES)
-        payload = validate.remote(selected)
+        payload = validate.remote(selected, tuple(kinds.split(",")))
         payload["modal_app_id"] = os.environ.get("MODAL_APP_ID") or app.app_id
         for run in payload.get("runs", []):
             for record in run["records"]:
                 print(
                     run["build"],
+                    run.get("kind", "forward"),
                     record["shape"],
                     record["routing"],
                     record["rank"],
