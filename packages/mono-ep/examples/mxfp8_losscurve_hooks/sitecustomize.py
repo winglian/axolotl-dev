@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Axolotl AI
 
-"""Counts native persistent backward calls per precision (printed per rank at exit) and prints
+"""Counts native persistent backward calls per backward/dW precision (printed per rank at exit) and prints
 Trainer.log dicts unformatted on rank 0."""
 
 import atexit
@@ -18,7 +18,11 @@ def _wrap_backward(module):
     original = backward.backward
 
     def wrapped(self, *args, **kwargs):
-        key = self.precision() if self.arch == 10 else "sm90"
+        key = "sm90"
+        if self.arch == 10:
+            key = self.precision()
+            if self.dw_precision() != "bf16":
+                key += f"+{self.dw_precision()}dw"
         COUNTS[key] = COUNTS.get(key, 0) + 1
         return original(self, *args, **kwargs)
 

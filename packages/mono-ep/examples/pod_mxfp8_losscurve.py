@@ -3,7 +3,9 @@ FSDP2, 300 steps fineweb-edu) with the runs given on the command line.
 
     python pod_mxfp8_losscurve.py --work /scratch/losscurve --out result.json --runs bf16:1 mxfp8:1 mxfp8dw:1
 
-Run names: bf16, mxfp8 (MXFP8 backward, BF16 dW), mxfp8dw (plus MONO_EP_SM100_DW_PRECISION=mxfp8).
+Run names on the BF16 runtime: bf16, mxfp8 (MXFP8 backward, BF16 dW), mxfp8dw (plus
+MONO_EP_SM100_DW_PRECISION=mxfp8). On the MXFP8 runtime (expert_parallel_mono_ep_precision: mxfp8):
+rt_mxfp8 (BF16 dW), rt_mxfp8dw (MXFP8 dW). The same precision:seed can be repeated under another --tag.
 CUDA_VISIBLE_DEVICES selects the two GPUs. The worktree's env.sh must be sourced first (PYTHONPATH
 with the built DeepGEMM site and mono_ep src)."""
 
@@ -26,7 +28,10 @@ PRECISION_ENV = {
         "MONO_EP_SM100_BACKWARD_PRECISION": "mxfp8",
         "MONO_EP_SM100_DW_PRECISION": "mxfp8",
     },
+    "rt_mxfp8": {},
+    "rt_mxfp8dw": {"MONO_EP_SM100_DW_PRECISION": "mxfp8"},
 }
+SELECTORS = ("MONO_EP_SM100_BACKWARD_PRECISION", "MONO_EP_SM100_DW_PRECISION")
 
 
 def load_config_template():
@@ -110,13 +115,18 @@ def parse(line):
 
 def train(work, template, run, precision, seed, max_steps, tag):
     config = template.replace("/work/", f"{work}/")
+    if precision.startswith("rt_"):
+        config = config.replace(
+            "expert_parallel_mono_ep_precision: bf16",
+            "expert_parallel_mono_ep_precision: mxfp8",
+        )
     out_dir = work / f"out_{tag}_{run}"
     config_path = work / f"config_{tag}_{run}.yaml"
     config_path.write_text(
         config.format(seed=seed, max_steps=max_steps, run=f"{tag}_{run}")
     )
     run_env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if k not in SELECTORS},
         "PYTHONPATH": f"{HERE / 'mxfp8_losscurve_hooks'}:{os.environ.get('PYTHONPATH', '')}",
         "PYTHONUNBUFFERED": "1",
         "LOSSCURVE_COUNT": "1",
@@ -126,8 +136,6 @@ def train(work, template, run, precision, seed, max_steps, tag):
         "MAX_JOBS": "8",
         **PRECISION_ENV[precision],
     }
-    if precision != "mxfp8dw":
-        run_env.pop("MONO_EP_SM100_DW_PRECISION", None)
     train_log, eval_log, other, lines = [], [], [], []
     start = time.time()
     with subprocess.Popen(  # nosec B603 B607
