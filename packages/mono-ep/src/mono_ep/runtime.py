@@ -262,7 +262,7 @@ def _check_sm_budget(runtime):
         )
 
 
-def _forward_impl(x, indices, scores, w1, w2, runtime):
+def _forward_impl(x, indices, scores, w1, w2, runtime, record_key=None):
     import deep_gemm
 
     _check_sm_budget(runtime)
@@ -327,7 +327,7 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
             counts,
         )
         if counts is not None:
-            bound.record(w1, counts)
+            bound.record(w1 if record_key is None else record_key, counts)
         return y, None
     if runtime.compute_dtype == "mxfp8":
         from .token_quantization import prepare_persistent_mxfp8
@@ -396,7 +396,7 @@ def _forward_impl(x, indices, scores, w1, w2, runtime):
                 fast_math=False,
                 cumulative_local_expert_recv_stats=counts,
             )
-            bound.record(w1, counts)
+            bound.record(w1 if record_key is None else record_key, counts)
         else:
             forward(y, tw1, tw2, buffer, fast_math=False)
     return y, saved_z
