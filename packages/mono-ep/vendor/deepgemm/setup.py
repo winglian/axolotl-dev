@@ -44,6 +44,16 @@ third_party_include_dirs = [
     'third-party/cutlass/include/cutlass',
 ]
 
+# Headers python_api.cpp can include (CUTLASS left out: it changes only with a pin bump): distutils rebuilds
+# deep_gemm._C only when a source or one of these is newer than the built extension, so a header-only
+# edit would otherwise reuse a stale object
+depends = sorted(
+    str(path.relative_to(current_dir))
+    for root in ('csrc', 'deep_gemm/include', 'third-party/deep_jit/include')
+    for pattern in ('*.hpp', '*.h', '*.cuh')
+    for path in Path(current_dir, root).rglob(pattern)
+)
+
 # Release
 base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}'
 
@@ -102,6 +112,7 @@ def get_ext_modules():
 
     return [CUDAExtension(name='deep_gemm._C',
                           sources=sources,
+                          depends=depends,
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
                           library_dirs=build_library_dirs,

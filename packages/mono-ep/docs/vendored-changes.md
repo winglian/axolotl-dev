@@ -25,6 +25,10 @@ is new code in this tree. By theme:
   selector, the dispatch pull sizing (`mono_ep_dispatch_pull.hpp`), the combine chunk
   sizing (`mono_ep_combine.cuh`), exclusive-slot scatter-store epilogues, and the grouped
   GEMM entry points with in-kernel readiness and GPU row bounds.
+- **Build** (`setup.py`): `deep_gemm._C` lists the headers under `csrc/`, `deep_gemm/include/`
+  and the fetched `third-party/deep_jit/include/` as `depends`, so distutils rebuilds the
+  extension after a header-only edit instead of reusing the stale object (CUTLASS stays out; it
+  changes only with a pin bump).
 - **Host side** (`src/mono_ep`): the `torch.library` ops and fake implementations, the
   `PersistentMoE` runtime and `MonoEPRuntime` API, the NCCL reference backward, the weight
   layout cache and its FSDP2 contract, SM90 FP8 weight forms and fused token preparation
