@@ -260,8 +260,55 @@ class MergedWeights:
     has_forward = True
     has_backward = True
 
+    def tensors(self):
+        return [self.w1, self.w2]
+
     def nbytes(self):
-        return sum(t.numel() * t.element_size() for t in (self.w1, self.w2))
+        return sum(t.numel() * t.element_size() for t in self.tensors())
+
+
+@dataclass
+class MergedMxfp8Forms:
+    """One step's merged experts as the four SM100 MXFP8 forms the fused kernels read
+    (``sm100_mx_w1``, ``sm100_mx_w1t``, ``sm100_mx_w2``, ``sm100_mx_w2t``), built by the
+    CUDA forms builder with the merge fused in; the merged BF16 weight never exists."""
+
+    forms: dict
+    version: int
+    has_forward = True
+    has_backward = True
+
+    def tensors(self):
+        """Every form's values (as bytes) and scale words, in a fixed order."""
+        return [
+            t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t
+            for name in sorted(self.forms)
+            for t in self.forms[name]
+        ]
+
+    def nbytes(self):
+        return sum(t.numel() * t.element_size() for t in self.tensors())
+
+
+def mxfp8_forms_mode():
+    """``MONO_EP_LORA_MXFP8_FORMS``: ``fused`` (default: the merge runs inside the CUDA MXFP8
+    forms builder) or ``merge`` (merge to BF16, then the full fine-tune's forms)."""
+    value = os.environ.get("MONO_EP_LORA_MXFP8_FORMS", "fused")
+    if value not in ("fused", "merge"):
+        raise ValueError("MONO_EP_LORA_MXFP8_FORMS must be fused or merge")
+    return value
+
+
+def _fused_mxfp8_forms(runtime, w1):
+    """Whether this call's merged weights are built as MXFP8 forms with the merge fused in."""
+    native = runtime._peer_backward
+    if runtime.compute_dtype != "mxfp8" or w1.dtype != torch.bfloat16:
+        return False
+    if native.precision() != "mxfp8" or mxfp8_forms_mode() != "fused":
+        return False
+    from .mx_weight_forms import cuda_forms_available
+
+    return cuda_forms_available(w1.device)
 
 
 def merge(w, lora_b, lora_a, scaling):
@@ -282,15 +329,25 @@ class LoraExperts:
     def __init__(self, *, scaling):
         self.scaling = float(scaling)
         self.w1 = self.w2 = None
+        self.mxfp8_forms = False
         self.key = next(_LAYER_KEYS)
 
-    def bind(self, w1, w2):
-        self.w1, self.w2 = w1, w2
+    def bind(self, w1, w2, mxfp8_forms=False):
+        self.w1, self.w2, self.mxfp8_forms = w1, w2, mxfp8_forms
         return self
 
     def merged(self, a1, b1, a2, b2, version=0):
         if self.w1 is None:
             raise RuntimeError("LoraExperts.merged before bind(w1, w2)")
+        if self.mxfp8_forms:
+            from .mx_weight_forms import cuda_mx_lora_forms
+
+            return MergedMxfp8Forms(
+                cuda_mx_lora_forms(
+                    self.w1.detach(), self.w2.detach(), a1, b1, a2, b2, self.scaling
+                ),
+                version,
+            )
         return MergedWeights(
             merge(self.w1, b1, a1, self.scaling),
             merge(self.w2, b2, a2, self.scaling),
@@ -328,8 +385,22 @@ def lora_forward(
 
     runtime = _RUNTIMES[runtime_key]
     experts, cache = _LAYERS[layer_key]
-    merged = cache.forward(experts.bind(w1, w2), (a1, b1, a2, b2))
+    merged = cache.forward(
+        experts.bind(w1, w2, _fused_mxfp8_forms(runtime, w1)), (a1, b1, a2, b2)
+    )
     experts.bind(None, None)
+    if isinstance(merged, MergedMxfp8Forms):
+        f = merged.forms
+        return _forward_impl(
+            x,
+            indices,
+            scores,
+            w1,
+            w2,
+            runtime,
+            record_key=w1,
+            mx_forms=(f["sm100_mx_w1"], f["sm100_mx_w2"]),
+        )[0]
     return _forward_impl(
         x, indices, scores, merged.w1, merged.w2, runtime, record_key=w1
     )[0]
@@ -364,9 +435,27 @@ def lora_backward(
     native = _RUNTIMES[runtime_key]._peer_backward
     experts, cache = _LAYERS[layer_key]
     adapters = (a1, b1, a2, b2)
-    merged = cache.backward(experts.bind(w1, w2), adapters)
+    merged = cache.backward(
+        experts.bind(w1, w2, _fused_mxfp8_forms(_RUNTIMES[runtime_key], w1)), adapters
+    )
     experts.bind(None, None)
-    if native.blockwise:
+    if isinstance(merged, MergedMxfp8Forms):
+        f = merged.forms
+        dx, ds, _, _ = native.backward(
+            dy,
+            x,
+            indices,
+            scores,
+            w1,
+            w2,
+            record_key=w1,
+            weight_grads=False,
+            mx_forms=(f["sm100_mx_w1"], f["sm100_mx_w2t"], f["sm100_mx_w1t"]),
+        )
+        grads = lora_weight_grads(
+            native.pools[:4], native.starts, native.counts, *adapters, experts.scaling
+        )
+    elif native.blockwise:
         # the blockwise FP8 backward keeps FP8 operands only: project its full dW
         dx, ds, dw1, dw2 = native.backward(
             dy, x, indices, scores, merged.w1, merged.w2, record_key=w1

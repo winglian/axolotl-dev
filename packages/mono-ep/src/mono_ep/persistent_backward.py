@@ -304,7 +304,7 @@ class NativePersistentBackward:
         return resolve_dw_precision(self.runtime.compute_dtype, self.precision())
 
     def _backward_mxfp8(
-        self, dy, x, indices, scores, w1, w2, stored_z=None, mxfp8_dw=False
+        self, dy, x, indices, scores, w1, w2, stored_z=None, mxfp8_dw=False, forms=None
     ):
         import deep_gemm
 
@@ -323,7 +323,8 @@ class NativePersistentBackward:
         mx.buffer.topk_idx[:tokens].copy_(indices)
         mx.buffer.topk_weights[:tokens].copy_(scores)
         _mark("token_quant")
-        forms = mxfp8_backward_weight_forms(w1, w2)
+        if forms is None:
+            forms = mxfp8_backward_weight_forms(w1, w2)
         _mark("weight_forms")
         dx = torch.empty_like(x)
         ds = torch.empty_like(scores, dtype=torch.float32)
@@ -443,13 +444,23 @@ class NativePersistentBackward:
         ]
 
     def backward(
-        self, dy, x, indices, scores, w1, w2, record_key=None, weight_grads=True
+        self,
+        dy,
+        x,
+        indices,
+        scores,
+        w1,
+        w2,
+        record_key=None,
+        weight_grads=True,
+        mx_forms=None,
     ):
         """``dx, dscore, dW1, dW2``. ``record_key`` (default ``w1``) is the tensor the
         matching forward recorded its receive counts under. ``weight_grads=False``
         returns ``None`` for both weight gradients and leaves the BF16 x / dy / h / dz
         pools (``pools[:4]``, by ``starts`` / ``counts``) for the caller; the MXFP8
-        backward then runs with BF16 dW so it writes them."""
+        backward then runs with BF16 dW so it writes them. ``mx_forms`` hands the MXFP8
+        backward its ``(w1, w2t, w1t)`` forms instead of building them from ``w1`` / ``w2``."""
         import deep_gemm
         from deep_gemm.mega import _interleave_weights
 
@@ -492,6 +503,7 @@ class NativePersistentBackward:
                 w2,
                 self._take_context(x, indices, scores, w1, w2),
                 dw == "mxfp8",
+                mx_forms,
             )
             if not weight_grads:
                 return self._finish_pools(dx, ds, scores, stream)

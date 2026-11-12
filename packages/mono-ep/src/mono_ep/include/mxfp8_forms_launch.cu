@@ -31,6 +31,11 @@
 // SR [E][COLS / 128][ROWS] in the UTCCP row order; transposed form
 // QT [E, COLS, ROWS] with words ST [E][ROWS / 128][COLS]. Each word packs
 // the four UE8M0 exponents of one 128-wide K block, low byte first.
+//
+// LoRA instantiation (BF16 W only): the tile is first merged in shared memory with
+// W + scaling * B_e @ A_e (B [E, ROWS, R], A [E, R, COLS], BF16): the rank-R product on the
+// tensor cores (FP32 accumulate) and the merge one fmaf rounded to BF16 once, so the forms
+// quantize the merged weight without it ever reaching global memory.
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -59,6 +64,11 @@ struct Layout {
     static constexpr int kWordsT = kWordsR + 2 * kWordBytes;
     static constexpr int kBarrier = kWordsT + kWordBytes;
     static constexpr int kSmemBytes = kBarrier + 16;
+    // LoRA factors after the barrier, BF16 zero-padded to the MMA K step: B [128 rows][Rp], A^T [128 cols][Rp]
+    static constexpr int kLoraOffset = (kSmemBytes + 127) / 128 * 128;
+    static constexpr int lora_bytes(int rank) {
+        return (rank <= 16 ? 16 : rank <= 32 ? 32 : rank <= 64 ? 64 : 128) * kTile * 4;
+    }
     static constexpr int kMinBlocks = sizeof(T) == 2 ? 4 : 2;
 };
 
@@ -357,10 +367,71 @@ struct Maps {
     CUtensorMap out_t;  // QT as [E * COLS, ROWS]
 };
 
-template <typename T, bool kRowForm, bool kTForm>
-__global__ void __launch_bounds__(kThreads, Layout<T>::kMinBlocks)
-    forms_kernel(const __grid_constant__ Maps maps, int rows, int cols, int interleave, int32_t* __restrict__ sr,
-                 int32_t* __restrict__ st, int debug) {
+struct Lora {
+    const __nv_bfloat16* b;  // [E, ROWS, R]
+    const __nv_bfloat16* a;  // [E, R, COLS]
+    int rank;
+    float scaling;
+};
+
+// Rank padded to a power-of-two number of MMA K steps (1, 2, 4, 8); the factors are staged zero-padded to it.
+__device__ __host__ __forceinline__ int lora_steps(int rank) { return rank <= 16 ? 1 : rank <= 32 ? 2 : rank <= 64 ? 4 : 8; }
+__device__ __host__ __forceinline__ int padded_rank(int rank) { return lora_steps(rank) * 16; }
+
+__device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Warp w merges tile rows 16w .. 16w + 15 in place: delta = B_rows @ A_tile on the tensor cores (BF16 in,
+// FP32 accumulate, K = the padded rank), then W + scaling * delta with one fmaf, rounded to BF16. The staged
+// factors are B as [128 rows][Rp] and A transposed as [128 columns][Rp], K contiguous in both.
+template <int kSteps>
+__device__ __forceinline__ void merge_tile(uint32_t smem, const uint8_t* factors, float scaling, int t) {
+    constexpr int rp = kSteps * 16;
+    const uint32_t* bs = reinterpret_cast<const uint32_t*>(factors);
+    const uint32_t* at = reinterpret_cast<const uint32_t*>(factors + kTile * rp * 2);
+    const int warp = t >> 5, lane = t & 31, g = lane >> 2, q = lane & 3;
+    const int row0 = warp * 16 + g, row1 = row0 + 8;
+    constexpr int words = rp / 2;  // u32 per staged row
+    uint32_t a[kSteps][4];
+#pragma unroll
+    for (int s = 0; s < kSteps; ++s) {
+        a[s][0] = bs[row0 * words + s * 8 + q];
+        a[s][1] = bs[row1 * words + s * 8 + q];
+        a[s][2] = bs[row0 * words + s * 8 + 4 + q];
+        a[s][3] = bs[row1 * words + s * 8 + 4 + q];
+    }
+    for (int nb = 0; nb < kTile / 8; ++nb) {
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const int n = nb * 8 + g;
+#pragma unroll
+        for (int s = 0; s < kSteps; ++s) {
+            mma_bf16_16816(acc, a[s], at[n * words + s * 8 + q], at[n * words + s * 8 + 4 + q]);
+        }
+        const int col = nb * 8 + 2 * q;
+        const uint32_t base = smem + (col / 64) * kSub + ((col % 8) * 2);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint32_t addr = base + swizzled(h ? row1 : row0, (col % 64) / 8);
+            float lo, hi;
+            unpack_bf16x2(lds32(addr), lo, hi);
+            const __nv_bfloat162 merged =
+                __floats2bfloat162_rn(fmaf(scaling, acc[2 * h], lo), fmaf(scaling, acc[2 * h + 1], hi));
+            uint32_t out;
+            memcpy(&out, &merged, 4);
+            asm volatile("st.shared.b32 [%0], %1;" ::"r"(addr), "r"(out) : "memory");
+        }
+    }
+}
+
+template <typename T, bool kRowForm, bool kTForm, int kLoraSteps>
+__device__ __forceinline__ void forms_body(const Maps& maps, int rows, int cols, int interleave,
+                                           int32_t* __restrict__ sr, int32_t* __restrict__ st, int debug,
+                                           const Lora& lora) {
     using L = Layout<T>;
     const uint32_t smem = smem_u32(smem_raw);
     const uint32_t bar = smem + L::kBarrier;
@@ -380,8 +451,27 @@ __global__ void __launch_bounds__(kThreads, Layout<T>::kMinBlocks)
             }
         }
     }
+    if constexpr (kLoraSteps > 0) {
+        // stage the factors of this tile (zero-padded to the MMA K step) while the TMA load is in flight
+        const int rp = padded_rank(lora.rank);
+        __nv_bfloat16* bs = reinterpret_cast<__nv_bfloat16*>(smem_raw + L::kLoraOffset);
+        __nv_bfloat16* at = bs + kTile * rp;
+        const __nv_bfloat16* b = lora.b + (e * rows + rb * kTile) * lora.rank;
+        const __nv_bfloat16* a = lora.a + e * lora.rank * cols + cb * kTile;
+        const __nv_bfloat16 zero = __float2bfloat16_rn(0.0f);
+        for (int i = t; i < kTile * rp; i += kThreads) {
+            const int x = i / rp, k = i % rp;  // tile row of B, K contiguous in global and shared memory
+            bs[i] = k < lora.rank ? b[x * lora.rank + k] : zero;
+            const int kt = i / kTile, xt = i % kTile;  // A row kt, columns contiguous in global memory
+            at[xt * rp + kt] = kt < lora.rank ? a[kt * static_cast<int64_t>(cols) + xt] : zero;
+        }
+    }
     __syncthreads();
     if (!(debug & 1)) mbarrier_wait(bar, 0);
+    if constexpr (kLoraSteps > 0) {
+        merge_tile<kLoraSteps>(smem, smem_raw + L::kLoraOffset, lora.scaling, t);
+        __syncthreads();
+    }
 
     // Interleaved W1: the tile's rows land as the even (gate) or odd (up) 8-row groups of two output blocks.
     const int half = rows / 2;
@@ -433,6 +523,20 @@ __global__ void __launch_bounds__(kThreads, Layout<T>::kMinBlocks)
     }
 }
 
+template <typename T, bool kRowForm, bool kTForm>
+__global__ void __launch_bounds__(kThreads, Layout<T>::kMinBlocks)
+    forms_kernel(const __grid_constant__ Maps maps, int rows, int cols, int interleave, int32_t* __restrict__ sr,
+                 int32_t* __restrict__ st, int debug) {
+    forms_body<T, kRowForm, kTForm, 0>(maps, rows, cols, interleave, sr, st, debug, Lora{});
+}
+
+template <typename T, bool kRowForm, bool kTForm, int kLoraSteps>
+__global__ void __launch_bounds__(kThreads, 3)
+    lora_forms_kernel(const __grid_constant__ Maps maps, int rows, int cols, int interleave,
+                      int32_t* __restrict__ sr, int32_t* __restrict__ st, const __grid_constant__ Lora lora) {
+    forms_body<T, kRowForm, kTForm, kLoraSteps>(maps, rows, cols, interleave, sr, st, 0, lora);
+}
+
 // ---- host --------------------------------------------------------------------------------------
 
 using EncodeTiled = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
@@ -465,16 +569,20 @@ int encode(CUtensorMap* map, CUtensorMapDataType type, int rank, const void* add
     return r == CUDA_SUCCESS ? 0 : -4;
 }
 
-template <typename T, bool kRowForm, bool kTForm>
+template <typename T, bool kRowForm, bool kTForm, int kLoraSteps = 0>
 int launch(const void* w, int experts, int rows, int cols, int interleave, void* qr, int32_t* sr, void* qt,
-           int32_t* st, int debug, cudaStream_t stream) {
+           int32_t* st, int debug, cudaStream_t stream, Lora lora = Lora{nullptr, nullptr, 0, 0.0f}) {
     using L = Layout<T>;
-    auto kernel = forms_kernel<T, kRowForm, kTForm>;
-    static bool configured = false;  // per instantiation
-    if (!configured) {
-        cudaError_t err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, L::kSmemBytes);
+    auto kernel = [] {
+        if constexpr (kLoraSteps > 0) return lora_forms_kernel<T, kRowForm, kTForm, kLoraSteps>;
+        else return forms_kernel<T, kRowForm, kTForm>;
+    }();
+    const int smem_bytes = kLoraSteps > 0 ? L::kLoraOffset + L::lora_bytes(lora.rank) : L::kSmemBytes;
+    static int configured = 0;  // per instantiation: the largest dynamic shared memory set so far
+    if (smem_bytes > configured) {
+        cudaError_t err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         if (err != cudaSuccess) return static_cast<int>(err);
-        configured = true;
+        configured = smem_bytes;
     }
     Maps maps;
     memset(&maps, 0, sizeof(maps));
@@ -513,7 +621,11 @@ int launch(const void* w, int experts, int rows, int cols, int interleave, void*
         if (rc) return rc;
     }
     const dim3 grid(cols / kTile, rows / kTile, experts);
-    kernel<<<grid, kThreads, L::kSmemBytes, stream>>>(maps, rows, cols, interleave, sr, st, debug);
+    if constexpr (kLoraSteps > 0) {
+        kernel<<<grid, kThreads, smem_bytes, stream>>>(maps, rows, cols, interleave, sr, st, lora);
+    } else {
+        kernel<<<grid, kThreads, smem_bytes, stream>>>(maps, rows, cols, interleave, sr, st, debug);
+    }
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -550,5 +662,31 @@ int mxfp8_forms_launch(uintptr_t w, int dtype, int experts, int rows, int cols, 
         }
     }
 #undef MONO_EP_FORMS_CASE
+    return -1;
+}
+
+// The forms of the merged BF16 weight W + scaling * B @ A (see the LoRA instantiation above): the row form
+// (optionally interleaved) and the transposed form in one launch. Same return codes; -2 for a rank outside 1..128.
+int mxfp8_lora_forms_launch(uintptr_t w, uintptr_t b, uintptr_t a, int rank, float scaling, int experts, int rows,
+                            int cols, int interleave, uintptr_t qr, uintptr_t sr, uintptr_t qt, uintptr_t st,
+                            uintptr_t stream_ptr) {
+    using namespace mono_ep_mxfp8_forms;
+    if (experts == 0) return 0;
+    if (rank < 1 || rank > 128) return -2;
+    const Lora lora{reinterpret_cast<const __nv_bfloat16*>(b), reinterpret_cast<const __nv_bfloat16*>(a), rank,
+                    scaling};
+#define MONO_EP_LORA_FORMS_CASE(STEPS)                                                                        \
+    case STEPS:                                                                                               \
+        return launch<__nv_bfloat16, true, true, STEPS>(                                                      \
+            reinterpret_cast<const void*>(w), experts, rows, cols, interleave, reinterpret_cast<void*>(qr),  \
+            reinterpret_cast<int32_t*>(sr), reinterpret_cast<void*>(qt), reinterpret_cast<int32_t*>(st), 0, \
+            reinterpret_cast<cudaStream_t>(stream_ptr), lora)
+    switch (lora_steps(rank)) {
+        MONO_EP_LORA_FORMS_CASE(1);
+        MONO_EP_LORA_FORMS_CASE(2);
+        MONO_EP_LORA_FORMS_CASE(4);
+        MONO_EP_LORA_FORMS_CASE(8);
+    }
+#undef MONO_EP_LORA_FORMS_CASE
     return -1;
 }

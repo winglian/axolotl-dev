@@ -327,11 +327,20 @@ def main():
                 samples.append(a.elapsed_time(b))
             return statistics.median(samples)
 
+        from mono_ep.lora import _fused_mxfp8_forms
+
         merged = layer.merged(a1, b1, a2, b2)
+        fused_forms = _fused_mxfp8_forms(runtime._moe, w1)
         rebuild = dict(
             merge_ms=timed(lambda: layer.merged(a1, b1, a2, b2)),
             forms_ms=timed(lambda: forms(merged)),
             merged_gib=merged.nbytes() / 2**30,
+            fused_forms=fused_forms,
+            fused_forms_ms=timed(
+                lambda: layer.bind(w1, w2, True).merged(a1, b1, a2, b2)
+            )
+            if fused_forms
+            else None,
             cache=state.stats(),
         )
     result = dict(
@@ -360,6 +369,9 @@ def main():
                 "MONO_EP_STORED_CONTEXT",
                 "MONO_EP_LORA_MERGED_CACHE",
                 "MONO_EP_SM100_DW_PRECISION",
+                "MONO_EP_LORA_MXFP8_FORMS",
+                "MONO_EP_LORA_PROJECTIONS",
+                "MONO_EP_LORA_MXFP8_POOLS",
             )
         },
     )

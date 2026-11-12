@@ -262,7 +262,7 @@ def _check_sm_budget(runtime):
         )
 
 
-def _forward_impl(x, indices, scores, w1, w2, runtime, record_key=None):
+def _forward_impl(x, indices, scores, w1, w2, runtime, record_key=None, mx_forms=None):
     import deep_gemm
 
     _check_sm_budget(runtime)
@@ -336,7 +336,9 @@ def _forward_impl(x, indices, scores, w1, w2, runtime, record_key=None):
         buffer.x[:tokens].copy_(qx)
         buffer.x_sf[:tokens].copy_(sx)
         backward = runtime._peer_backward
-        if hasattr(backward, "precision") and backward.precision() == "mxfp8":
+        if mx_forms is not None:
+            tw1, tw2 = mx_forms
+        elif hasattr(backward, "precision") and backward.precision() == "mxfp8":
             from .weight_cache import mxfp8_forward_weight_forms
 
             # W1's forward form is the MXFP8 backward's: one cached build serves the step

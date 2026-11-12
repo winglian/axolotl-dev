@@ -258,3 +258,45 @@ def cuda_mx_backward_forms(w1, w2):
     w1_form, w1t_form = _cuda_forms(w1, row_form=True, interleave=True, t_form=True)
     (w2t_form,) = _cuda_forms(w2, row_form=False, interleave=False, t_form=True)
     return w1_form, w2t_form, w1t_form
+
+
+def cuda_mx_lora_forms(w1, w2, a1, b1, a2, b2, scaling):
+    """The four MXFP8 forms of the merged experts ``bf16(W + scaling * B_e @ A_e)`` straight from
+    the BF16 base and the factors (``a1 [E, r, H]``, ``b1 [E, 2I, r]``, ``a2 [E, r, I]``,
+    ``b2 [E, H, r]``), merged tile by tile in shared memory: ``sm100_mx_w1`` (interleaved),
+    ``sm100_mx_w1t``, ``sm100_mx_w2`` and ``sm100_mx_w2t`` as ``(values, scale words)``."""
+    forms = {}
+    for w, a, b, row, t, interleave in (
+        (w1, a1, b1, "sm100_mx_w1", "sm100_mx_w1t", True),
+        (w2, a2, b2, "sm100_mx_w2", "sm100_mx_w2t", False),
+    ):
+        experts, rows, cols = _check(w, interleave)
+        if w.dtype != torch.bfloat16 or w.data_ptr() % 16:
+            raise ValueError("the fused LoRA forms take a 16-byte aligned BF16 base")
+        rank = a.shape[1]
+        a = a.detach().to(torch.bfloat16).contiguous()
+        b = b.detach().to(torch.bfloat16).contiguous()
+        if a.shape != (experts, rank, cols) or b.shape != (experts, rows, rank):
+            raise ValueError("LoRA factors do not match the base")
+        qr, sr, qt, st = _outputs(w, row_form=True, t_form=True)
+        if experts:
+            err = _extension().lora_launch(
+                w.data_ptr(),
+                b.data_ptr(),
+                a.data_ptr(),
+                rank,
+                float(scaling),
+                experts,
+                rows,
+                cols,
+                int(interleave),
+                qr.data_ptr(),
+                sr.data_ptr(),
+                qt.data_ptr(),
+                st.data_ptr(),
+                torch.cuda.current_stream(w.device).cuda_stream,
+            )
+            if err:
+                raise RuntimeError(f"mxfp8 LoRA forms launch failed with code {err}")
+        forms[row], forms[t] = _pack(True, True, qr, sr, qt, st)
+    return forms

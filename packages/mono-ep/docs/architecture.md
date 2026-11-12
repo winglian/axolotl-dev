@@ -188,7 +188,10 @@ returns the BF16 x / dy / h / dz pools, whose padded tails the kernels zero; `lo
 computes `Q = X Aᵀ`, `P = dZ B`, `dA = s Pᵀ X`, `dB = s dZᵀ Q` (and the same for W2 with dY and
 H) as eight grouped GEMMs. The full dW is never formed. The MXFP8 backward is launched with BF16
 dW for this, so it writes the BF16 pools (x and dy are the dequantized MXFP8 operands the kernel
-used). The SM90 blockwise FP8 backward keeps only FP8 operand copies, so `fp8_lora` instead
+used). Under `mxfp8_lora` the merged BF16 weight is never written: the CUDA MXFP8 forms builder
+loads each 128 x 128 base tile, adds `scaling * B @ A` for it on the tensor cores in shared memory
+and quantizes the merged tile into all four forms (`MONO_EP_LORA_MXFP8_FORMS=fused`, default). The
+SM90 blockwise FP8 backward keeps only FP8 operand copies, so `fp8_lora` instead
 projects the full FP8 dW the Hopper wgrad already computes (`dA = s Bᵀ dW`, `dB = s dW Aᵀ`). The
 forward and backward run as the `mono_ep::lora_forward` / `lora_backward` custom ops, so
 selective activation checkpointing saves the fused output exactly as it does for

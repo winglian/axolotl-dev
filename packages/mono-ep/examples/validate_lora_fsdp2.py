@@ -138,8 +138,8 @@ def main():
     from mono_ep.lora import (
         LoraExperts,
         MergedWeightCache,
+        _fused_mxfp8_forms,
         attach_post_step_hook,
-        merge,
     )
     from mono_ep.runtime import PersistentMoE
 
@@ -242,13 +242,21 @@ def main():
         entry = cache.entries.get(id(experts))
         live = [_full(p) for p in adapters]
         fresh = (
-            merge(w1, live[1], live[0], SCALING),
-            merge(w2, live[3], live[2], SCALING),
+            LoraExperts(scaling=SCALING)
+            .bind(w1, w2, _fused_mxfp8_forms(runtime, w1))
+            .merged(*live)
         )
-        cached_ok = entry is not None and all(
-            torch.equal(a, b) for a, b in zip((entry.w1, entry.w2), fresh, strict=True)
+        cached_ok = (
+            entry is not None
+            and type(entry) is type(fresh)
+            and all(
+                torch.equal(a, b)
+                for a, b in zip(entry.tensors(), fresh.tensors(), strict=True)
+            )
         )
-        changed = prev_merged is None or not torch.equal(prev_merged, fresh[0])
+        changed = prev_merged is None or not torch.equal(
+            prev_merged, fresh.tensors()[0]
+        )
         base_ok = torch.equal(w1, base[0]) and torch.equal(w2, base[1])
         worst = torch.tensor(list(errs.values()), device=device)
         dist.all_reduce(worst, op=dist.ReduceOp.MAX)
@@ -280,7 +288,7 @@ def main():
         )
         if dist.get_rank() == 0:
             print(json.dumps(results[-1]), flush=True)
-        prev_merged = fresh[0].clone()
+        prev_merged = fresh.tensors()[0].clone()
         if step < args.steps:
             optimizer.step()
     torch.cuda.synchronize()

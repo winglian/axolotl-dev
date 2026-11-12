@@ -219,8 +219,8 @@ def test_base_frozen_and_merge_rebuilt_per_step(group, monkeypatch, dtype):
     from mono_ep.lora import (
         LoraExperts,
         MergedWeightCache,
+        _fused_mxfp8_forms,
         attach_post_step_hook,
-        merge,
     )
 
     _require(dtype)
@@ -242,8 +242,16 @@ def test_base_frozen_and_merge_rebuilt_per_step(group, monkeypatch, dtype):
         assert all(g is not None and torch.isfinite(g).all() for g in grads)
         entry = cache.entries[id(layer)]
         assert entry.version == step == cache.version
-        assert torch.equal(entry.w1, merge(w1, adapters[1], adapters[0], SCALING))
-        assert torch.equal(entry.w2, merge(w2, adapters[3], adapters[2], SCALING))
+        fresh = (
+            LoraExperts(scaling=SCALING)
+            .bind(w1, w2, _fused_mxfp8_forms(runtime, w1))
+            .merged(*adapters)
+        )
+        assert type(fresh) is type(entry)
+        assert all(
+            torch.equal(a, b)
+            for a, b in zip(entry.tensors(), fresh.tensors(), strict=True)
+        )
         outputs.append(y)
         optimizer.step()
     runtime.close()
@@ -343,3 +351,57 @@ def test_layer_cache_eviction_and_sac(group, monkeypatch, dtype):
     assert torch.equal(y_sac, y_ref) and torch.equal(dx_sac, dx_ref)
     for got, want in zip(sum(grads_sac, []), sum(grads_ref, []), strict=True):
         assert rel(got, want) < 1e-3
+
+
+def test_fused_mxfp8_forms_match_a_single_rounded_merge(group):
+    """The MXFP8 forms with the merge fused into the CUDA builder: bitwise the plain forms for zero
+    adapters, and the forms of the single-rounded FP32 merge up to the rank-r summation order."""
+    _require("mxfp8")
+    from mono_ep.mx_weight_forms import cuda_mx_backward_forms, cuda_mx_lora_forms
+    from mono_ep.token_quantization import prepare_persistent_mxfp8
+
+    def plain(m1, m2):
+        f1, f2t, f1t = cuda_mx_backward_forms(m1, m2)
+        return dict(
+            sm100_mx_w1=f1,
+            sm100_mx_w1t=f1t,
+            sm100_mx_w2=prepare_persistent_mxfp8(m2, weights=True),
+            sm100_mx_w2t=f2t,
+        )
+
+    _, _, _, w1, w2, _, _ = _inputs(256, 4)
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    for rank in (8, 16, 40):
+        a1, a2 = (
+            torch.randn(EXPERTS, rank, k, device="cuda", generator=gen) / k**0.5
+            for k in (HIDDEN, INNER)
+        )
+        b1, b2 = (
+            torch.randn(EXPERTS, n, rank, device="cuda", generator=gen) * 0.02
+            for n in (2 * INNER, HIDDEN)
+        )
+        zero = cuda_mx_lora_forms(w1, w2, a1, b1 * 0, a2, b2 * 0, SCALING)
+        base = plain(w1, w2)
+        for name in base:
+            assert torch.equal(
+                zero[name][0].view(torch.uint8), base[name][0].view(torch.uint8)
+            )
+            assert torch.equal(zero[name][1], base[name][1])
+        fused = cuda_mx_lora_forms(w1, w2, a1, b1, a2, b2, SCALING)
+        single = plain(
+            (
+                w1.float() + SCALING * b1.bfloat16().float() @ a1.bfloat16().float()
+            ).bfloat16(),
+            (
+                w2.float() + SCALING * b2.bfloat16().float() @ a2.bfloat16().float()
+            ).bfloat16(),
+        )
+        for name in single:
+            differ = fused[name][0].view(torch.uint8) != single[name][0].view(
+                torch.uint8
+            )
+            assert differ.float().mean() < 1e-5, (rank, name)
+            assert (fused[name][1] != single[name][1]).float().mean() < 1e-4, (
+                rank,
+                name,
+            )
