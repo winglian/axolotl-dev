@@ -197,6 +197,16 @@ forward and backward run as the `mono_ep::lora_forward` / `lora_backward` custom
 selective activation checkpointing saves the fused output exactly as it does for
 `persistent_forward`.
 
+Declined: computing the rank-r projections in the backward epilogue. Of the four projections only
+`P1 = dZ B1` and `Q2 = H A2ᵀ` see their pool operand in an epilogue (the recompute epilogue holds
+dZ and H tiles); `X` and `dY` exist only as GEMM A operands and in the dispatch warps, and the four
+row contractions read the pools again in any case. Appending the factors as extra weight rows to
+the existing GEMMs instead costs whole 256-row UMMA tiles under swap-AB (one extra tile per 6-20),
+more than it saves. Measured on one B200 at the EP8 pools (131,072 rows, rank 16) the eight
+Python-side GEMMs take 0.86 / 1.57 / 1.98 ms per layer at 30B-A3B / 235B-A22B / Beam, 60-73 % of
+their two-pass bandwidth floor, and the epilogue-reachable P1 + Q2 0.18 / 0.30 / 0.43 ms, about 2-3 %
+of the SAC step before any cost on the backward's critical epilogue warps.
+
 ## Dispatch mode and the bounded compact receive
 
 The dispatch mode (`expert_parallel_mono_ep_mode: dispatch`, `MonoEPDispatchRuntime`) runs only

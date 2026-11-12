@@ -30,12 +30,19 @@ MERGED_CACHE_MODES = ("layer", "all")
 MERGED_CACHE_LAYERS = 2
 
 
-def wgrad_mode():
-    """``MONO_EP_LORA_WGRAD=loop`` (or the older ``MONO_EP_NVFP4_LORA_WGRAD``): per-expert
-    adapter-gradient fallback instead of the grouped GEMMs."""
-    return os.environ.get(
-        "MONO_EP_LORA_WGRAD", os.environ.get("MONO_EP_NVFP4_LORA_WGRAD", "grouped")
+WGRAD_MODES = ("grouped", "triton", "loop")
+
+
+def wgrad_mode(default="grouped"):
+    """``MONO_EP_LORA_WGRAD`` (or the older ``MONO_EP_NVFP4_LORA_WGRAD``): ``grouped``
+    (``torch._grouped_mm``), ``triton`` (the two-pass kernels of :mod:`mono_ep.lora_grads`) or
+    ``loop`` (per-expert reference); ``default`` when unset."""
+    value = os.environ.get(
+        "MONO_EP_LORA_WGRAD", os.environ.get("MONO_EP_NVFP4_LORA_WGRAD", default)
     )
+    if value not in WGRAD_MODES:
+        raise ValueError(f"MONO_EP_LORA_WGRAD must be one of {WGRAD_MODES}")
+    return value
 
 
 def merged_cache_mode(mode=None, env="MONO_EP_LORA_MERGED_CACHE"):
@@ -180,7 +187,9 @@ def padded_offsets(starts, counts):
     return torch.cat([starts[1:], last]).to(torch.int32)
 
 
-def lora_weight_grads(pools, starts, counts, a1, b1, a2, b2, scaling):
+def lora_weight_grads(
+    pools, starts, counts, a1, b1, a2, b2, scaling, default="grouped"
+):
     """``dA, dB`` of both projections from the BF16 pools (fp32 outputs):
 
     ``W1: P = dz @ B1_e, dA1_e = s * Pᵀ @ x; Q = x @ A1_eᵀ, dB1_e = s * dzᵀ @ Q``
@@ -188,9 +197,14 @@ def lora_weight_grads(pools, starts, counts, a1, b1, a2, b2, scaling):
     ``h`` / ``dz`` and finite stale ``x`` / ``dy``, so they contribute nothing.
     """
     x_pool, dy_pool, h_pool, dz_pool = pools
-    offs = padded_offsets(starts, counts)
-    if wgrad_mode() == "loop":
+    mode = wgrad_mode(default)
+    if mode == "loop":
         return _lora_weight_grads_loop(pools, starts, counts, a1, b1, a2, b2, scaling)
+    if mode == "triton":
+        from .lora_grads import lora_weight_grads_triton
+
+        return lora_weight_grads_triton(pools, starts, counts, a1, b1, a2, b2, scaling)
+    offs = padded_offsets(starts, counts)
     bf = lambda t: t.detach().to(torch.bfloat16).contiguous()  # noqa: E731
 
     def rows_times(a, b):
@@ -359,6 +373,9 @@ class LoraExperts:
 
 
 LORA_COMPUTE_DTYPES = ("bf16", "mxfp8", "blockwise")
+# Adapter-gradient route of bf16_lora / mxfp8_lora by architecture: the Triton kernels won the paired
+# 8xB200 runs at every shape; on SM90 they are unvalidated, so torch._grouped_mm stays
+TRITON_WGRAD_DEFAULT = {9: "grouped", 10: "triton"}
 
 
 FORWARD_OP = "mono_ep::lora_forward"
@@ -453,7 +470,12 @@ def lora_backward(
             mx_forms=(f["sm100_mx_w1"], f["sm100_mx_w2t"], f["sm100_mx_w1t"]),
         )
         grads = lora_weight_grads(
-            native.pools[:4], native.starts, native.counts, *adapters, experts.scaling
+            native.pools[:4],
+            native.starts,
+            native.counts,
+            *adapters,
+            experts.scaling,
+            default=TRITON_WGRAD_DEFAULT[native.arch],
         )
     elif native.blockwise:
         # the blockwise FP8 backward keeps FP8 operands only: project its full dW
@@ -473,7 +495,12 @@ def lora_backward(
             weight_grads=False,
         )
         grads = lora_weight_grads(
-            native.pools[:4], native.starts, native.counts, *adapters, experts.scaling
+            native.pools[:4],
+            native.starts,
+            native.counts,
+            *adapters,
+            experts.scaling,
+            default=TRITON_WGRAD_DEFAULT[native.arch],
         )
     return (
         dx,

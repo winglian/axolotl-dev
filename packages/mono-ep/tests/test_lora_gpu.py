@@ -405,3 +405,46 @@ def test_fused_mxfp8_forms_match_a_single_rounded_merge(group):
                 rank,
                 name,
             )
+
+
+def _pool_case(
+    rows_per_expert=(300, 0, 517, 129), hidden=HIDDEN, inter=INNER, rank=RANK
+):
+    """Synthetic backward pools: experts packed at 128-row aligned starts, padded rows zero in h / dz."""
+    counts = torch.tensor(rows_per_expert, device="cuda", dtype=torch.int32)
+    padded = (counts + 127) // 128 * 128
+    starts = torch.cumsum(padded, 0, dtype=torch.int32) - padded
+    rows = int(padded.sum()) + 128
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    pools = [
+        torch.randn(rows, w, device="cuda", generator=gen).mul(s).bfloat16()
+        for w, s in ((hidden, 1.0), (hidden, 0.01), (inter, 1.0), (2 * inter, 0.01))
+    ]
+    valid = torch.zeros(rows, dtype=torch.bool, device="cuda")
+    for s, c in zip(starts.tolist(), counts.tolist(), strict=True):
+        valid[s : s + c] = True
+    for p in pools[2:]:
+        p[~valid] = 0
+    e = len(rows_per_expert)
+    factors = (
+        torch.randn(e, rank, hidden, device="cuda", generator=gen) / hidden**0.5,
+        torch.randn(e, 2 * inter, rank, device="cuda", generator=gen) * 0.02,
+        torch.randn(e, rank, inter, device="cuda", generator=gen) / inter**0.5,
+        torch.randn(e, hidden, rank, device="cuda", generator=gen) * 0.02,
+    )
+    return pools, starts, counts, factors
+
+
+@pytest.mark.parametrize("rank", [8, 16, 64])
+def test_triton_adapter_grads_match_the_grouped_route(group, monkeypatch, rank):
+    """BF16 pools: the two-pass Triton kernels against the per-expert reference loop."""
+    from mono_ep.lora import lora_weight_grads
+    from mono_ep.lora_grads import lora_weight_grads_triton
+
+    pools, starts, counts, factors = _pool_case(rank=rank)
+    monkeypatch.setenv("MONO_EP_LORA_WGRAD", "loop")
+    want = lora_weight_grads(pools, starts, counts, *factors, SCALING)
+    got = lora_weight_grads_triton(pools, starts, counts, *factors, SCALING)
+    for g, w in zip(got, want, strict=True):
+        assert g.shape == w.shape
+        assert rel(g, w) < 5e-3

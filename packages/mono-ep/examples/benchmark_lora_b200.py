@@ -370,7 +370,7 @@ def main():
                 "MONO_EP_LORA_MERGED_CACHE",
                 "MONO_EP_SM100_DW_PRECISION",
                 "MONO_EP_LORA_MXFP8_FORMS",
-                "MONO_EP_LORA_PROJECTIONS",
+                "MONO_EP_LORA_WGRAD",
                 "MONO_EP_LORA_MXFP8_POOLS",
             )
         },
