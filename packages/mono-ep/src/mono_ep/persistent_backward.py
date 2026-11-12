@@ -16,6 +16,7 @@ from .dw import (
     direct_dw,
     dw_precision,
     requant_k_blocks,
+    resolve_dw_precision,
     weight_grad,
     weight_grad_quantized,
 )
@@ -298,7 +299,13 @@ class NativePersistentBackward:
         )
         return mx
 
-    def _backward_mxfp8(self, dy, x, indices, scores, w1, w2, stored_z=None):
+    def dw_precision(self):
+        """SM100 dW precision of the next backward (see ``dw.resolve_dw_precision``)."""
+        return resolve_dw_precision(self.runtime.compute_dtype, self.precision())
+
+    def _backward_mxfp8(
+        self, dy, x, indices, scores, w1, w2, stored_z=None, mxfp8_dw=False
+    ):
         import deep_gemm
 
         from .token_quantization import quantize_persistent_mxfp8_into
@@ -346,6 +353,7 @@ class NativePersistentBackward:
             mx.buffer.l1_acts.shape[0],
             self.runtime.topk,
             *(() if stored_z is None else (stored_z,)),
+            mxfp8_dw,
         )
         _mark("kernel")
         return dx, ds
@@ -459,6 +467,7 @@ class NativePersistentBackward:
                     "MONO_EP_SM100_INKERNEL_DW=1 does not combine with "
                     "MONO_EP_SM100_BACKWARD_PRECISION=mxfp8"
                 )
+            dw = resolve_dw_precision(self.runtime.compute_dtype, "mxfp8")
             dx, ds = self._backward_mxfp8(
                 dy,
                 x,
@@ -467,8 +476,9 @@ class NativePersistentBackward:
                 w1,
                 w2,
                 self._take_context(x, indices, scores, w1, w2),
+                dw == "mxfp8",
             )
-            return self._finish_bf16_sm100(dx, ds, scores, stream, self._mx_resources())
+            return self._finish_mxfp8(dx, ds, scores, stream, self._mx_resources(), dw)
         tokens = x.shape[0]
         from .sm90_prep import enabled as fused_prep
 
@@ -655,15 +665,16 @@ class NativePersistentBackward:
         self.finished.record(stream)
         return dx, ds.to(scores.dtype), dw1, dw2
 
-    def _finish_bf16_sm100(self, dx, ds, scores, stream, mx=None):
-        """SM100 weight gradients after the persistent backward.
+    def _finish_mxfp8(self, dx, ds, scores, stream, mx, dw):
+        """SM100 weight gradients after the MXFP8 persistent backward.
 
         BF16 dW reads the BF16 pools (the MXFP8 backward dequantizes x and dy into them); MXFP8 dW
-        (``MONO_EP_SM100_DW_PRECISION=mxfp8``) requantizes x, dy and dz along the rows from the
-        MXFP8 backward's E4M3 pools when ``mx`` is given, h from its BF16 pool."""
+        requantizes x, dy and dz along the rows from the backward's E4M3 pools, h from its BF16
+        pool. ``dw`` must be the precision the kernel was launched with: with MXFP8 dW it leaves
+        the BF16 x, dy and dz pools unwritten."""
         x_pool, dy_pool, h_pool, dz_pool = self.pools[:4]
         ends = self.starts + self.counts
-        if dw_precision() == "mxfp8" and mx is not None:
+        if dw == "mxfp8":
             qx, qdy, qdz, sx, sdy, sdz = mx.pools
             x_q = requant_k_blocks(qx, self.starts, ends, sx)
             dy_q = requant_k_blocks(qdy, self.starts, ends, sdy)
@@ -674,12 +685,12 @@ class NativePersistentBackward:
             _mark("dw1")
             dw2 = weight_grad_quantized(dy_q, h_q, ends, self.counts, self.experts)
             _mark("dw2")
-        elif direct_dw() or dw_precision() != "bf16":
+        elif direct_dw():
             dw1 = weight_grad(
-                dz_pool, x_pool, ends, self.counts, self.experts, self.starts
+                dz_pool, x_pool, ends, self.counts, self.experts, self.starts, "bf16"
             )
             dw2 = weight_grad(
-                dy_pool, h_pool, ends, self.counts, self.experts, self.starts
+                dy_pool, h_pool, ends, self.counts, self.experts, self.starts, "bf16"
             )
         else:
             dw1 = weight_grad_bf16(dz_pool, x_pool, ends, None, self.experts, True)

@@ -318,7 +318,8 @@ static void mxfp8_mono_ep_backward_launch(
     const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
     const torch::Tensor& dy_sf, const std::vector<int64_t>& dy_sf_ptrs,
     const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
-    int rank, int max_tokens, int ring_tokens, int topk, const std::optional<torch::Tensor>& saved_z = std::nullopt) {
+    int rank, int max_tokens, int ring_tokens, int topk, const bool mxfp8_dw,
+    const std::optional<torch::Tensor>& saved_z = std::nullopt) {
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(dx.is_cuda() and dx.dim() == 2);
     const auto check = [&](const torch::Tensor& t, torch::ScalarType dtype) {
@@ -414,9 +415,7 @@ static void mxfp8_mono_ep_backward_launch(
     // E4M3 x and dy rows travel together (one NVLink round trip per routed row); scales are fetched by lanes.
     const int pull = hidden * 2;
     const char* options_selector = std::getenv("MONO_EP_SM100_BACKWARD_OPTIONS");
-    // MXFP8 weight gradients (MONO_EP_SM100_DW_PRECISION=mxfp8) read the E4M3 pools: no BF16 x/dy/dz copies (8192)
-    const char* dw_precision = std::getenv("MONO_EP_SM100_DW_PRECISION");
-    const bool mxfp8_dw = dw_precision != nullptr and std::string(dw_precision) == "mxfp8";
+    // MXFP8 weight gradients (mxfp8_dw, resolved by the caller) read the E4M3 pools: no BF16 x/dy/dz copies (8192)
     const uint32_t options = (options_selector == nullptr ? kDefaultBackwardOptions :
         static_cast<uint32_t>(std::strtoul(options_selector, nullptr, 10))) | 2048u | (saved_z.has_value() ? 4096u : 0u) |
         (mxfp8_dw ? 8192u : 0u);
@@ -497,9 +496,9 @@ static void mxfp8_mono_ep_backward(
     const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
     const torch::Tensor& dy_sf, const std::vector<int64_t>& dy_sf_ptrs,
     const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
-    int rank, int max_tokens, int ring_tokens, int topk) {
+    int rank, int max_tokens, int ring_tokens, int topk, bool mxfp8_dw) {
     mxfp8_mono_ep_backward_launch(dx, ds, w1, w2t, w1t, weight_scales, pools, starts, counts, sym_buffer, sym_ptrs,
-        dy, dy_ptrs, dy_sf, dy_sf_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk);
+        dy, dy_ptrs, dy_sf, dy_sf_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, mxfp8_dw);
 }
 
 // The MXFP8 backward reading the forward's stored z instead of recomputing the gate/up projection.
@@ -513,9 +512,9 @@ static void mxfp8_mono_ep_backward_ctx(
     const torch::Tensor& dy, const std::vector<int64_t>& dy_ptrs,
     const torch::Tensor& dy_sf, const std::vector<int64_t>& dy_sf_ptrs,
     const torch::Tensor& ds_partials, const std::vector<int64_t>& ds_ptrs,
-    int rank, int max_tokens, int ring_tokens, int topk, const torch::Tensor& saved_z) {
+    int rank, int max_tokens, int ring_tokens, int topk, const torch::Tensor& saved_z, bool mxfp8_dw) {
     mxfp8_mono_ep_backward_launch(dx, ds, w1, w2t, w1t, weight_scales, pools, starts, counts, sym_buffer, sym_ptrs,
-        dy, dy_ptrs, dy_sf, dy_sf_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, saved_z);
+        dy, dy_ptrs, dy_sf, dy_sf_ptrs, ds_partials, ds_ptrs, rank, max_tokens, ring_tokens, topk, mxfp8_dw, saved_z);
 }
 
 } // namespace deep_gemm

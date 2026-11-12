@@ -95,6 +95,65 @@ def test_mxfp8_runtime_takes_the_fused_mxfp8_backward(group, monkeypatch):
         runtime.close()
 
 
+def _launched_dw(monkeypatch):
+    import deep_gemm
+
+    flags = []
+    native = deep_gemm._C.mxfp8_mono_ep_backward
+
+    def record(*args):
+        flags.append(args[-1])
+        return native(*args)
+
+    monkeypatch.setattr(deep_gemm._C, "mxfp8_mono_ep_backward", record)
+    return flags
+
+
+def test_mxfp8_dw_follows_the_runtime_default_and_the_selector(group, monkeypatch):
+    from mono_ep import dw
+
+    monkeypatch.delenv("MONO_EP_SM100_BACKWARD_PRECISION", raising=False)
+    monkeypatch.delenv("MONO_EP_SM100_DW_PRECISION", raising=False)
+    monkeypatch.setenv("MONO_EP_STORED_CONTEXT", "off")
+    flags = _launched_dw(monkeypatch)
+    inputs = _inputs()
+    mx = _runtime(group, "mxfp8")
+    _, dx, dw1, dw2 = _step(mx, inputs)
+    monkeypatch.setenv("MONO_EP_SM100_DW_PRECISION", "mxfp8")
+    _, dx_env, dw1_env, dw2_env = _step(mx, inputs)
+    monkeypatch.delenv("MONO_EP_SM100_DW_PRECISION")
+    monkeypatch.setitem(dw.MXFP8_BACKWARD_DW_DEFAULTS, "mxfp8", "mxfp8")
+    _, dx_default, dw1_default, dw2_default = _step(mx, inputs)
+    monkeypatch.setenv("MONO_EP_SM100_DW_PRECISION", "bf16")
+    _, _, dw1_off, dw2_off = _step(mx, inputs)
+    assert flags == [False, True, True, False]
+    # dx never depends on the dW precision
+    assert torch.equal(dx, dx_env) and torch.equal(dx, dx_default)
+
+    def gap(got, want):
+        return (got.float() - want.float()).norm() / want.float().norm()
+
+    # dW pool row order varies run to run, so one path repeats to rounding, not bytes
+    for same in (
+        (dw1_env, dw1_default),
+        (dw2_env, dw2_default),
+        (dw1, dw1_off),
+        (dw2, dw2_off),
+    ):
+        assert gap(*same) < 1e-3
+    for got, want in ((dw1_env, dw1), (dw2_env, dw2)):
+        assert torch.isfinite(got).all()
+        assert 1e-3 < gap(got, want) < 0.1
+    # the BF16 runtime's MXFP8 backward keeps BF16 dW under an MXFP8-runtime default
+    monkeypatch.delenv("MONO_EP_SM100_DW_PRECISION")
+    monkeypatch.setenv("MONO_EP_SM100_BACKWARD_PRECISION", "mxfp8")
+    bf = _runtime(group, "bf16")
+    _step(bf, inputs)
+    assert flags[-1] is False
+    for runtime in (mx, bf):
+        runtime.close()
+
+
 def test_mxfp8_forward_forms_are_the_backward_and_direct_bytes(group):
     from mono_ep import weight_cache
     from mono_ep.token_quantization import prepare_persistent_mxfp8

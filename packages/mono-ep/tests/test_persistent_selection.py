@@ -246,3 +246,74 @@ def test_stored_context_auto_declines_for_the_mxfp8_backward(
     )
     assert _store_context(runtime) is stores
     assert runtime._stored.key is None
+
+
+def _dw_precision(compute_dtype, hidden):
+    pytest.importorskip("triton")
+    from mono_ep.persistent_backward import NativePersistentBackward
+
+    backend = SimpleNamespace(
+        arch=10,
+        blockwise=False,
+        runtime=SimpleNamespace(compute_dtype=compute_dtype, hidden=hidden),
+        _mx_fallback_logged=False,
+    )
+    backend.precision = lambda: NativePersistentBackward.precision(backend)
+    return NativePersistentBackward.dw_precision(backend)
+
+
+@pytest.mark.parametrize(
+    "compute_dtype,backward_env,hidden,dw_env,defaults,expected",
+    [
+        # shipped defaults: BF16 dW on both runtimes
+        ("mxfp8", None, 2048, None, {}, "bf16"),
+        ("bf16", "mxfp8", 2048, None, {}, "bf16"),
+        ("bf16", None, 2048, None, {}, "bf16"),
+        # the explicit selector wins in both directions
+        ("mxfp8", None, 2048, "mxfp8", {}, "mxfp8"),
+        ("bf16", "mxfp8", 2048, "mxfp8", {}, "mxfp8"),
+        ("bf16", None, 2048, "mxfp8", {}, "mxfp8"),
+        ("mxfp8", None, 2048, "bf16", {"mxfp8": "mxfp8"}, "bf16"),
+        # a runtime default applies to that runtime's MXFP8 backward only
+        ("mxfp8", None, 2048, None, {"mxfp8": "mxfp8"}, "mxfp8"),
+        ("bf16", "mxfp8", 2048, None, {"mxfp8": "mxfp8"}, "bf16"),
+        ("bf16", "mxfp8", 2048, None, {"bf16": "mxfp8"}, "mxfp8"),
+        ("mxfp8", "bf16", 2048, None, {"mxfp8": "mxfp8"}, "bf16"),
+        ("bf16", None, 2048, None, {"bf16": "mxfp8"}, "bf16"),
+        # hidden % 512 != 0 falls back to the BF16 backward and BF16 dW
+        ("mxfp8", None, 2304, None, {"mxfp8": "mxfp8"}, "bf16"),
+        ("mxfp8", None, 2304, "mxfp8", {}, "mxfp8"),
+    ],
+)
+def test_sm100_dw_precision_resolution(
+    monkeypatch, compute_dtype, backward_env, hidden, dw_env, defaults, expected
+):
+    pytest.importorskip("triton")
+    from mono_ep import dw
+
+    for key, value in (
+        ("MONO_EP_SM100_BACKWARD_PRECISION", backward_env),
+        ("MONO_EP_SM100_DW_PRECISION", dw_env),
+    ):
+        monkeypatch.delenv(key, raising=False)
+        if value is not None:
+            monkeypatch.setenv(key, value)
+    for key, value in defaults.items():
+        monkeypatch.setitem(dw.MXFP8_BACKWARD_DW_DEFAULTS, key, value)
+    assert _dw_precision(compute_dtype, hidden) == expected
+
+
+def test_sm100_dw_precision_defaults_stay_bf16():
+    pytest.importorskip("triton")
+    from mono_ep.dw import MXFP8_BACKWARD_DW_DEFAULTS
+
+    assert MXFP8_BACKWARD_DW_DEFAULTS == {"bf16": "bf16", "mxfp8": "bf16"}
+
+
+def test_sm100_dw_precision_rejects_unknown_values(monkeypatch):
+    pytest.importorskip("triton")
+    from mono_ep.dw import resolve_dw_precision
+
+    monkeypatch.setenv("MONO_EP_SM100_DW_PRECISION", "fp8")
+    with pytest.raises(ValueError, match="bf16 or mxfp8"):
+        resolve_dw_precision("mxfp8", "mxfp8")

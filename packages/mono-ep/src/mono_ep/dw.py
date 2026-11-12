@@ -7,7 +7,7 @@ The pools hold each local expert's rows from ``starts[e]`` (a multiple of 128) t
 ``ends[e]``, with the tail of its last 128-row block zeroed. The k-grouped GEMM
 writes ``out[e] = a_pool[rows of e]^T b_pool[rows of e]`` straight into an
 uninitialized FP32 output; only the slabs of experts with no rows, which it leaves
-unwritten, are zeroed afterwards. ``MONO_EP_SM100_DW_PRECISION=mxfp8`` (opt-in) quantizes
+unwritten, are zeroed afterwards. MXFP8 dW (opt-in, see ``resolve_dw_precision``) quantizes
 the pools to E4M3 with one UE8M0 scale per 32 pool rows and column (from the BF16 pools, or
 from the MXFP8 backward's row-wise E4M3 pools and their scales) and runs DeepGEMM's
 k-grouped ``recipe=(1, 1, 32)`` GEMM instead.
@@ -28,11 +28,35 @@ def direct_dw():
     return value == "1"
 
 
-def dw_precision():
-    value = os.getenv("MONO_EP_SM100_DW_PRECISION", "bf16")
-    if value not in ("bf16", "mxfp8"):
+# dW precision of the SM100 MXFP8 persistent backward when ``MONO_EP_SM100_DW_PRECISION`` is unset,
+# by the runtime's compute dtype (``mxfp8`` is ``precision: mxfp8``, ``bf16`` the BF16 runtime with
+# ``MONO_EP_SM100_BACKWARD_PRECISION=mxfp8``)
+MXFP8_BACKWARD_DW_DEFAULTS = {"bf16": "bf16", "mxfp8": "bf16"}
+
+
+def dw_precision_override():
+    """``MONO_EP_SM100_DW_PRECISION``: ``bf16``, ``mxfp8`` or ``None`` when unset."""
+    value = os.getenv("MONO_EP_SM100_DW_PRECISION")
+    if value not in (None, "bf16", "mxfp8"):
         raise ValueError("MONO_EP_SM100_DW_PRECISION must be bf16 or mxfp8")
     return value
+
+
+def dw_precision():
+    """dW precision after the BF16 backward: only the explicit selector moves it off BF16."""
+    return dw_precision_override() or "bf16"
+
+
+def resolve_dw_precision(compute_dtype, backward_precision):
+    """SM100 dW precision for one backward call: the explicit ``MONO_EP_SM100_DW_PRECISION``, else
+    the runtime's entry in ``MXFP8_BACKWARD_DW_DEFAULTS`` when the MXFP8 backward runs, else BF16
+    (the BF16 backward, including the MXFP8 runtime's fallback for hidden % 512 != 0)."""
+    override = dw_precision_override()
+    if override is not None:
+        return override
+    if backward_precision != "mxfp8":
+        return "bf16"
+    return MXFP8_BACKWARD_DW_DEFAULTS.get(compute_dtype, "bf16")
 
 
 @triton.jit
@@ -263,11 +287,11 @@ def zero_empty_experts(out, counts):
     return out
 
 
-def weight_grad(a_pool, b_pool, ends, counts, experts, starts=None):
+def weight_grad(a_pool, b_pool, ends, counts, experts, starts=None, precision=None):
     """FP32 ``[experts, A cols, B cols]`` weight gradients, written directly."""
     import deep_gemm
 
-    if dw_precision() == "mxfp8":
+    if (precision or dw_precision()) == "mxfp8":
         return weight_grad_quantized(
             requant_k_blocks(a_pool, starts, ends),
             requant_k_blocks(b_pool, starts, ends),
