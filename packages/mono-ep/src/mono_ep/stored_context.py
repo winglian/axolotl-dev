@@ -12,10 +12,10 @@ activation-checkpoint recompute.
 
 ``MONO_EP_STORED_CONTEXT``:
 
-* ``auto`` (default): store in checkpoint-recompute forwards when the shape rule says the
-  backward is GEMM-bound (``hidden * intermediate >= MIN_HIDDEN_X_INTERMEDIATE``) and the
-  buffer fits in free device memory with headroom; otherwise recompute, with one log line
-  saying why.
+* ``auto`` (default): store in checkpoint-recompute forwards when the backward is the BF16
+  one, the shape rule says it is GEMM-bound
+  (``hidden * intermediate >= MIN_HIDDEN_X_INTERMEDIATE``) and the buffer fits in free
+  device memory with headroom; otherwise recompute, with one log line saying why.
 * ``recompute``: store in checkpoint-recompute forwards, no shape or memory check.
 * ``always``: store in every forward (only the last forward before a backward is used).
 * ``off`` (or ``0``): never store.
@@ -61,6 +61,26 @@ def meta_bytes(ranks, max_tokens, topk):
 
 def shape_rule(hidden, intermediate):
     return hidden * intermediate >= MIN_HIDDEN_X_INTERMEDIATE
+
+
+_logged_mxfp8 = False
+
+
+def backward_rule(precision):
+    """``auto`` stores only for the BF16 backward. The MXFP8 backward's gate/up recompute is one
+    cheap FP8 GEMM over H bytes per row; reading 4I bytes of stored BF16 z per row in its
+    epilogue is slower (8xB200 checkpointed layer, stored vs recompute: 4096 x 1536 21.1 vs
+    19.2 ms, 5120 x 2560 45.9 vs 41.9 ms)."""
+    global _logged_mxfp8
+    if precision != "mxfp8":
+        return True
+    if not _logged_mxfp8:
+        _logged_mxfp8 = True
+        LOG.info(
+            "mono_ep stored context (auto): recomputing z, the MXFP8 backward recomputes "
+            "faster than it reads stored z"
+        )
+    return False
 
 
 class StoredContext:

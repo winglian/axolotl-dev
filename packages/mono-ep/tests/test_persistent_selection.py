@@ -216,3 +216,33 @@ def test_sm100_explicit_mxfp8_backward_rejects_hidden_not_multiple_of_512(monkey
     monkeypatch.setenv("MONO_EP_SM100_BACKWARD_PRECISION", "mxfp8")
     with pytest.raises(ValueError, match="multiples of 512"):
         _backward_precision("bf16", 2304)
+
+
+@pytest.mark.parametrize(
+    "policy,precision,stores",
+    [
+        ("auto", "bf16", True),
+        ("auto", "mxfp8", False),
+        ("recompute", "mxfp8", True),
+        ("always", "mxfp8", True),
+        ("off", "bf16", False),
+    ],
+)
+def test_stored_context_auto_declines_for_the_mxfp8_backward(
+    monkeypatch, policy, precision, stores
+):
+    from mono_ep.runtime import _store_context
+
+    monkeypatch.setenv("MONO_EP_STORED_CONTEXT", policy)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setattr(torch._C, "_current_graph_task_id", lambda: 0)
+    runtime = SimpleNamespace(
+        compute_dtype="bf16",
+        retain_activations=False,
+        _peer_backward=SimpleNamespace(
+            stored_context_usable=lambda: True, precision=lambda: precision
+        ),
+        _stored=SimpleNamespace(key="stale", decide_auto=lambda: True),
+    )
+    assert _store_context(runtime) is stores
+    assert runtime._stored.key is None

@@ -423,6 +423,10 @@ def _store_context(runtime):
         return False
     if not runtime._peer_backward.stored_context_usable():
         return False
+    if policy == "auto" and not stored_context.backward_rule(
+        runtime._peer_backward.precision()
+    ):
+        return False
     if runtime._stored is None:
         runtime._stored = stored_context.StoredContext(
             runtime, dist.get_world_size(runtime.group)
