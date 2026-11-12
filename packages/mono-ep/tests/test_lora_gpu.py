@@ -615,3 +615,25 @@ def test_sm90_packed_and_project_routes_agree(group, monkeypatch, routing):
     assert torch.equal(ds_packed, ds_project)
     for got, want in zip(grads_packed, grads_project, strict=True):
         assert rel(got, want) < 1e-2
+
+
+@pytest.mark.parametrize("rank", [8, 16, 40])
+def test_triton_merge_rounds_the_fp32_merge_once(group, monkeypatch, rank):
+    """``MONO_EP_LORA_MERGE=triton``: the one-pass merge against the single-rounded FP32 merge, and
+    bitwise the base weights for zero adapters."""
+    from mono_ep.lora import merge
+
+    monkeypatch.setenv("MONO_EP_LORA_MERGE", "triton")
+    _, _, _, w1, _, _, _ = _inputs(256, 4)
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    a = (
+        torch.randn(EXPERTS, rank, HIDDEN, device="cuda", generator=gen) / 32
+    ).bfloat16()
+    b = (
+        torch.randn(EXPERTS, 2 * INNER, rank, device="cuda", generator=gen) * 0.02
+    ).bfloat16()
+    assert torch.equal(merge(w1, b * 0, a, SCALING), w1.bfloat16())
+    got = merge(w1, b, a, SCALING)
+    want = (w1.float() + SCALING * b.float() @ a.float()).bfloat16()
+    assert got.dtype == torch.bfloat16 and got.shape == want.shape
+    assert (got != want).float().mean() < 1e-4

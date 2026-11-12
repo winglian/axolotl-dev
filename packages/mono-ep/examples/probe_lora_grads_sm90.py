@@ -5,8 +5,9 @@
 adapter gradients from the SM90 blockwise backward's packed E4M3 wgrad operands, by the full FP8
 dW plus projection (``project``) against the rank-r Triton passes (``packed``). Time per layer and
 relative error against an FP32 per-expert reference on the dequantized operands; the compiled
-TTGIR is checked for 8-bit types. Then the per-step weight forms of the merged experts: BF16 merge
-plus the five-form kernel against the merge fused into the forms kernel.
+TTGIR is checked for 8-bit types. Then the per-step LoRA merge of the experts by ``torch.baddbmm``
+against the one-pass Triton merge, each against the single-rounded FP32 merge, next to the
+five-form FP8 quantization of the merged experts.
 
     python probe_lora_grads_sm90.py [out.json]
 """
@@ -148,8 +149,14 @@ def main():
         out.append(row)
         del ops, packed, deq
         torch.cuda.empty_cache()
+    import os
+
     from mono_ep.lora import merge
-    from mono_ep.sm90_weight_forms import _quantize_forms, quantize_all_forms
+    from mono_ep.sm90_weight_forms import quantize_all_forms
+
+    def merge_both(mode, w1, w2, a1, b1, a2, b2):
+        os.environ["MONO_EP_LORA_MERGE"] = mode
+        return merge(w1, b1, a1, SCALING), merge(w2, b2, a2, SCALING)
 
     for name, (hidden, inter, e) in SHAPES.items():
         gen = torch.Generator(device="cuda").manual_seed(1)
@@ -167,41 +174,29 @@ def main():
             (torch.randn(e, n, RANK, device="cuda", generator=gen) * 0.02).bfloat16()
             for n in (2 * inter, hidden)
         )
-
-        def merged_forms(w1=w1, w2=w2, a1=a1, b1=b1, a2=a2, b2=b2):
-            return quantize_all_forms(
-                merge(w1, b1, a1, SCALING), merge(w2, b2, a2, SCALING)
+        weights = (w1, w2, a1, b1, a2, b2)
+        exact = (
+            (w1.float() + SCALING * b1.float() @ a1.float()).bfloat16(),
+            (w2.float() + SCALING * b2.float() @ a2.float()).bfloat16(),
+        )
+        row = dict(shape=name, local_experts=e, rank=RANK)
+        for mode in ("torch", "triton"):
+            row[f"{mode}_merge_ms"] = timed(
+                functools.partial(merge_both, mode, *weights)
             )
-
-        fused = functools.partial(
-            quantize_all_forms, w1, w2, lora=(a1, b1, a2, b2, SCALING)
-        )
-        f, m = fused(), merged_forms()
-        row = dict(
-            shape=name,
-            local_experts=e,
-            merge_plus_forms_ms=timed(merged_forms),
-            fused_forms_ms=timed(fused),
-            plain_forms_ms=timed(functools.partial(quantize_all_forms, w1, w2)),
-            differ={
-                k: float(
-                    (f[k][0].view(torch.uint8) != m[k][0].view(torch.uint8))
-                    .float()
-                    .mean()
-                )
-                for k in f
-            },
-        )
+            got = merge_both(mode, *weights)
+            row[f"{mode}_vs_fp32_merge_differ"] = [
+                float((g != x).float().mean()) for g, x in zip(got, exact, strict=True)
+            ]
+            del got
+        row["forms_ms"] = timed(functools.partial(quantize_all_forms, *exact))
         print(json.dumps(row), flush=True)
         out.append(row)
-        del w1, w2, f, m
+        del w1, w2, exact, weights
         torch.cuda.empty_cache()
+    os.environ.pop("MONO_EP_LORA_MERGE")
     ttgir = []
-    for kernel in (
-        lora_grads._project_packed,
-        lora_grads._contract_packed,
-        _quantize_forms,
-    ):
+    for kernel in (lora_grads._project_packed, lora_grads._contract_packed):
         for cache in kernel.device_caches.values():
             for compiled in cache[0].values():
                 ttgir.append(compiled.asm["ttgir"])

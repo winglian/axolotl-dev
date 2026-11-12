@@ -345,10 +345,29 @@ def _fused_mxfp8_forms(runtime, w1):
     return cuda_forms_available(w1.device)
 
 
+def merge_mode(device):
+    """``MONO_EP_LORA_MERGE``: ``triton`` (:func:`mono_ep.lora_merge.merge_triton`, one pass; the
+    SM90 default) or ``torch`` (``torch.baddbmm``; the default elsewhere)."""
+    default = "triton" if torch.cuda.get_device_capability(device)[0] == 9 else "torch"
+    value = os.environ.get("MONO_EP_LORA_MERGE", default)
+    if value not in ("triton", "torch"):
+        raise ValueError("MONO_EP_LORA_MERGE must be triton or torch")
+    return value
+
+
 def merge(w, lora_b, lora_a, scaling):
     """``bf16(w + scaling * B_e @ A_e)`` per expert, one rounding of the fp32 result;
     the factors enter in BF16, as the NVFP4 requant takes them."""
     bf = torch.bfloat16
+    if (
+        w.is_cuda
+        and w.shape[1] % 128 == 0
+        and w.shape[2] % 128 == 0
+        and merge_mode(w.device) == "triton"
+    ):
+        from .lora_merge import merge_triton
+
+        return merge_triton(w.to(bf), lora_b.to(bf), lora_a.to(bf), scaling)
     return torch.baddbmm(
         w.detach().to(bf), lora_b.to(bf), lora_a.to(bf), alpha=float(scaling)
     )
