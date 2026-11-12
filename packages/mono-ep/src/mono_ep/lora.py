@@ -15,10 +15,15 @@ the full ``dW`` is never formed. ``nvfp4_lora`` requantizes packed NVFP4 bases
 
 import os
 from collections import OrderedDict
+from dataclasses import dataclass
+from itertools import count
 
 import torch
 
+from . import workspace_bound
+
 POOL_BLOCK = 128
+_LAYER_KEYS = count(1)
 MERGED_CACHE_MODES = ("layer", "all")
 # Layers whose merged forms a ``layer`` cache keeps: the checkpoint recompute and the backward of
 # one layer are adjacent, a second slot covers a layer called twice in a row
@@ -228,3 +233,179 @@ def _lora_weight_grads_loop(pools, starts, counts, a1, b1, a2, b2, scaling):
         da2[e] = scaling * (dy @ b2[e].float()).t() @ h
         db2[e] = scaling * dy.t() @ (h @ a2[e].float().t())
     return da1, db1, da2, db2
+
+
+@dataclass
+class MergedWeights:
+    """One step's merged BF16 experts ``w1 [E, 2I, H]`` (gate rows then up rows) and
+    ``w2 [E, H, I]``. The kernel layouts and quantized forms derive from them through
+    :mod:`mono_ep.weight_cache`, keyed by these tensors' storage, so a rebuilt merge
+    never reuses a previous step's forms."""
+
+    w1: torch.Tensor
+    w2: torch.Tensor
+    version: int
+    has_forward = True
+    has_backward = True
+
+    def nbytes(self):
+        return sum(t.numel() * t.element_size() for t in (self.w1, self.w2))
+
+
+def merge(w, lora_b, lora_a, scaling):
+    """``bf16(w + scaling * B_e @ A_e)`` per expert, one rounding of the fp32 result;
+    the factors enter in BF16, as the NVFP4 requant takes them."""
+    bf = torch.bfloat16
+    return torch.baddbmm(
+        w.detach().to(bf), lora_b.to(bf), lora_a.to(bf), alpha=float(scaling)
+    )
+
+
+class LoraExperts:
+    """One MoE layer's frozen base experts and its LoRA scaling: the key of its
+    :class:`MergedWeightCache` entry. The base is bound only around a cache access
+    (:meth:`bind`), since FSDP2 hands the layer a regathered unsharded tensor each forward
+    and backward."""
+
+    def __init__(self, *, scaling):
+        self.scaling = float(scaling)
+        self.w1 = self.w2 = None
+        self.key = next(_LAYER_KEYS)
+
+    def bind(self, w1, w2):
+        self.w1, self.w2 = w1, w2
+        return self
+
+    def merged(self, a1, b1, a2, b2, version=0):
+        if self.w1 is None:
+            raise RuntimeError("LoraExperts.merged before bind(w1, w2)")
+        return MergedWeights(
+            merge(self.w1, b1, a1, self.scaling),
+            merge(self.w2, b2, a2, self.scaling),
+            version,
+        )
+
+    merged_forward = merged
+    merged_backward = merged
+
+
+LORA_COMPUTE_DTYPES = ("bf16", "mxfp8")
+
+
+FORWARD_OP = "mono_ep::lora_forward"
+BACKWARD_OP = "mono_ep::lora_backward"
+# (experts, cache) per LoraExperts key, so the custom ops take only tensors and ints
+_LAYERS: dict[int, tuple] = {}
+
+
+@torch.library.custom_op(FORWARD_OP, mutates_args=())
+def lora_forward(
+    x: torch.Tensor,
+    indices: torch.Tensor,
+    scores: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    a1: torch.Tensor,
+    b1: torch.Tensor,
+    a2: torch.Tensor,
+    b2: torch.Tensor,
+    runtime_key: int,
+    layer_key: int,
+) -> torch.Tensor:
+    from .runtime import _RUNTIMES, _forward_impl
+
+    runtime = _RUNTIMES[runtime_key]
+    experts, cache = _LAYERS[layer_key]
+    merged = cache.forward(experts.bind(w1, w2), (a1, b1, a2, b2))
+    experts.bind(None, None)
+    return _forward_impl(
+        x, indices, scores, merged.w1, merged.w2, runtime, record_key=w1
+    )[0]
+
+
+@lora_forward.register_fake
+def _lora_forward_fake(
+    x, indices, scores, w1, w2, a1, b1, a2, b2, runtime_key, layer_key
+):
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op(BACKWARD_OP, mutates_args=())
+def lora_backward(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    indices: torch.Tensor,
+    scores: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    a1: torch.Tensor,
+    b1: torch.Tensor,
+    a2: torch.Tensor,
+    b2: torch.Tensor,
+    runtime_key: int,
+    layer_key: int,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    from .runtime import _RUNTIMES
+
+    native = _RUNTIMES[runtime_key]._peer_backward
+    experts, cache = _LAYERS[layer_key]
+    adapters = (a1, b1, a2, b2)
+    merged = cache.backward(experts.bind(w1, w2), adapters)
+    experts.bind(None, None)
+    dx, ds, _, _ = native.backward(
+        dy, x, indices, scores, merged.w1, merged.w2, record_key=w1, weight_grads=False
+    )
+    grads = lora_weight_grads(
+        native.pools[:4], native.starts, native.counts, *adapters, experts.scaling
+    )
+    return (
+        dx,
+        ds,
+        *(g.to(t.dtype) for g, t in zip(grads, adapters, strict=True)),
+    )
+
+
+@lora_backward.register_fake
+def _lora_backward_fake(dy, x, indices, scores, w1, w2, a1, b1, a2, b2, *keys):
+    return tuple(torch.empty_like(t) for t in (x, scores, a1, b1, a2, b2))
+
+
+def _setup_context(ctx, inputs, output):
+    *tensors, runtime_key, layer_key = inputs
+    ctx.save_for_backward(*tensors)
+    ctx.keys = (runtime_key, layer_key)
+
+
+def _autograd_backward(ctx, dy):
+    dx, ds, *grads = lora_backward(dy.contiguous(), *ctx.saved_tensors, *ctx.keys)
+    return (dx, None, ds, None, None, *grads, None, None)
+
+
+lora_forward.register_autograd(_autograd_backward, setup_context=_setup_context)
+
+
+def lora_moe(x, indices, scores, w1, w2, a1, b1, a2, b2, runtime, experts, cache):
+    """Routed MoE on frozen base experts ``w1 [E_local, 2I, H]``, ``w2 [E_local, H, I]``
+    plus adapters ``A1 [E_local, r, H]``, ``B1 [E_local, 2I, r]``, ``A2 [E_local, r, I]``,
+    ``B2 [E_local, H, r]``, differentiable in ``x``, ``scores`` and the factors (the base
+    gets no gradient). ``runtime`` is a BF16 or SM100 MXFP8 :class:`PersistentMoE` with
+    the native backward; ``experts`` the layer's :class:`LoraExperts`; ``cache`` the
+    :class:`MergedWeightCache` an optimizer post-step hook invalidates. Runs as the
+    ``mono_ep::lora_forward`` custom op, so selective activation checkpointing can save
+    its output like ``mono_ep::persistent_forward``."""
+    if runtime.compute_dtype not in LORA_COMPUTE_DTYPES:
+        raise ValueError(
+            f"lora_moe supports compute dtypes {LORA_COMPUTE_DTYPES}, not "
+            f"{runtime.compute_dtype!r} (nvfp4_lora has its own path)"
+        )
+    if runtime._peer_backward is None or not hasattr(
+        runtime._peer_backward, "precision"
+    ):
+        raise ValueError("lora_moe needs the native persistent backward")
+    _LAYERS[experts.key] = (experts, cache)
+    runtime._record_forward = workspace_bound.will_backward(x, scores, a1, b1, a2, b2)
+    return lora_forward(
+        x, indices, scores, w1, w2, a1, b1, a2, b2, runtime._key, experts.key
+    )

@@ -20,7 +20,20 @@ if TYPE_CHECKING:
     from .runtime import PersistentMoE
 
 DEFAULT_RESERVED_SMS = 16
-PRECISIONS = ("auto", "bf16", "mxfp8", "fp8", "fp8_bwd", "nvfp4_lora")
+PRECISIONS = (
+    "auto",
+    "bf16",
+    "mxfp8",
+    "fp8",
+    "fp8_bwd",
+    "nvfp4_lora",
+    "bf16_lora",
+    "mxfp8_lora",
+    "fp8_lora",
+)
+# Frozen base experts plus trainable per-expert LoRA factors on the fused kernels, by the
+# full fine-tune precision whose kernels run the merged weights
+LORA_PRECISIONS = {"bf16": "bf16_lora", "mxfp8": "mxfp8_lora", "fp8": "fp8_lora"}
 MODES = ("auto", "fused", "dispatch")
 FORWARD_OP = "mono_ep::persistent_forward"
 BACKWARD_OP = "mono_ep::persistent_backward"
@@ -40,6 +53,9 @@ _COMPUTE_DTYPES = {
     "mxfp8": "mxfp8",
     "fp8": "blockwise",
     "nvfp4_lora": "nvfp4_lora",
+    "bf16_lora": "bf16",
+    "mxfp8_lora": "mxfp8",
+    "fp8_lora": "blockwise",
 }
 _NATIVE_BACKWARD = {
     (9, "bf16"): "bf16_mono_ep_backward_sm90",
@@ -47,7 +63,20 @@ _NATIVE_BACKWARD = {
     (10, "mxfp8"): "mxfp8_mono_ep_backward",
     (9, "fp8"): "fp8_mono_ep_backward_sm90",
     (10, "nvfp4_lora"): "nvfp4_mono_ep_backward",
+    (10, "bf16_lora"): "bf16_mono_ep_backward",
+    (10, "mxfp8_lora"): "mxfp8_mono_ep_backward",
 }
+
+
+def lora_precision(precision: str, capability: tuple[int, int]) -> str:
+    """The LoRA precision for a configured fused precision (``auto`` resolves first);
+    a ``*_lora`` value passes through."""
+    resolved = resolve_precision(precision, capability)
+    if resolved.endswith("_lora"):
+        return resolved
+    if resolved not in LORA_PRECISIONS:
+        raise ValueError(f"precision {resolved!r} has no LoRA variant")
+    return LORA_PRECISIONS[resolved]
 
 
 def resolve_precision(precision: str, capability: tuple[int, int]) -> str:
@@ -84,8 +113,12 @@ def unsupported_reason(
     resolved = resolve_precision(precision, capability)
     if resolved == "fp8_bwd":
         return "precision fp8_bwd (BF16 forward, blockwise FP8 backward) is not implemented yet"
-    if resolved == "mxfp8" and major != 10:
-        return "precision mxfp8 requires SM100"
+    if resolved in ("mxfp8", "mxfp8_lora") and major != 10:
+        return f"precision {resolved} requires SM100"
+    if resolved == "fp8_lora":
+        return "precision fp8_lora (blockwise FP8 + LoRA) is not implemented yet"
+    if resolved == "bf16_lora" and major != 10:
+        return "precision bf16_lora currently requires SM100"
     if resolved == "fp8" and major != 9:
         return "precision fp8 (blockwise E4M3) requires SM90"
     if resolved == "nvfp4_lora":
@@ -406,6 +439,11 @@ class MonoEPRuntime:
                 "mono_ep: precision nvfp4_lora needs the SM100 NVFP4 native backward "
                 "(rebuild vendored DeepGEMM; single host only)"
             )
+        if resolved in LORA_PRECISIONS.values() and backward_backend != "native":
+            raise ValueError(
+                f"mono_ep: precision {resolved} needs the native persistent backward "
+                "(rebuild vendored DeepGEMM; single host only)"
+            )
         physical = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
@@ -479,14 +517,43 @@ class MonoEPRuntime:
         lora_b2: torch.Tensor,
         experts,
         cache,
+        w1: torch.Tensor | None = None,
+        w2: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``precision="nvfp4_lora"``: frozen packed NVFP4 experts (``experts``, a
-        :class:`mono_ep.nvfp4_lora.Nvfp4LoraExperts`) plus adapters ``A1 [E_local, r, H]``,
-        ``B1 [E_local, 2I, r]`` (gate rows then up rows), ``A2 [E_local, r, I]``,
-        ``B2 [E_local, H, r]``; ``cache`` is the :class:`mono_ep.nvfp4_lora.RequantCache`
-        the optimizer's post-step hook invalidates."""
+        """Frozen experts plus adapters ``A1 [E_local, r, H]``, ``B1 [E_local, 2I, r]``
+        (gate rows then up rows), ``A2 [E_local, r, I]``, ``B2 [E_local, H, r]``, trained on
+        the merged weights; only the factors get gradients.
+
+        ``precision="nvfp4_lora"``: ``experts`` is a
+        :class:`mono_ep.nvfp4_lora.Nvfp4LoraExperts` over the packed NVFP4 base and ``cache``
+        a :class:`mono_ep.nvfp4_lora.RequantCache`. Every other precision: ``w1`` / ``w2``
+        are the frozen base in :meth:`forward`'s layout, ``experts`` the layer's
+        :class:`mono_ep.lora.LoraExperts` and ``cache`` a
+        :class:`mono_ep.lora.MergedWeightCache`. The optimizer's post-step hook must
+        invalidate the cache."""
         if self._moe is None:
             raise RuntimeError("mono_ep runtime used after destroy()")
+        if self.precision != "nvfp4_lora":
+            from .lora import lora_moe
+
+            if w1 is None or w2 is None:
+                raise ValueError(
+                    f"forward_lora with precision {self.precision} needs the base w1 / w2"
+                )
+            return lora_moe(
+                x.contiguous(),
+                topk_idx.contiguous(),
+                topk_weights.contiguous(),
+                w1.contiguous(),
+                w2.contiguous(),
+                lora_a1,
+                lora_b1,
+                lora_a2,
+                lora_b2,
+                self._moe,
+                experts,
+                cache,
+            )
         from .nvfp4_lora import nvfp4_lora_moe
 
         return nvfp4_lora_moe(
