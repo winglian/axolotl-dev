@@ -105,9 +105,10 @@ def main():
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument(
         "--compute-dtype",
-        choices=("bf16", "mxfp8"),
+        choices=("bf16", "mxfp8", "blockwise"),
         default="bf16",
-        help="mono-ep runtime precision (mxfp8: MXFP8 forward with the fused MXFP8 backward)",
+        help="mono-ep runtime precision (mxfp8: SM100 MXFP8 forward with the fused MXFP8 backward; "
+        "blockwise: SM90 blockwise FP8)",
     )
     parser.add_argument(
         "--reference", action="store_true", help="FP32 reference parity"
@@ -387,6 +388,7 @@ def main():
     host = {label: [] for label, *_ in cases}
     event = {label: [] for label, *_ in cases}
     peak = dict.fromkeys(host, 0.0)
+    host_mean = {label: [] for label in host}
     gathered = torch.empty(3 * world, device=device, dtype=torch.float64)
     captured = {}
     for iteration in range(args.warmup + args.iters):
@@ -416,6 +418,7 @@ def main():
             values = gathered.view(world, 3)
             if iteration >= args.warmup:
                 host[label].append(values[:, 0].max().item())
+                host_mean[label].append(values[:, 0].mean().item())
                 event[label].append(values[:, 1].max().item())
             peak[label] = max(peak[label], values[:, 2].max().item())
             if (
@@ -489,6 +492,7 @@ def main():
         nccl=".".join(map(str, torch.cuda.nccl.version())),
         mok=mok_payload,
         host_wall_median_ms=med(host),
+        host_wall_mean_rank_median_ms=med(host_mean),
         cuda_event_median_ms=med(event),
         host_wall_samples_ms=host,
         parity_first_measured=parity,
