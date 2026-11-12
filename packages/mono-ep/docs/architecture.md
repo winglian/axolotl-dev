@@ -197,6 +197,12 @@ forward and backward run as the `mono_ep::lora_forward` / `lora_backward` custom
 selective activation checkpointing saves the fused output exactly as it does for
 `persistent_forward`.
 
+The adapter gradients default to two Triton passes on SM100 (`mono_ep.lora_grads`: rank-r
+projections per 128-row block, then FP32 row contractions per expert). `mxfp8_lora` can feed them
+the MXFP8 backward's E4M3 x / dy / dz pools instead of BF16 copies (`MONO_EP_LORA_MXFP8_POOLS=fp8`,
+opt-in): the E4M3 bytes are read as int32 words and each byte lane is its own K slice of the dot
+product, decoded by placing the byte's bits in an FP32 and two power-of-two multiplies.
+
 Declined: computing the rank-r projections in the backward epilogue. Of the four projections only
 `P1 = dZ B1` and `Q2 = H A2ᵀ` see their pool operand in an epilogue (the recompute epilogue holds
 dZ and H tiles); `X` and `dY` exist only as GEMM A operands and in the dispatch warps, and the four

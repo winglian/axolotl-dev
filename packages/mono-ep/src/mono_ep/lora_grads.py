@@ -6,7 +6,13 @@
 Pass one projects the pools onto the factors per 128-row block, ``P1 = dZ B1``, ``Q1 = X A1ᵀ``,
 ``P2 = dY B2``, ``Q2 = H A2ᵀ`` (FP32 accumulation, stored BF16 like the grouped-GEMM route);
 pass two contracts over each expert's rows, ``dA1 = s P1ᵀ X``, ``dB1 = s dZᵀ Q1``,
-``dA2 = s P2ᵀ H``, ``dB2 = s dYᵀ Q2`` (FP32 out, where the grouped-GEMM route stores BF16).
+``dA2 = s P2ᵀ H``, ``dB2 = s dYᵀ Q2`` (FP32 out). The pools are either the BF16 x / dy / h / dz
+pools or, for the SM100 MXFP8 backward launched without its BF16 copies, the row-wise E4M3 x / dy
+/ dz pools (one UE8M0 exponent per 32 columns, four packed per int32 word per 128 columns, rows
+in UTCCP order inside each 128-row block) next to the BF16 h pool. E4M3 bytes are read as int32
+words and decoded with integer ops and one multiply (no 8-bit tensors in the kernel, no exp2):
+each of the four byte lanes of a word is its own K slice of the dot product, so the K order is
+permuted the same way on both operands and nothing is reshaped.
 """
 
 import torch
@@ -17,8 +23,45 @@ BLOCK_ROWS = tl.constexpr(128)
 
 
 @triton.jit
+def _fp8_tiles(X, SW, SF_ROWS, rows, words_col, valid, kblock, K: tl.constexpr):
+    """The four BF16 ``[rows, words]`` tiles of pool columns ``4 * words_col + lane`` (E4M3
+    dequantized), all columns inside 128-column block ``kblock``. An E4M3 byte placed as
+    ``sign << 31 | (byte & 0x7F) << 20`` is an FP32 (subnormal for exponent 0) equal to its value
+    times 2^-120; two exact power-of-two multiplies (2^120, then the block scale) decode it."""
+    words = tl.load(
+        X + rows[:, None] * (K // 4) + words_col[None, :], valid[:, None], other=0
+    )
+    r = rows % 128
+    sf_row = rows - r + (r % 32) * 4 + r // 32
+    word = tl.load(SW + kblock * SF_ROWS + sf_row, valid, other=0)
+    shift = ((4 * words_col) % 128) // 32 * 8
+    # stale words of masked rows may hold 255: keep the scale finite so 0 * scale stays 0
+    exponent = tl.minimum((word[:, None] >> shift[None, :]) & 255, 254)
+    scale = (exponent << 23).to(tl.float32, bitcast=True) * 1.329227995784916e36
+    b0 = words
+    b1 = words >> 8
+    b2 = words >> 16
+    b3 = words >> 24
+    x0 = (
+        (((b0 & 0x7F) << 20) | ((b0 & 0x80) << 24)).to(tl.float32, bitcast=True) * scale
+    ).to(tl.bfloat16)
+    x1 = (
+        (((b1 & 0x7F) << 20) | ((b1 & 0x80) << 24)).to(tl.float32, bitcast=True) * scale
+    ).to(tl.bfloat16)
+    x2 = (
+        (((b2 & 0x7F) << 20) | ((b2 & 0x80) << 24)).to(tl.float32, bitcast=True) * scale
+    ).to(tl.bfloat16)
+    x3 = (
+        (((b3 & 0x7F) << 20) | ((b3 & 0x80) << 24)).to(tl.float32, bitcast=True) * scale
+    ).to(tl.bfloat16)
+    return x0, x1, x2, x3
+
+
+@triton.jit
 def _project(
     X,
+    SW,
+    SF_ROWS,
     W,
     OUT,
     STARTS,
@@ -27,6 +70,7 @@ def _project(
     EXPERTS_POW2: tl.constexpr,
     K: tl.constexpr,
     R: tl.constexpr,
+    FP8: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     # One 128-row pool block: OUT[rows, R] = X[rows, :K] @ W[owner] with W [E, K, R]
@@ -43,12 +87,23 @@ def _project(
         acc = tl.zeros([BLOCK_ROWS, R], dtype=tl.float32)
         w_base = W + owner.to(tl.int64) * K * R
         for k0 in range(0, K, BLOCK_K):
-            cols = k0 + tl.arange(0, BLOCK_K)
-            x = tl.load(
-                X + rows[:, None] * K + cols[None, :], valid[:, None], other=0.0
-            )
-            w = tl.load(w_base + cols[:, None] * R + r[None, :])
-            acc = tl.dot(x, w, acc)
+            if FP8:
+                words_col = k0 // 4 + tl.arange(0, BLOCK_K // 4)
+                x0, x1, x2, x3 = _fp8_tiles(
+                    X, SW, SF_ROWS, rows, words_col, valid, k0 // 128, K
+                )
+                w_rows = w_base + 4 * words_col[:, None] * R + r[None, :]
+                acc = tl.dot(x0, tl.load(w_rows), acc)
+                acc = tl.dot(x1, tl.load(w_rows + R), acc)
+                acc = tl.dot(x2, tl.load(w_rows + 2 * R), acc)
+                acc = tl.dot(x3, tl.load(w_rows + 3 * R), acc)
+            else:
+                cols = k0 + tl.arange(0, BLOCK_K)
+                x = tl.load(
+                    X + rows[:, None] * K + cols[None, :], valid[:, None], other=0.0
+                )
+                w = tl.load(w_base + cols[:, None] * R + r[None, :])
+                acc = tl.dot(x, w, acc)
         tl.store(
             OUT + rows[:, None] * R + r[None, :], acc.to(tl.bfloat16), valid[:, None]
         )
@@ -57,6 +112,8 @@ def _project(
 @triton.jit
 def _contract(
     X,
+    SW,
+    SF_ROWS,
     Y,
     OUT,
     STARTS,
@@ -64,6 +121,7 @@ def _contract(
     scaling,
     K: tl.constexpr,
     R: tl.constexpr,
+    FP8: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
@@ -73,16 +131,39 @@ def _contract(
     start = tl.load(STARTS + e)
     count = tl.load(COUNTS + e)
     r = tl.arange(0, R)
-    cols = kb * BLOCK_K + tl.arange(0, BLOCK_K)
-    acc = tl.zeros([BLOCK_K, R], dtype=tl.float32)
-    for m0 in range(0, count, BLOCK_M):
-        rows = start.to(tl.int64) + m0 + tl.arange(0, BLOCK_M)
-        valid = m0 + tl.arange(0, BLOCK_M) < count
-        x = tl.load(X + rows[:, None] * K + cols[None, :], valid[:, None], other=0.0)
-        y = tl.load(Y + rows[:, None] * R + r[None, :], valid[:, None], other=0.0)
-        acc = tl.dot(tl.trans(x), y, acc)
     out = OUT + e.to(tl.int64) * K * R
-    tl.store(out + cols[:, None] * R + r[None, :], acc * scaling)
+    if FP8:
+        words_col = kb * (BLOCK_K // 4) + tl.arange(0, BLOCK_K // 4)
+        acc0 = tl.zeros([BLOCK_K // 4, R], dtype=tl.float32)
+        acc1 = tl.zeros([BLOCK_K // 4, R], dtype=tl.float32)
+        acc2 = tl.zeros([BLOCK_K // 4, R], dtype=tl.float32)
+        acc3 = tl.zeros([BLOCK_K // 4, R], dtype=tl.float32)
+        for m0 in range(0, count, BLOCK_M):
+            rows = start.to(tl.int64) + m0 + tl.arange(0, BLOCK_M)
+            valid = m0 + tl.arange(0, BLOCK_M) < count
+            y = tl.load(Y + rows[:, None] * R + r[None, :], valid[:, None], other=0.0)
+            x0, x1, x2, x3 = _fp8_tiles(X, SW, SF_ROWS, rows, words_col, valid, kb, K)
+            acc0 = tl.dot(tl.trans(x0), y, acc0)
+            acc1 = tl.dot(tl.trans(x1), y, acc1)
+            acc2 = tl.dot(tl.trans(x2), y, acc2)
+            acc3 = tl.dot(tl.trans(x3), y, acc3)
+        col = 4 * words_col[:, None]
+        tl.store(out + (col + 0) * R + r[None, :], acc0 * scaling)
+        tl.store(out + (col + 1) * R + r[None, :], acc1 * scaling)
+        tl.store(out + (col + 2) * R + r[None, :], acc2 * scaling)
+        tl.store(out + (col + 3) * R + r[None, :], acc3 * scaling)
+    else:
+        cols = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        acc = tl.zeros([BLOCK_K, R], dtype=tl.float32)
+        for m0 in range(0, count, BLOCK_M):
+            rows = start.to(tl.int64) + m0 + tl.arange(0, BLOCK_M)
+            valid = m0 + tl.arange(0, BLOCK_M) < count
+            x = tl.load(
+                X + rows[:, None] * K + cols[None, :], valid[:, None], other=0.0
+            )
+            y = tl.load(Y + rows[:, None] * R + r[None, :], valid[:, None], other=0.0)
+            acc = tl.dot(tl.trans(x), y, acc)
+        tl.store(out + cols[:, None] * R + r[None, :], acc * scaling)
 
 
 def _padded_rank(rank):
@@ -99,8 +180,12 @@ def _factor(t, transpose, rp):
     return out
 
 
-def lora_weight_grads_triton(pools, starts, counts, a1, b1, a2, b2, scaling):
-    """``dA1, dB1, dA2, dB2`` (FP32, the factors' shapes) from the BF16 ``(x, dy, h, dz)`` pools."""
+def lora_weight_grads_triton(
+    pools, starts, counts, a1, b1, a2, b2, scaling, fp8_pools=None
+):
+    """``dA1, dB1, dA2, dB2`` (FP32, the factors' shapes). ``pools`` are the BF16 ``(x, dy, h, dz)``
+    pools; with ``fp8_pools = (qx, qdy, qdz, sx, sdy, sdz)`` x, dy and dz come from the MXFP8
+    backward's E4M3 pools instead and only ``pools[2]`` (h) is read."""
     x_pool, dy_pool, h_pool, dz_pool = pools
     experts, rank = a1.shape[:2]
     hidden, inter = a1.shape[2], h_pool.shape[1]
@@ -114,12 +199,28 @@ def lora_weight_grads_triton(pools, starts, counts, a1, b1, a2, b2, scaling):
         a2=_factor(a2, True, rp),
         b2=_factor(b2, False, rp),
     )
-    source = dict(x=x_pool, dy=dy_pool, h=h_pool, dz=dz_pool)
+    if fp8_pools is not None:
+        qx, qdy, qdz, sx, sdy, sdz = fp8_pools
+        source = dict(
+            x=(qx.view(torch.int32), sx, True),
+            dy=(qdy.view(torch.int32), sdy, True),
+            dz=(qdz.view(torch.int32), sdz, True),
+        )
+    else:
+        source = dict(
+            x=(x_pool, None, False),
+            dy=(dy_pool, None, False),
+            dz=(dz_pool, None, False),
+        )
+    source["h"] = (h_pool, None, False)
 
     def project(name, weight, k):
+        x, sw, fp8 = source[name]
         out = torch.zeros(rows, rp, device=device, dtype=torch.bfloat16)
         _project[(rows // BLOCK_ROWS,)](
-            source[name],
+            x,
+            sw if fp8 else x,
+            sw.shape[1] if fp8 else 0,
             w[weight],
             out,
             starts,
@@ -128,15 +229,19 @@ def lora_weight_grads_triton(pools, starts, counts, a1, b1, a2, b2, scaling):
             pow2,
             k,
             rp,
+            fp8,
             64,
             num_warps=4,
         )
         return out
 
     def contract(name, y, k):
+        x, sw, fp8 = source[name]
         out = torch.empty(experts, k, rp, device=device, dtype=torch.float32)
         _contract[(experts, k // 128)](
-            source[name],
+            x,
+            sw if fp8 else x,
+            sw.shape[1] if fp8 else 0,
             y,
             out,
             starts,
@@ -144,6 +249,7 @@ def lora_weight_grads_triton(pools, starts, counts, a1, b1, a2, b2, scaling):
             float(scaling),
             k,
             rp,
+            fp8,
             128,
             64,
             num_warps=4,

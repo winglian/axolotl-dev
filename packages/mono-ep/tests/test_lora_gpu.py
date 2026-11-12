@@ -448,3 +448,48 @@ def test_triton_adapter_grads_match_the_grouped_route(group, monkeypatch, rank):
     for g, w in zip(got, want, strict=True):
         assert g.shape == w.shape
         assert rel(g, w) < 5e-3
+
+
+def _mx_pool(x):
+    """Row-wise E4M3 pool with the MXFP8 backward's ``[K / 128, rows]`` UTCCP scale words, and its
+    exact dequantization."""
+    from mono_ep.token_quantization import prepare_persistent_mxfp8
+
+    q, words = prepare_persistent_mxfp8(x)
+    rows = x.shape[0]
+    r = torch.arange(rows, device=x.device)
+    sf_row = r - r % 128 + (r % 32) * 4 + (r % 128) // 32
+    sw = torch.zeros(x.shape[1] // 128, rows, device=x.device, dtype=torch.int32)
+    sw[:, sf_row] = words.t()
+    exps = words.contiguous().view(torch.uint8).view(rows, -1).float()
+    deq = q.float() * torch.exp2(exps - 127.0).repeat_interleave(32, 1)
+    return q, sw, deq.bfloat16()
+
+
+def test_e4m3_pool_route_reads_the_dequantized_values(group, monkeypatch):
+    """E4M3 x / dy / dz pools decoded on load (int32 words, no 8-bit tensors) against the reference
+    on their exact dequantization, including E4M3 subnormals."""
+    _require("mxfp8")
+    from mono_ep import lora_grads
+    from mono_ep.lora import lora_weight_grads
+
+    pools, starts, counts, factors = _pool_case()
+    pools[0][:, :64] *= 1e-3  # E4M3 subnormals inside blocks with a large amax
+    pools[0][:5, 64:] *= 1e3
+    qx, sx, x8 = _mx_pool(pools[0])
+    qdy, sdy, dy8 = _mx_pool(pools[1])
+    qdz, sdz, dz8 = _mx_pool(pools[3])
+    monkeypatch.setenv("MONO_EP_LORA_WGRAD", "loop")
+    want = lora_weight_grads(
+        [x8, dy8, pools[2], dz8], starts, counts, *factors, SCALING
+    )
+    got = lora_grads.lora_weight_grads_triton(
+        pools, starts, counts, *factors, SCALING, fp8_pools=(qx, qdy, qdz, sx, sdy, sdz)
+    )
+    for g, w in zip(got, want, strict=True):
+        assert rel(g, w) < 5e-3
+    for kernel in (lora_grads._project, lora_grads._contract):
+        for cache in kernel.device_caches.values():
+            for compiled in cache[0].values():
+                ttgir = compiled.asm["ttgir"]
+                assert "i8" not in ttgir and "f8E4M3" not in ttgir

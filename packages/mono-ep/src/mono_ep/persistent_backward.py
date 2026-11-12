@@ -454,13 +454,16 @@ class NativePersistentBackward:
         record_key=None,
         weight_grads=True,
         mx_forms=None,
+        fp8_pools=False,
     ):
         """``dx, dscore, dW1, dW2``. ``record_key`` (default ``w1``) is the tensor the
         matching forward recorded its receive counts under. ``weight_grads=False``
         returns ``None`` for both weight gradients and leaves the BF16 x / dy / h / dz
         pools (``pools[:4]``, by ``starts`` / ``counts``) for the caller; the MXFP8
         backward then runs with BF16 dW so it writes them. ``mx_forms`` hands the MXFP8
-        backward its ``(w1, w2t, w1t)`` forms instead of building them from ``w1`` / ``w2``."""
+        backward its ``(w1, w2t, w1t)`` forms instead of building them from ``w1`` / ``w2``.
+        ``fp8_pools`` (with ``weight_grads=False``) launches the MXFP8 backward without the BF16
+        x / dy / dz copies: the caller reads the E4M3 pools (``mxfp8_pools()``) and BF16 h."""
         import deep_gemm
         from deep_gemm.mega import _interleave_weights
 
@@ -489,11 +492,10 @@ class NativePersistentBackward:
                     "MONO_EP_SM100_INKERNEL_DW=1 does not combine with "
                     "MONO_EP_SM100_BACKWARD_PRECISION=mxfp8"
                 )
-            dw = (
-                resolve_dw_precision(self.runtime.compute_dtype, "mxfp8")
-                if weight_grads
-                else "bf16"
-            )
+            if weight_grads:
+                dw = resolve_dw_precision(self.runtime.compute_dtype, "mxfp8")
+            else:
+                dw = "mxfp8" if fp8_pools else "bf16"
             dx, ds = self._backward_mxfp8(
                 dy,
                 x,
@@ -695,6 +697,10 @@ class NativePersistentBackward:
         self.finished = torch.cuda.Event()
         self.finished.record(stream)
         return dx, ds.to(scores.dtype), dw1, dw2
+
+    def mxfp8_pools(self):
+        """The MXFP8 backward's ``(qx, qdy, qdz, sx, sdy, sdz)`` E4M3 pools and scale words."""
+        return self._mx_resources().pools
 
     def _finish_pools(self, dx, ds, scores, stream):
         if self.runtime._stored is not None:

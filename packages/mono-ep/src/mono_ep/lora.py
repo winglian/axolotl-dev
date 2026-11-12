@@ -313,6 +313,16 @@ def mxfp8_forms_mode():
     return value
 
 
+def mxfp8_pools_mode():
+    """``MONO_EP_LORA_MXFP8_POOLS``: ``bf16`` (default: the MXFP8 backward also writes BF16 x / dy /
+    dz copies for the adapter gradients) or ``fp8`` (it skips them and the adapter gradients read
+    the E4M3 pools, dz included, which the BF16 route reads before its E4M3 rounding)."""
+    value = os.environ.get("MONO_EP_LORA_MXFP8_POOLS", "bf16")
+    if value not in ("bf16", "fp8"):
+        raise ValueError("MONO_EP_LORA_MXFP8_POOLS must be bf16 or fp8")
+    return value
+
+
 def _fused_mxfp8_forms(runtime, w1):
     """Whether this call's merged weights are built as MXFP8 forms with the merge fused in."""
     native = runtime._peer_backward
@@ -456,27 +466,44 @@ def lora_backward(
         experts.bind(w1, w2, _fused_mxfp8_forms(_RUNTIMES[runtime_key], w1)), adapters
     )
     experts.bind(None, None)
-    if isinstance(merged, MergedMxfp8Forms):
-        f = merged.forms
+    mxfp8 = native.arch == 10 and not native.blockwise and native.precision() == "mxfp8"
+    if mxfp8:
+        fp8 = mxfp8_pools_mode() == "fp8"
+        mx_forms = None
+        if isinstance(merged, MergedMxfp8Forms):
+            f = merged.forms
+            mx_forms = (f["sm100_mx_w1"], f["sm100_mx_w2t"], f["sm100_mx_w1t"])
         dx, ds, _, _ = native.backward(
             dy,
             x,
             indices,
             scores,
-            w1,
-            w2,
+            *((w1, w2) if mx_forms is not None else (merged.w1, merged.w2)),
             record_key=w1,
             weight_grads=False,
-            mx_forms=(f["sm100_mx_w1"], f["sm100_mx_w2t"], f["sm100_mx_w1t"]),
+            mx_forms=mx_forms,
+            fp8_pools=fp8,
         )
-        grads = lora_weight_grads(
-            native.pools[:4],
-            native.starts,
-            native.counts,
-            *adapters,
-            experts.scaling,
-            default=TRITON_WGRAD_DEFAULT[native.arch],
-        )
+        if fp8:
+            from .lora_grads import lora_weight_grads_triton
+
+            grads = lora_weight_grads_triton(
+                native.pools[:4],
+                native.starts,
+                native.counts,
+                *adapters,
+                experts.scaling,
+                fp8_pools=native.mxfp8_pools(),
+            )
+        else:
+            grads = lora_weight_grads(
+                native.pools[:4],
+                native.starts,
+                native.counts,
+                *adapters,
+                experts.scaling,
+                default=TRITON_WGRAD_DEFAULT[native.arch],
+            )
     elif native.blockwise:
         # the blockwise FP8 backward keeps FP8 operands only: project its full dW
         dx, ds, dw1, dw2 = native.backward(
