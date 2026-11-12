@@ -120,7 +120,7 @@ slot. At most 32 local experts. It pays at wide shapes
 (-1.49 ms per backward with wide tiles at the Beam shape, 8xB200) and costs about 0.1 ms per
 backward at the Qwen3-30B-A3B shape, so it stays opt-in.
 
-## MXFP8 backward (SM100, opt-in)
+## MXFP8 backward (SM100)
 
 `MONO_EP_SM100_BACKWARD_PRECISION=mxfp8` (option bit 2048) runs dh, the z recompute and dx as
 `kind::mxf8f6f4` GEMMs with E4M3 values and UE8M0 scales per 32 K elements, at BLOCK_K 128. The
@@ -132,8 +132,18 @@ after the accumulators, as in the MXFP8 forward. The E4M3 weight forms (W1 inter
 W1^T) are built in one Inductor graph and cached under the weight-cache epoch contract. It is
 not bitwise (about 6-7% relative error against an FP32 reference, BF16 0.2%; the loss curve
 stayed within a tenth of the seed gap) and saves about 0.4 ms per backward at the
-Qwen3-30B-A3B shape on 8xB200, so it stays opt-in. It does not combine with in-kernel dW: both
-use the kernel's unused shared-expert operand slots and they need different BLOCK_K.
+Qwen3-30B-A3B shape on 8xB200, so it stays opt-in for the BF16 runtime. It does not combine
+with in-kernel dW: both use the kernel's unused shared-expert operand slots and they need
+different BLOCK_K.
+
+`precision: mxfp8` (the SM100 `auto`) pairs the MXFP8 forward with this backward. The forward's
+interleaved W1 is the backward's `sm100_mx_w1` form (the same bytes), so the first forward of a
+step builds W1, W2^T and W1^T in one pass, plus the forward's W2, and the checkpoint recompute
+and the backward hit the cache. The backward still quantizes x and dy into its own transport
+buffer (the forward's E4M3 rows live in the forward ring, which the recompute overwrites), and it
+recomputes z: the MXFP8 forward does not write the compact stored-z layout. Hidden sizes that are
+not multiples of 512 fall back to the BF16 persistent backward with one log line. Before this the
+MXFP8 runtime's backward was the generic NCCL path, about ten times slower.
 
 ## NVFP4 LoRA path and the CUDA requant (SM100)
 
