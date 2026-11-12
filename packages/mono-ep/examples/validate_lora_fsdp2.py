@@ -11,7 +11,8 @@ optimizer steps with the merged-weight cache invalidated by the post-step hook. 
 the loss and the adapter gradients are compared with an FP32 torch reference computed from
 the live (gathered) weights and the routing the layer used; the merged weights the cache
 holds must equal a fresh merge of the live adapters, the base must not move, and the merge
-must change after every step. Run under torchrun on 4 or 8 B200 (``--ep 2`` or ``--ep 4``).
+must change after every step. Run under torchrun on 4 or 8 B200 (``--ep 2`` or ``--ep 4``), or 2 H100 (``--ep 1`` / ``--ep 2``,
+``--compute-dtype bf16`` or ``blockwise``).
 """
 
 import argparse
@@ -106,13 +107,17 @@ def main():
     parser.add_argument("--tokens", type=int, default=1024)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--compute-dtype", choices=("bf16", "mxfp8"), default="mxfp8")
+    parser.add_argument(
+        "--compute-dtype", choices=("bf16", "mxfp8", "blockwise"), default="mxfp8"
+    )
     parser.add_argument("--merged-cache", choices=("layer", "all"), default="layer")
     parser.add_argument("--reserved-sms", type=int, default=16)
     parser.add_argument("--loss-bound", type=float, default=None)
     parser.add_argument("--grad-bound", type=float, default=None)
     args = parser.parse_args()
-    bounds = dict(bf16=(1e-2, 2e-2), mxfp8=(0.1, 0.1))[args.compute_dtype]
+    bounds = dict(bf16=(1e-2, 2e-2), mxfp8=(0.1, 0.1), blockwise=(0.1, 0.1))[
+        args.compute_dtype
+    ]
     loss_bound = args.loss_bound or bounds[0]
     grad_bound = args.grad_bound or bounds[1]
     rank = int(os.environ.get("LOCAL_RANK", "0"))
