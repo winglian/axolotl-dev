@@ -175,6 +175,32 @@ def test_owned_backward_ring_floor_counts_clusters(monkeypatch, arch, num_sms, w
         owned_backward_ring_tokens(num_sms)
 
 
+def test_forward_ring_knobs_accept_any_non_negative_count(monkeypatch):
+    from mono_ep import workspace_bound
+
+    monkeypatch.delenv("MONO_EP_FORWARD_RING_ROWS", raising=False)
+    assert workspace_bound.forward_ring_budget(16384, 8) == 163840
+    for value, budget in (("", 163840), ("0", 0), ("1", 1), ("1024", 1024)):
+        monkeypatch.setenv("MONO_EP_FORWARD_RING_ROWS", value)
+        assert workspace_bound.forward_ring_budget(16384, 8) == budget
+    monkeypatch.setenv("MONO_EP_FORWARD_RING_TOKENS", "1920")
+    assert workspace_bound.forward_ring_tokens(2048, 768, 1024) == 1920
+    checks = {
+        "MONO_EP_FORWARD_RING_ROWS": lambda: workspace_bound.forward_ring_budget(
+            16384, 8
+        ),
+        "MONO_EP_FORWARD_RING_TOKENS": lambda: workspace_bound.forward_ring_tokens(
+            2048, 768, 1024
+        ),
+    }
+    for name, check in checks.items():
+        for value in ("-1", "1k"):
+            monkeypatch.setenv(name, value)
+            with pytest.raises(ValueError, match=name):
+                check()
+        monkeypatch.delenv(name)
+
+
 def _backward_precision(compute_dtype, hidden):
     pytest.importorskip("triton")
     from mono_ep.persistent_backward import NativePersistentBackward

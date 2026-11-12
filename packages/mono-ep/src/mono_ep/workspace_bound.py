@@ -30,8 +30,9 @@ time (it means a forward was not recorded, e.g. a custom autograd path).
 The SM100 BF16 forward's symmetric ring is sized the same way: for ``HEADROOM x tokens x top-k`` routed
 rows instead of every token of every rank (wide experts: the live-block bound for that budget; narrow
 experts, where slot reuse costs forward time: one slot per budgeted row; never above the worst case). Its scheduler gates L1 claims on the ring (an L1 block is
-claimed only after every L2 task one ring generation back is claimed), so a step whose routing needs
-more live blocks runs gated and slower instead of overflowing; ``forward_over_budget`` counts the
+claimed only after every L2 task one ring generation back is claimed, and an L2 task starts only after
+L1 of the block one generation back has finished), so a step whose routing needs more live blocks runs
+gated and slower instead of overflowing; ``forward_over_budget`` counts the
 recorded forwards whose padded rows exceeded the budget. The owned backward's ring is its one-wave
 floor.
 
@@ -68,10 +69,26 @@ MAX_DEPTH = 64
 _LIVE: "weakref.WeakSet[WorkspaceBound]" = weakref.WeakSet()
 
 
+def _env_count(name):
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    try:
+        count = int(value)
+    except ValueError:
+        count = -1
+    if count < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return count
+
+
 def forward_ring_budget(max_tokens, topk):
-    override = os.getenv("MONO_EP_FORWARD_RING_ROWS")
-    if override:
-        return int(override)
+    """Routed rows the forward ring is sized for; ``MONO_EP_FORWARD_RING_ROWS`` overrides (``0`` = the
+    worst-case ring). Any budget is safe: the ring rounds up to whole blocks of every candidate BLOCK_M
+    (at least 1,920 tokens) and a launch that needs more live blocks runs ring-gated."""
+    override = _env_count("MONO_EP_FORWARD_RING_ROWS")
+    if override is not None:
+        return override
     return _round_up(math.ceil(HEADROOM * max_tokens * topk))
 
 
@@ -83,9 +100,9 @@ WIDE_EXPERT_HIDDEN_X_INTERMEDIATE = 4096 * 1536
 def forward_ring_tokens(hidden, intermediate, budget):
     """Exact forward ring tokens (0 = the live-block bound for ``budget`` routed rows), capped at the worst-case
     ring. ``MONO_EP_FORWARD_RING_TOKENS`` overrides."""
-    override = os.getenv("MONO_EP_FORWARD_RING_TOKENS")
+    override = _env_count("MONO_EP_FORWARD_RING_TOKENS")
     if override is not None:
-        return int(override)
+        return override
     if hidden * intermediate >= WIDE_EXPERT_HIDDEN_X_INTERMEDIATE:
         return 0
     return budget
