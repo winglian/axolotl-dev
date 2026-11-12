@@ -1,5 +1,5 @@
 """EP2 x FSDP2 gradient and optimizer parity of the fused mono_ep backend against
-torch dispatch with grouped_mm, eager and under torch.compile."""
+torch dispatch with grouped_mm run the same way, eager and under torch.compile."""
 
 import json
 import os
@@ -138,9 +138,16 @@ def training_checks():
         torch.cuda.synchronize()
         return history, weights, starts
 
-    reference, ref_weights, starting_weights = run("torch", False, False)
+    # Inductor's bf16 kernels round the router logits differently from eager, and a token
+    # one bf16 ulp from the top-k boundary then routes to another expert, so compiled runs
+    # are held to a compiled torch reference
+    references = {}
     result = {}
     for checkpointing, compiled in ((False, False), (True, False), (False, True)):
+        if compiled not in references:
+            torch._dynamo.reset()
+            references[compiled] = run("torch", False, compiled)
+        reference, ref_weights, starting_weights = references[compiled]
         torch._dynamo.reset()
         history, weights, _ = run("mono_ep", checkpointing, compiled, starting_weights)
         worst = 0.0
