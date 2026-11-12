@@ -29,6 +29,22 @@ need; the environment variables exist for experiments and for restoring a previo
 | `fp8_bwd` (BF16 forward, FP8 backward) | not implemented | no |
 | `nvfp4_lora` (frozen packed NVFP4 experts with BF16 LoRA adapters; hidden and intermediate multiples of 256; native backward only, one host) | no | yes |
 
+`auto` on SM100 (full fine-tuning) resolves to `mxfp8`: the MXFP8 forward with the fused MXFP8
+persistent backward. That backward recomputes the gate/up context (the MXFP8 forward has no
+stored-context output, so `MONO_EP_STORED_CONTEXT` does not apply), keeps BF16 weight gradients
+unless `MONO_EP_SM100_DW_PRECISION=mxfp8` opts in to MXFP8 dW, and falls back to the BF16 fused
+persistent backward with one warning when `hidden % 512 != 0` (an explicit
+`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8` raises there instead). Its forward, backward and weight
+gradients carry about 6-7 % relative error against an FP32 reference (BF16: 0.2 %); set
+`expert_parallel_mono_ep_precision: bf16` for the BF16 kernels.
+
+`MONO_EP_STORED_CONTEXT=auto` on the BF16 runtime (`precision: bf16`) also engages when the opt-in
+MXFP8 backward is selected (`MONO_EP_SM100_BACKWARD_PRECISION=mxfp8`) and the shape rule holds.
+There storing measured slower than recomputing in the checkpointed 2F+B step (8xB200, 16 reserved
+SMs): 235B-A22B 21.00 ms with `auto` vs 19.42 ms with `off`, Beam 44.83 vs 41.83 ms. Set
+`MONO_EP_STORED_CONTEXT=off` (Axolotl `expert_parallel_mono_ep_stored_context: off`) for that
+combination.
+
 `auto` resolves to `nvfp4_lora` on SM100 when the experts load as packed NVFP4 (a modelopt NVFP4
 checkpoint through the kernels plugin) and `adapter: lora` targets them; `nvfp4_lora` can also be
 set explicitly. It is the one precision that trains with an adapter: the config needs
