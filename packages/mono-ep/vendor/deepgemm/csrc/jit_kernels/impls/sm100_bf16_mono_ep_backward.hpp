@@ -238,6 +238,8 @@ static void instantiate() {{
         ds.data_ptr<float>(), reinterpret_cast<uint32_t*>(starts.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(counts.data_ptr<int>())};
     buffers.pool_rows = rows < required_rows ? static_cast<uint32_t>(rows) : 0u;
+    if (mono_ep_prepare_only)
+        return;
     jit->launch(kernel, {.num_smem_bytes = smem, .grid_dim = dim3(sms),
         .block_dim = dim3(512), .cluster_dim = dim3(2, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),
@@ -480,6 +482,8 @@ static void instantiate() {{
     buffers.sdy_pool = reinterpret_cast<float*>(pools[8].data_ptr());
     buffers.sdz_pool = reinterpret_cast<float*>(pools[9].data_ptr());
     buffers.dy_sf = layout::SymBuffer<>(dy_sf_ptrs, rank);
+    if (mono_ep_prepare_only)
+        return;
     jit->launch(kernel, {.num_smem_bytes = smem, .grid_dim = dim3(sms),
         .block_dim = dim3(512), .cluster_dim = dim3(2, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),

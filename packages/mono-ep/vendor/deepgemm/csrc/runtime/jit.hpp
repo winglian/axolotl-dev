@@ -11,6 +11,9 @@ namespace deep_gemm {
 
 inline deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA>> jit(nullptr);
 
+// The persistent mono-ep entry points compile and load their kernel but do not launch it
+inline bool mono_ep_prepare_only = false;
+
 inline void init_jit(const std::string& library_root_path) {
     const auto library_root = std::filesystem::absolute(library_root_path);
     const auto include_dir = library_root / "include";

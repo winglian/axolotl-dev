@@ -99,6 +99,8 @@ static void instantiate() {{
         ds.data_ptr<float>(), reinterpret_cast<uint32_t*>(starts.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(counts.data_ptr<int>())};
     buffers.pool_rows = rows < required_rows ? static_cast<uint32_t>(rows) : 0u;
+    if (mono_ep_prepare_only)
+        return;
     jit->launch(kernel, {.num_smem_bytes = smem, .grid_dim = dim3(sms),
         .block_dim = dim3(512), .cluster_dim = dim3(1, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),

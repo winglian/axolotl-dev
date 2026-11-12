@@ -363,6 +363,8 @@ static void instantiate() {{
     }
     if (transport_fp8)
         buffers.dy_sf = layout::SymBuffer<>(dy_sf_ptrs, rank);
+    if (mono_ep_prepare_only)
+        return;
     jit->launch(kernel, {.num_smem_bytes = smem, .grid_dim = dim3(sms),
         .block_dim = dim3(block_threads), .cluster_dim = dim3(1, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),

@@ -165,6 +165,8 @@ static void __instantiate_kernel() {{
         fast_math ? "true" : "false", diag_suffix));
 
     // Launch
+    if (mono_ep_prepare_only)
+        return;
     jit->launch(
         kernel, {
             .num_smem_bytes = config.smem_size,

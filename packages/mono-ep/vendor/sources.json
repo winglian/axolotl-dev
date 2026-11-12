@@ -54,7 +54,8 @@
       "SM90 direct weight-gradient h/dG/dU column packing stages BF16 values through a bank-swizzled shared tile before warp-cooperative FP8 quantization",
       "Opt-in SM90 FP8 forward consumes original-layout W1 through paired gate/up 64-row TMA loads and canonical gate/up accumulator columns; interleaved default preserved",
       "Experimental SM90 backward x/dY column packing explicitly converts BF16 sources into 64-column bank-swizzled shared tiles for contiguous packed FP8 row stores",
-      "SM90 packed wgrad epilogue reuses its BF16 h/dz values in dead gate/up/dh shared slots instead of recomputing SwiGLU for each column operand"
+      "SM90 packed wgrad epilogue reuses its BF16 h/dz values in dead gate/up/dh shared slots instead of recomputing SwiGLU for each column operand",
+      "Persistent MonoEP entry points skip the launch after compiling and loading their kernel while set_mono_ep_prepare_only(True) is set"
     ],
     "dependencies": {
       "cutlass": {

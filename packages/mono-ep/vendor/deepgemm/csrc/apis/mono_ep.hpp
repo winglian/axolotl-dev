@@ -613,6 +613,8 @@ static void nvfp4_mono_ep(
 }
 
 static void register_apis(pybind11::module_& m) {
+    m.def("set_mono_ep_prepare_only", [](const bool& value) { mono_ep_prepare_only = value; });
+    m.def("get_mono_ep_prepare_only", [] { return mono_ep_prepare_only; });
     m.def("get_token_alignment_for_mono_ep", &get_token_alignment_for_mono_ep);
     m.def("get_block_m_for_mono_ep", &get_block_m_for_mono_ep);
     m.def("get_mono_ep_backward_combine_views", &get_mono_ep_backward_combine_views);

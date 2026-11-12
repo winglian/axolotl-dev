@@ -211,6 +211,8 @@ static void instantiate() {{
             dispatch_threads, non_epilogue_threads, sms, world, activation.limit_bits,
             compact_non_math ? "true" : "false", original_w1_layout ? "true" : "false",
             diag_suffix + trailing_args));
+    if (mono_ep_prepare_only)
+        return;
     jit->launch(kernel, {.num_smem_bytes = SM90ArchSpec::smem_capacity, .grid_dim = dim3(sms),
         .block_dim = dim3(block_threads), .cluster_dim = dim3(1, 1, 1)},
         y.data_ptr(), phase_trace_ptr != 0 ? reinterpret_cast<int*>(phase_trace_ptr) : recv_stats_ptr,

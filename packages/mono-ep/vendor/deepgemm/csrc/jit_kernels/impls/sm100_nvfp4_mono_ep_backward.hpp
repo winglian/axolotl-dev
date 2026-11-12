@@ -207,6 +207,8 @@ static void instantiate() {{
     buffers.nv_rdz = row_scales[1].data_ptr<float>();
     buffers.nv_pool_rows = static_cast<uint32_t>(rows);
     buffers.pool_rows = rows < required_rows ? static_cast<uint32_t>(rows) : 0u;
+    if (mono_ep_prepare_only)
+        return;
     jit->launch(kernel, {.num_smem_bytes = smem, .grid_dim = dim3(sms),
         .block_dim = dim3(512), .cluster_dim = dim3(2, 1, 1)},
         dx.data_ptr(), static_cast<int*>(nullptr), tokens, layout::SymBuffer<>(sym_ptrs, rank),

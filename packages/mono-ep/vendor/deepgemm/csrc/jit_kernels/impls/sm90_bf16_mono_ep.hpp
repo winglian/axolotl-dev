@@ -150,6 +150,8 @@ static void __instantiate_kernel() {{
         fast_math ? "true" : "false"));
 
     // Launch
+    if (mono_ep_prepare_only)
+        return;
     jit->launch(
         kernel, {
             .num_smem_bytes = SM90ArchSpec::smem_capacity,

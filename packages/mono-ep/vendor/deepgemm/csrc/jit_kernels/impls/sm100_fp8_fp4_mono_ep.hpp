@@ -190,6 +190,8 @@ static void __instantiate_kernel() {{
         to_string(l1_weights.scalar_type())));
 
     // Launch
+    if (mono_ep_prepare_only)
+        return;
     jit->launch(
         kernel, {
             .num_smem_bytes = config.smem_size,
