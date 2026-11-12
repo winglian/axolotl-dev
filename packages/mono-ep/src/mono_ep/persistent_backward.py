@@ -503,15 +503,18 @@ class NativePersistentBackward:
         weight_grads=True,
         mx_forms=None,
         fp8_pools=False,
+        sm90_forms=None,
     ):
         """``dx, dscore, dW1, dW2``. ``record_key`` (default ``w1``) is the tensor the
         matching forward recorded its receive counts under. ``weight_grads=False``
         returns ``None`` for both weight gradients and leaves the BF16 x / dy / h / dz
-        pools (``pools[:4]``, by ``starts`` / ``counts``) for the caller; the MXFP8
+        pools (``pools[:4]``, by ``starts`` / ``counts``) for the caller (blockwise FP8: the packed
+        E4M3 wgrad operands, :meth:`packed_pools`); the MXFP8
         backward then runs with BF16 dW so it writes them. ``mx_forms`` hands the MXFP8
         backward its ``(w1, w2t, w1t)`` forms instead of building them from ``w1`` / ``w2``.
         ``fp8_pools`` (with ``weight_grads=False``) launches the MXFP8 backward without the BF16
-        x / dy / dz copies: the caller reads the E4M3 pools (``mxfp8_pools()``) and BF16 h."""
+        x / dy / dz copies: the caller reads the E4M3 pools (``mxfp8_pools()``) and BF16 h.
+        ``sm90_forms`` hands the blockwise backward its ``(w1_interleaved, w2t, w1t)`` forms."""
         import deep_gemm
         from deep_gemm.mega import _interleave_weights
 
@@ -525,10 +528,6 @@ class NativePersistentBackward:
             )
         if x.dtype != torch.bfloat16 or dy.dtype != torch.bfloat16:
             raise ValueError("Native backward requires BF16 activations and gradients")
-        if not weight_grads and self.blockwise:
-            raise NotImplementedError(
-                "the blockwise FP8 backward keeps no full BF16 pools to return"
-            )
         stream = torch.cuda.current_stream(x.device)
         if self.finished is not None:
             stream.wait_event(self.finished)
@@ -607,7 +606,11 @@ class NativePersistentBackward:
             from .sm90_weight_forms import cache_mode
 
             cache = cache_mode()
-        if cache != "0":
+        if sm90_forms is not None:
+            prepared = sm90_forms
+            interleaved, w2t, w1t = [p[0] for p in prepared]
+            scale_args = ([p[1] for p in prepared],)
+        elif cache != "0":
             from .sm90_weight_forms import BACKWARD_FORMS, cached_forms
 
             prepared = cached_forms(w1, w2, BACKWARD_FORMS, cache)
@@ -748,6 +751,11 @@ class NativePersistentBackward:
         self.finished = torch.cuda.Event()
         self.finished.record(stream)
         return dx, ds.to(scores.dtype), dw1, dw2
+
+    def packed_pools(self):
+        """The SM90 blockwise backward's packed column-major ``(qx, qdy, qh, qdz, sx, sdy, sh, sdz)``
+        wgrad operands, laid out by ``starts`` / ``padded_counts``."""
+        return tuple(self.pools[10:18])
 
     def mxfp8_pools(self):
         """The MXFP8 backward's ``(qx, qdy, qdz, sx, sdy, sdz)`` E4M3 pools and scale words."""

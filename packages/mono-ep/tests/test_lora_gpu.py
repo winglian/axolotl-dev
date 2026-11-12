@@ -530,3 +530,88 @@ def test_mxfp8_lora_pool_modes_and_wgrad_routes(group, monkeypatch):
     # dA2 / dB2 read h and dy, which both routes see identically up to rounding of the routes
     for got, want in zip(grads_fp8[2:], grads_bf16[2:], strict=True):
         assert rel(got, want) < 5e-3
+
+
+def _packed_operand(x, starts, counts):
+    """The SM90 blockwise backward's packed column-major E4M3 wgrad operand of ``x`` (rows past
+    each expert's count zero) and its exact dequantization."""
+    from mono_ep.wgrad_quantization import quantize_transposed_groups
+
+    padded = (counts + 127) // 128 * 128
+    q, s = quantize_transposed_groups(
+        x, starts + padded, use_psum_layout=True, scales_mn_major=True
+    )
+    width = x.shape[1]
+    deq = torch.zeros_like(x, dtype=torch.float32)
+    for st, p in zip(starts.tolist(), padded.tolist(), strict=True):
+        if p:
+            seg = q[st * width : (st + p) * width].view(width, p).float()
+            scale = s[:, st // 128 : (st + p) // 128].repeat_interleave(128, 1)
+            deq[st : st + p] = (seg * scale).t()
+    return q, s, deq.bfloat16()
+
+
+def test_sm90_packed_route_reads_the_dequantized_values(group, monkeypatch):
+    """fp8_lora's rank-r route on the packed column-major E4M3 operands (int32 words, no 8-bit
+    tensors) against the reference on their exact dequantization, including E4M3 subnormals,
+    an empty expert and partial last blocks."""
+    _require("blockwise")
+    from mono_ep import lora_grads
+    from mono_ep.lora import lora_weight_grads
+
+    pools, starts, counts, factors = _pool_case()
+    valid = torch.zeros(pools[0].shape[0], dtype=torch.bool, device="cuda")
+    for s, c in zip(starts.tolist(), counts.tolist(), strict=True):
+        valid[s : s + c] = True
+    for p in pools:
+        p[~valid] = 0
+    pools[0][:, :64] *= 1e-3
+    pools[0][:5, 64:] *= 1e3
+    ops = [_packed_operand(p, starts, counts) for p in pools]
+    packed = tuple(o[0] for o in ops) + tuple(o[1] for o in ops)
+    monkeypatch.setenv("MONO_EP_LORA_WGRAD", "loop")
+    want = lora_weight_grads([o[2] for o in ops], starts, counts, *factors, SCALING)
+    padded = (counts + 127) // 128 * 128
+    got = lora_grads.lora_weight_grads_packed(
+        packed, starts, counts, padded, *factors, SCALING
+    )
+    for g, w in zip(got, want, strict=True):
+        assert g.shape == w.shape
+        assert rel(g, w) < 5e-3
+    for kernel in (lora_grads._project_packed, lora_grads._contract_packed):
+        for cache in kernel.device_caches.values():
+            for compiled in cache[0].values():
+                ttgir = compiled.asm["ttgir"]
+                assert "i8" not in ttgir and "f8E4M3" not in ttgir
+
+
+@pytest.mark.parametrize("routing", ["balanced", "skewed"])
+def test_sm90_packed_and_project_routes_agree(group, monkeypatch, routing):
+    """``MONO_EP_LORA_SM90_WGRAD``: the packed rank-r route and the full-dW projection read the
+    same backward (dx bitwise) and agree on the adapter gradients up to the projection's FP8 dW."""
+    _require("blockwise")
+    from mono_ep.lora import LoraExperts, MergedWeightCache
+
+    monkeypatch.setenv("MONO_EP_STORED_CONTEXT", "off")
+    tokens, topk = 256, 4
+    inputs = _inputs(tokens, topk, routing)
+    runtime = _runtime(group, "blockwise", tokens, topk)
+
+    def step(mode):
+        monkeypatch.setenv("MONO_EP_LORA_SM90_WGRAD", mode)
+        adapters = [a.clone().requires_grad_() for a in inputs[5]]
+        return _lora_step(
+            runtime,
+            MergedWeightCache(mode="layer"),
+            LoraExperts(scaling=SCALING),
+            inputs,
+            adapters,
+        )
+
+    _, dx_packed, ds_packed, grads_packed = step("packed")
+    _, dx_project, ds_project, grads_project = step("project")
+    runtime.close()
+    assert torch.equal(dx_packed, dx_project)
+    assert torch.equal(ds_packed, ds_project)
+    for got, want in zip(grads_packed, grads_project, strict=True):
+        assert rel(got, want) < 1e-2

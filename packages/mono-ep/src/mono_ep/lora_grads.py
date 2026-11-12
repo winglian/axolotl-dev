@@ -265,3 +265,213 @@ def lora_weight_grads_triton(
     da2 = contract("h", p2, inter).transpose(1, 2)
     db2 = contract("dy", q2, hidden)
     return da1, db1, da2, db2
+
+
+@triton.jit
+def _packed_tiles(X, S, base, cols, words, scale_row, PADDED_WORDS, K: tl.constexpr):
+    """The four BF16 ``[cols, words]`` tiles of a packed column-major E4M3 operand (rows
+    ``4 * word + lane`` of the expert segment at word ``base``), one power-of-two scale per
+    column and 128-row block. Same E4M3 decode as :func:`_fp8_tiles`."""
+    w = tl.load(X + base + cols[:, None].to(tl.int64) * PADDED_WORDS + words[None, :])
+    scale = tl.load(S + scale_row * K + cols)[:, None]
+    b1 = w >> 8
+    b2 = w >> 16
+    b3 = w >> 24
+    x0 = (
+        (((w & 0x7F) << 20) | ((w & 0x80) << 24)).to(tl.float32, bitcast=True)
+        * 1.329227995784916e36
+        * scale
+    ).to(tl.bfloat16)
+    x1 = (
+        (((b1 & 0x7F) << 20) | ((b1 & 0x80) << 24)).to(tl.float32, bitcast=True)
+        * 1.329227995784916e36
+        * scale
+    ).to(tl.bfloat16)
+    x2 = (
+        (((b2 & 0x7F) << 20) | ((b2 & 0x80) << 24)).to(tl.float32, bitcast=True)
+        * 1.329227995784916e36
+        * scale
+    ).to(tl.bfloat16)
+    x3 = (
+        (((b3 & 0x7F) << 20) | ((b3 & 0x80) << 24)).to(tl.float32, bitcast=True)
+        * 1.329227995784916e36
+        * scale
+    ).to(tl.bfloat16)
+    return x0, x1, x2, x3
+
+
+@triton.jit
+def _project_packed(
+    X,
+    S,
+    W,
+    OUT,
+    STARTS,
+    COUNTS,
+    PADDED,
+    NUM_EXPERTS: tl.constexpr,
+    EXPERTS_POW2: tl.constexpr,
+    K: tl.constexpr,
+    R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # One 128-row block: OUT[rows, R] = X[rows, :K] @ W[owner], computed as W[owner]ᵀ X[rows]ᵀ
+    # per byte lane so the decoded tiles are never transposed
+    block = tl.program_id(0)
+    experts = tl.arange(0, EXPERTS_POW2)
+    starts = tl.load(STARTS + experts, experts < NUM_EXPERTS, other=2147483647)
+    owner = tl.max(tl.where(starts <= block * BLOCK_ROWS, experts, -1), 0)
+    start = tl.load(STARTS + tl.maximum(owner, 0))
+    count = tl.load(COUNTS + tl.maximum(owner, 0))
+    padded = tl.load(PADDED + tl.maximum(owner, 0))
+    first = block * BLOCK_ROWS - start
+    if (owner >= 0) & (first < count):
+        words = tl.arange(0, BLOCK_ROWS // 4)
+        r = tl.arange(0, R)
+        base = (start.to(tl.int64) * K + first) // 4
+        acc0 = tl.zeros([R, BLOCK_ROWS // 4], dtype=tl.float32)
+        acc1 = tl.zeros([R, BLOCK_ROWS // 4], dtype=tl.float32)
+        acc2 = tl.zeros([R, BLOCK_ROWS // 4], dtype=tl.float32)
+        acc3 = tl.zeros([R, BLOCK_ROWS // 4], dtype=tl.float32)
+        w_base = W + owner.to(tl.int64) * K * R
+        for k0 in range(0, K, BLOCK_K):
+            cols = k0 + tl.arange(0, BLOCK_K)
+            x0, x1, x2, x3 = _packed_tiles(
+                X, S, base, cols, words, block, padded // 4, K
+            )
+            wt = tl.load(w_base + cols[None, :] * R + r[:, None])
+            acc0 = tl.dot(wt, x0, acc0)
+            acc1 = tl.dot(wt, x1, acc1)
+            acc2 = tl.dot(wt, x2, acc2)
+            acc3 = tl.dot(wt, x3, acc3)
+        local = first + 4 * words
+        out = (
+            OUT
+            + (block.to(tl.int64) * BLOCK_ROWS + 4 * words[None, :]) * R
+            + r[:, None]
+        )
+        tl.store(out, acc0.to(tl.bfloat16), (local < count)[None, :])
+        tl.store(out + R, acc1.to(tl.bfloat16), (local + 1 < count)[None, :])
+        tl.store(out + 2 * R, acc2.to(tl.bfloat16), (local + 2 < count)[None, :])
+        tl.store(out + 3 * R, acc3.to(tl.bfloat16), (local + 3 < count)[None, :])
+
+
+@triton.jit
+def _contract_packed(
+    X,
+    S,
+    Y,
+    OUT,
+    STARTS,
+    COUNTS,
+    PADDED,
+    scaling,
+    K: tl.constexpr,
+    R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # OUT[e, K-block, R] = scaling * X[rows of e, K-block]ᵀ @ Y[rows of e, R], FP32; the packed
+    # operand is already column-major, so each byte lane is a [BLOCK_K, rows / 4] tile
+    e = tl.program_id(0)
+    kb = tl.program_id(1)
+    start = tl.load(STARTS + e)
+    count = tl.load(COUNTS + e)
+    padded = tl.load(PADDED + e)
+    r = tl.arange(0, R)
+    words = tl.arange(0, BLOCK_ROWS // 4)
+    cols = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+    acc = tl.zeros([BLOCK_K, R], dtype=tl.float32)
+    for m0 in range(0, padded, BLOCK_ROWS):
+        base = (start.to(tl.int64) * K + m0) // 4
+        x0, x1, x2, x3 = _packed_tiles(
+            X, S, base, cols, words, (start + m0) // BLOCK_ROWS, padded // 4, K
+        )
+        local = m0 + 4 * words
+        y = Y + (start.to(tl.int64) + local[:, None]) * R + r[None, :]
+        acc = tl.dot(x0, tl.load(y, (local < count)[:, None], other=0.0), acc)
+        acc = tl.dot(x1, tl.load(y + R, (local + 1 < count)[:, None], other=0.0), acc)
+        acc = tl.dot(
+            x2, tl.load(y + 2 * R, (local + 2 < count)[:, None], other=0.0), acc
+        )
+        acc = tl.dot(
+            x3, tl.load(y + 3 * R, (local + 3 < count)[:, None], other=0.0), acc
+        )
+    out = OUT + e.to(tl.int64) * K * R
+    tl.store(out + cols[:, None] * R + r[None, :], acc * scaling)
+
+
+def lora_weight_grads_packed(
+    packed, starts, counts, padded_counts, a1, b1, a2, b2, scaling
+):
+    """``dA1, dB1, dA2, dB2`` (FP32) from the SM90 blockwise backward's packed column-major E4M3
+    wgrad operands ``packed = (qx, qdy, qh, qdz, sx, sdy, sh, sdz)``: expert ``e``'s
+    ``[width, padded_counts[e]]`` segment starts at element ``starts[e] * width``, rows past
+    ``counts[e]`` are zero, and ``s*[col, row // 128]`` scales a column of a 128-row block."""
+    qx, qdy, qh, qdz, sx, sdy, sh, sdz = packed
+    experts, rank = a1.shape[:2]
+    hidden, inter = a1.shape[2], a2.shape[2]
+    rp = _padded_rank(rank)
+    rows = sx.shape[1] * BLOCK_ROWS
+    device = sx.device
+    pow2 = triton.next_power_of_2(experts)
+    w = dict(
+        a1=_factor(a1, True, rp),
+        b1=_factor(b1, False, rp),
+        a2=_factor(a2, True, rp),
+        b2=_factor(b2, False, rp),
+    )
+    source = dict(
+        x=(qx.view(torch.int32), sx, hidden),
+        dy=(qdy.view(torch.int32), sdy, hidden),
+        h=(qh.view(torch.int32), sh, inter),
+        dz=(qdz.view(torch.int32), sdz, 2 * inter),
+    )
+
+    def project(name, weight):
+        x, s, k = source[name]
+        out = torch.zeros(rows, rp, device=device, dtype=torch.bfloat16)
+        _project_packed[(rows // BLOCK_ROWS,)](
+            x,
+            s,
+            w[weight],
+            out,
+            starts,
+            counts,
+            padded_counts,
+            experts,
+            pow2,
+            k,
+            rp,
+            64,
+            num_warps=4,
+        )
+        return out
+
+    def contract(name, y):
+        x, s, k = source[name]
+        out = torch.empty(experts, k, rp, device=device, dtype=torch.float32)
+        _contract_packed[(experts, k // 64)](
+            x,
+            s,
+            y,
+            out,
+            starts,
+            counts,
+            padded_counts,
+            float(scaling),
+            k,
+            rp,
+            64,
+            num_warps=4,
+        )
+        return out[..., :rank]
+
+    p1 = project("dz", "b1")
+    q1 = project("x", "a1")
+    p2 = project("dy", "b2")
+    q2 = project("h", "a2")
+    da1 = contract("x", p1).transpose(1, 2)
+    db1 = contract("dz", q1)
+    da2 = contract("h", p2).transpose(1, 2)
+    db2 = contract("dy", q2)
+    return da1, db1, da2, db2

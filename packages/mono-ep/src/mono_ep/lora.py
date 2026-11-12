@@ -304,6 +304,16 @@ class MergedMxfp8Forms:
         return sum(t.numel() * t.element_size() for t in self.tensors())
 
 
+def sm90_wgrad_mode():
+    """``MONO_EP_LORA_SM90_WGRAD``: adapter gradients of the SM90 blockwise ``fp8_lora`` backward.
+    ``packed`` (default) runs the rank-r Triton passes on the backward's packed E4M3 wgrad
+    operands; ``project`` computes the full FP8 dW and projects it onto the factors."""
+    value = os.environ.get("MONO_EP_LORA_SM90_WGRAD", "packed")
+    if value not in ("packed", "project"):
+        raise ValueError("MONO_EP_LORA_SM90_WGRAD must be packed or project")
+    return value
+
+
 def mxfp8_forms_mode():
     """``MONO_EP_LORA_MXFP8_FORMS``: ``fused`` (default: the merge runs inside the CUDA MXFP8
     forms builder) or ``merge`` (merge to BF16, then the full fine-tune's forms)."""
@@ -510,8 +520,28 @@ def lora_backward(
                 experts.scaling,
                 default=TRITON_WGRAD_DEFAULT[native.arch],
             )
+    elif native.blockwise and sm90_wgrad_mode() == "packed":
+        from .lora_grads import lora_weight_grads_packed
+
+        dx, ds, _, _ = native.backward(
+            dy,
+            x,
+            indices,
+            scores,
+            merged.w1,
+            merged.w2,
+            record_key=w1,
+            weight_grads=False,
+        )
+        grads = lora_weight_grads_packed(
+            native.packed_pools(),
+            native.starts,
+            native.counts,
+            native.padded_counts,
+            *adapters,
+            experts.scaling,
+        )
     elif native.blockwise:
-        # the blockwise FP8 backward keeps FP8 operands only: project its full dW
         dx, ds, dw1, dw2 = native.backward(
             dy, x, indices, scores, merged.w1, merged.w2, record_key=w1
         )
