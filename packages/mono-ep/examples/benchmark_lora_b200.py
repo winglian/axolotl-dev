@@ -143,6 +143,12 @@ def main():
     )
     parser.add_argument("--iters", type=int, default=40)
     parser.add_argument("--out", default=None)
+    parser.add_argument(
+        "--profile",
+        type=int,
+        default=0,
+        help="after timing, profile this many (d) steps and report GPU time by kernel (rank 0)",
+    )
     args = parser.parse_args()
     tokens, hidden, inner, num_experts, topk = SHAPES[args.shape]
 
@@ -271,6 +277,36 @@ def main():
             if iteration >= WARMUP:
                 times[name].append(max(elapsed.tolist()))
                 peaks[name] = max(peaks[name], float(peak))
+    profile = None
+    if args.profile:
+        from torch.profiler import ProfilerActivity, profile as torch_profile
+
+        dist.barrier()
+        torch.cuda.synchronize()
+        with torch_profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for _ in range(args.profile):
+                contract_d()
+            torch.cuda.synchronize()
+        events = [
+            e
+            for e in prof.key_averages()
+            if getattr(e, "device_type", None) is not None
+            and str(e.device_type).endswith("CUDA")
+            and e.self_device_time_total > 0
+        ]
+        total = sum(e.self_device_time_total for e in events)
+        profile = dict(
+            steps=args.profile,
+            gpu_ms_per_step=total / 1e3 / args.profile,
+            kernels=[
+                dict(
+                    name=e.key[:160],
+                    ms_per_step=e.self_device_time_total / 1e3 / args.profile,
+                    calls_per_step=e.count / args.profile,
+                )
+                for e in sorted(events, key=lambda e: -e.self_device_time_total)[:40]
+            ],
+        )
     finite = all(
         torch.isfinite(t.grad.float()).all().item()
         for t in leaves
@@ -361,6 +397,7 @@ def main():
             for name, v in times.items()
         },
         rebuild=rebuild,
+        profile=profile,
         env={
             k: os.environ.get(k)
             for k in (
