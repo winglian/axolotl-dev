@@ -63,8 +63,10 @@ _NATIVE_BACKWARD = {
     (10, "mxfp8"): "mxfp8_mono_ep_backward",
     (9, "fp8"): "fp8_mono_ep_backward_sm90",
     (10, "nvfp4_lora"): "nvfp4_mono_ep_backward",
+    (9, "bf16_lora"): "bf16_mono_ep_backward_sm90",
     (10, "bf16_lora"): "bf16_mono_ep_backward",
     (10, "mxfp8_lora"): "mxfp8_mono_ep_backward",
+    (9, "fp8_lora"): "fp8_mono_ep_backward_sm90",
 }
 
 
@@ -115,10 +117,8 @@ def unsupported_reason(
         return "precision fp8_bwd (BF16 forward, blockwise FP8 backward) is not implemented yet"
     if resolved in ("mxfp8", "mxfp8_lora") and major != 10:
         return f"precision {resolved} requires SM100"
-    if resolved == "fp8_lora":
-        return "precision fp8_lora (blockwise FP8 + LoRA) is not implemented yet"
-    if resolved == "bf16_lora" and major != 10:
-        return "precision bf16_lora currently requires SM100"
+    if resolved == "fp8_lora" and major != 9:
+        return "precision fp8_lora (blockwise E4M3 + LoRA) requires SM90"
     if resolved == "fp8" and major != 9:
         return "precision fp8 (blockwise E4M3) requires SM90"
     if resolved == "nvfp4_lora":

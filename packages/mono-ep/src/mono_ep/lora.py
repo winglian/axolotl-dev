@@ -211,6 +211,18 @@ def lora_weight_grads(pools, starts, counts, a1, b1, a2, b2, scaling):
     return da1, db1, da2, db2
 
 
+def project_weight_grads(dw1, dw2, a1, b1, a2, b2, scaling):
+    """``dA = s Bᵀ dW``, ``dB = s dW Aᵀ`` from full fp32 weight gradients (the route for
+    backwards that keep no BF16 pools)."""
+    f = lambda t: t.detach().float()  # noqa: E731
+    return (
+        scaling * f(b1).transpose(1, 2) @ dw1,
+        scaling * dw1 @ f(a1).transpose(1, 2),
+        scaling * f(b2).transpose(1, 2) @ dw2,
+        scaling * dw2 @ f(a2).transpose(1, 2),
+    )
+
+
 def _lora_weight_grads_loop(pools, starts, counts, a1, b1, a2, b2, scaling):
     x_pool, dy_pool, h_pool, dz_pool = pools
     starts_l, counts_l = starts.tolist(), counts.tolist()
@@ -289,7 +301,7 @@ class LoraExperts:
     merged_backward = merged
 
 
-LORA_COMPUTE_DTYPES = ("bf16", "mxfp8")
+LORA_COMPUTE_DTYPES = ("bf16", "mxfp8", "blockwise")
 
 
 FORWARD_OP = "mono_ep::lora_forward"
@@ -354,12 +366,26 @@ def lora_backward(
     adapters = (a1, b1, a2, b2)
     merged = cache.backward(experts.bind(w1, w2), adapters)
     experts.bind(None, None)
-    dx, ds, _, _ = native.backward(
-        dy, x, indices, scores, merged.w1, merged.w2, record_key=w1, weight_grads=False
-    )
-    grads = lora_weight_grads(
-        native.pools[:4], native.starts, native.counts, *adapters, experts.scaling
-    )
+    if native.blockwise:
+        # the blockwise FP8 backward keeps FP8 operands only: project its full dW
+        dx, ds, dw1, dw2 = native.backward(
+            dy, x, indices, scores, merged.w1, merged.w2, record_key=w1
+        )
+        grads = project_weight_grads(dw1, dw2, *adapters, experts.scaling)
+    else:
+        dx, ds, _, _ = native.backward(
+            dy,
+            x,
+            indices,
+            scores,
+            merged.w1,
+            merged.w2,
+            record_key=w1,
+            weight_grads=False,
+        )
+        grads = lora_weight_grads(
+            native.pools[:4], native.starts, native.counts, *adapters, experts.scaling
+        )
     return (
         dx,
         ds,
@@ -390,8 +416,8 @@ def lora_moe(x, indices, scores, w1, w2, a1, b1, a2, b2, runtime, experts, cache
     """Routed MoE on frozen base experts ``w1 [E_local, 2I, H]``, ``w2 [E_local, H, I]``
     plus adapters ``A1 [E_local, r, H]``, ``B1 [E_local, 2I, r]``, ``A2 [E_local, r, I]``,
     ``B2 [E_local, H, r]``, differentiable in ``x``, ``scores`` and the factors (the base
-    gets no gradient). ``runtime`` is a BF16 or SM100 MXFP8 :class:`PersistentMoE` with
-    the native backward; ``experts`` the layer's :class:`LoraExperts`; ``cache`` the
+    gets no gradient). ``runtime`` is a BF16, SM100 MXFP8 or SM90 blockwise FP8
+    :class:`PersistentMoE` with the native backward; ``experts`` the layer's :class:`LoraExperts`; ``cache`` the
     :class:`MergedWeightCache` an optimizer post-step hook invalidates. Runs as the
     ``mono_ep::lora_forward`` custom op, so selective activation checkpointing can save
     its output like ``mono_ep::persistent_forward``."""
