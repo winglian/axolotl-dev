@@ -9,12 +9,14 @@ need; the environment variables exist for experiments and for restoring a previo
 |---|---|---|
 | `expert_parallel_size` | `1` (off) or a divisor of the world size | Number of EP ranks; experts are split evenly across them. |
 | `expert_parallel_backend` | `auto`, `deep_ep`, `torch`, `mono_ep` | Token dispatch backend. `auto` never picks `mono_ep`; set it explicitly. In the fused mode the local experts kernel (`use_sonicmoe`, `use_scattermoe`, `experts_implementation`) is not used; in the dispatch mode it is. |
-| `expert_parallel_mono_ep_mode` | `auto` (default), `fused`, `dispatch` | `fused`: one persistent kernel per direction (plain SwiGLU experts, full fine-tuning). `dispatch`: mono-ep's peer dispatch and combine around the configured local experts kernel, so LoRA, quantized experts, biases, other activations and clamped SwiGLU work. `auto`: `fused` when the config and model allow it, else `dispatch`. |
+| `expert_parallel_mono_ep_mode` | `auto` (default), `fused`, `dispatch` | `fused`: one persistent kernel per direction (plain SwiGLU experts; full fine-tuning, or a LoRA adapter on the experts through the `*_lora` precisions). `dispatch`: mono-ep's peer dispatch and combine around the configured local experts kernel, so DoRA and other adapters the fused LoRA path does not cover, quantized experts, biases, other activations and clamped SwiGLU work. `auto`: `fused` when the config and model allow it, else `dispatch`. |
 | `expert_parallel_mono_ep_compact` | `false` (default), `true` | Dispatch mode: hand the local kernel only the routed receive rows instead of the fixed `ep_size x tokens_per_rank` layout, at the cost of one device-to-host count per layer (saved under activation checkpointing). |
 | `expert_parallel_mono_ep_bounded` | `false` (default), `true` | With `compact`: receive into a bound from each layer's high-water routed count (filled to SonicMoE's row bucket) and read the count only after the local kernel is issued, so dispatch never stalls on the host. Bitwise equal to `compact`; a count above the bound re-runs that layer exactly. Restore: `false`. |
-| `expert_parallel_mono_ep_precision` | `auto`, `bf16`, `mxfp8`, `fp8`, `fp8_bwd` | Compute precision of the fused kernels (table below). Master weights keep their dtype and weight gradients come back in it. |
+| `expert_parallel_mono_ep_precision` | `auto`, `bf16`, `mxfp8`, `fp8`, `fp8_bwd`, `nvfp4_lora`, `bf16_lora`, `mxfp8_lora`, `fp8_lora` | Compute precision of the fused kernels (table below). Master weights keep their dtype and weight gradients come back in it. With an expert LoRA adapter on a BF16 base, `auto` / `bf16` / `mxfp8` / `fp8` resolve to their `*_lora` precision. |
 | `expert_parallel_mono_ep_workspace_bound` | `auto` (default), `max` | Fused mode: size the backward pools and the rings from each step's routed rows (`MONO_EP_WORKSPACE_BOUND`). `max` restores the worst-case sizing. |
 | `expert_parallel_mono_ep_nvfp4_merged_cache` | `layer` (default), `all` | `nvfp4_lora` only: how long a layer's merged NVFP4 weights (base + LoRA, rebuilt after every optimizer step) stay resident. `layer` builds them just in time per layer and keeps the two most recent layers; `all` keeps every layer's forms for the step. Exported as `MONO_EP_NVFP4_MERGED_CACHE`. Restore: `all`. |
+| `expert_parallel_mono_ep_fused_lora` | `true` (default), `false` | Fused mode with an expert LoRA adapter on BF16 experts: train it on the fused kernels (`bf16_lora`, `mxfp8_lora`, `fp8_lora`, below). `false` restores the dispatch mode for every adapter except `nvfp4_lora`. Restore: `false`. |
+| `expert_parallel_mono_ep_lora_merged_cache` | `layer` (default), `all` | `bf16_lora` / `mxfp8_lora` / `fp8_lora`: how long a layer's merged BF16 weights (base + LoRA, rebuilt after every optimizer step) stay resident, like `expert_parallel_mono_ep_nvfp4_merged_cache`. `all` holds one BF16 copy of every layer's routed experts. Exported as `MONO_EP_LORA_MERGED_CACHE`. |
 | `expert_parallel_fallback_on_unsupported` | `true` (default), `false` | When `mono_ep` cannot run (table below), fall back to `expert_parallel_backend: torch` with a warning, or raise. |
 | `dp_shard_size` | | FSDP shard axis next to EP; `expert_parallel_size x dp_shard_size` must equal the world size. The EP group must stay inside one NVLink node. |
 | `activation_checkpointing` | `true` | Non-reentrant checkpointing; reentrant checkpointing is rejected with EP because its recompute cannot replay the fused op. |
@@ -28,6 +30,9 @@ need; the environment variables exist for experiments and for restoring a previo
 | `fp8` (blockwise E4M3 forward and backward, the kernels timed in [benchmarks.md](benchmarks.md)) | yes | no |
 | `fp8_bwd` (BF16 forward, FP8 backward) | not implemented | no |
 | `nvfp4_lora` (frozen packed NVFP4 experts with BF16 LoRA adapters; hidden and intermediate multiples of 256; native backward only, one host) | no | yes |
+| `bf16_lora` (frozen BF16 experts with LoRA adapters on the `bf16` kernels; native backward only, one host) | yes (single-H100 and 2xH100 validated) | yes |
+| `mxfp8_lora` (the same on the `mxfp8` kernels, BF16 dW pools) | no | yes |
+| `fp8_lora` (the same on the blockwise `fp8` kernels; adapter gradients projected from the FP8 dW) | yes (single-H100 and 2xH100 validated) | no |
 
 `auto` on SM100 (full fine-tuning) resolves to `mxfp8`: the MXFP8 forward with the fused MXFP8
 persistent backward. That backward recomputes the gate/up context (the MXFP8 forward has no
@@ -73,6 +78,26 @@ and a warning. Only the adapter is saved; merging it into the NVFP4 base is `mer
 the SonicMoE merge-aware path. The package API is `MonoEPRuntime(precision="nvfp4_lora")` and
 `forward_lora(...)` ([trl-integration.md](trl-integration.md#nvfp4-lora)).
 
+With an expert LoRA adapter on a BF16 base, the fused mode trains it on the full fine-tune
+kernels of the configured precision: `auto` and `mxfp8` resolve to `mxfp8_lora` on SM100, `bf16`
+to `bf16_lora`, and on SM90 `bf16` to `bf16_lora` and `fp8` to `fp8_lora`. The config needs
+`adapter: lora` with `lora_target_parameters` on both `experts.gate_up_proj` and
+`experts.down_proj`, `use_sonicmoe: true` (its ParamWrapper fast path hands the factors to the
+experts module), `lora_dropout: 0` and no DoRA; anything else keeps the dispatch mode, and
+`expert_parallel_mono_ep_fused_lora: false` restores the dispatch mode outright. The base stays a
+frozen parameter (FSDP2-sharded with the rest of the layer, no optimizer state); after every
+optimizer step each layer's merged weights `bf16(W + scaling * B @ A)` are rebuilt once per use
+under `expert_parallel_mono_ep_lora_merged_cache: layer` (forward, checkpoint recompute and,
+when evicted, backward; the last two layers stay resident) or once per step under `all`, and the
+kernels run on them. Adapter gradients come from rank-r grouped GEMMs on the backward's BF16 pools
+(blockwise FP8: projected from the FP8 dW); the base gets none. Adapter-gradient error against an
+FP32 merge-aware reference sits at the precision's own full fine-tune dW envelope (BF16 0.49 % vs
+0.43 %, MXFP8 6.1-6.3 % vs 6.6-6.8 %, blockwise FP8 6.5-6.8 % vs 6.6-6.8 %). On 8xB200 at EP8 the
+`mxfp8_lora` SAC step is 1.75-2.2x faster than the dispatch mode around SonicMoE LoRA with a
+quarter of its peak memory, and at 235B-A22B / Beam faster than the full fine-tune
+([benchmarks.md](benchmarks.md#fused-lora-on-bf16-experts-mxfp8_lora-bf16_lora)). The package API is
+`MonoEPRuntime(precision="mxfp8_lora")` with `forward_lora(..., w1=, w2=)`, or `mono_ep.lora.lora_moe`.
+
 ### Fallback conditions
 
 The backend falls back to `torch` (or raises, per `expert_parallel_fallback_on_unsupported`)
@@ -81,13 +106,13 @@ when:
 | Condition | Checked |
 |---|---|
 | the `mono_ep` package or its DeepGEMM build is missing | config load |
-| an adapter is configured and the config does not qualify for `nvfp4_lora` (not `adapter: lora`, no `use_sonicmoe`, `lora_dropout > 0`, an expert projection missing from `lora_target_parameters`, `nvfp4_merge_aware` on, or a base that is not a modelopt NVFP4 checkpoint); `nvfp4_lora` without an adapter | config load |
+| an adapter is configured and the config does not qualify for a fused LoRA precision (not `adapter: lora`, no `use_sonicmoe`, `lora_dropout > 0`, DoRA, an expert projection missing from `lora_target_parameters`, `expert_parallel_mono_ep_fused_lora: false`; for `nvfp4_lora` also `nvfp4_merge_aware` on or a base that is not a modelopt NVFP4 checkpoint; a modelopt NVFP4 base with another precision); a `*_lora` precision without an adapter | config load |
 | quantized loading (`load_in_4bit`, `load_in_8bit`, `gptq`, `model_quantization_config`) | config load |
 | no CUDA, or a compute capability other than SM90 / SM100 | after model build |
 | `hidden_size % 256 != 0` or expert intermediate size `% 128 != 0` (`% 256` for `nvfp4_lora`) | after model build |
 | expert biases, a non-SiLU gate, a custom `_apply_gate` (e.g. `alpha`), or a clamped SwiGLU (`limit` / `swiglu_limit`) | after model build |
 | experts not in HF `gate_up_proj [E, 2I, H]` / `down_proj [E, H, I]` layout, or MoE layers with different shapes | after model build |
-| with an adapter: experts that are not torchao `NVFP4Tensor`s with row-major block-16 scales and a per-expert per-tensor scale, or not SM100 | after model build |
+| with an adapter: for `nvfp4_lora`, experts that are not torchao `NVFP4Tensor`s with row-major block-16 scales and a per-expert per-tensor scale, or not SM100; for the other LoRA precisions, packed NVFP4 experts | after model build |
 | the precision does not match the architecture | after model build |
 
 The Axolotl side (checkpointing policy, the FSDP mesh, the runtime's lifetime) is described
@@ -189,7 +214,8 @@ before it was made the default; setting that value restores the previous behavio
 | `MONO_EP_NVFP4_REQUANT` | `cuda_fused` | `cuda`, `triton` | Backend of the per-step NVFP4 merged-weight rebuild (requant cache). `cuda_fused` (SM100 kernel) quantizes the transposed backward forms `w1t` / `w2t` from the merged fp32 tile with fresh scales, so no transposed copy of the packed base is stored (81 MiB per layer at Qwen3-30B-A3B EP4, 3.8 GiB per rank over 48 layers; 0.84 GiB per layer at Beam EP8) and the backward is slightly closer to the fp32 reference (one B200, lean-tail default: dx 0.235 vs 0.267, dscore 0.23 vs 0.25, dA / dB 0.18-0.20 vs 0.19-0.22 relative). It moves away from SonicMoE merge-aware's double-rounded transposed bytes, which the Axolotl e2e parity test compares against: adapter-gradient cosine 0.941 -> 0.909 (bound 0.9), relative L2 0.356 -> 0.425 (bound 0.5); `cuda` restores the old bytes at the cost of the transposed base. `cuda` keeps a transposed base per layer and writes the Triton kernel's bytes for every form (the double-rounded transposed forms); `triton` is the vendored Triton kernel. Python-side, not a JIT key. |
 | `MONO_EP_NVFP4_MERGED_CACHE` | `layer` | `all` | Residency of the merged NVFP4 forms. `layer`: built just in time, forward forms (`w1`, `w2`) in the forward and again in the checkpoint recompute, backward forms (`w1`, `w1t`, `w2t`) in the backward, LRU of the two most recent layers (`RequantCache(capacity=2)`), so 3 rebuilds per layer per step under non-reentrant checkpointing (the last two layers of a step hit the recompute forms). `all`: one rebuild of all four forms per layer per step, every layer resident. Both invalidate on the global optimizer post-step hook (version bump) and never serve stale forms: FSDP2 dp_shard 2 x EP 2, three AdamW steps, cached bytes equal a fresh requant of the live adapters every step in both modes. Qwen3-30B-A3B EP4, 3,840 tokens per rank, 48 layers: resident merged forms 7.6 GiB -> 0.26 GiB per rank, 0.98 -> 1.03 s per step (the Axolotl 50-step run; losses equal within the atomics noise, 0.938 vs 0.937 at step 50); one B200 rebuild of the forward forms 0.28 ms, of the backward forms 0.36 ms per layer (32 local 2048 x 768 experts). Beam-1.0-501B at EP8 (32 local 5120 x 2560 experts, 1,350 MiB of merged forms per layer): `all` would hold 68.6 GiB per rank over 52 layers, `layer` holds 2.2 GiB; rebuilds 1.78 / 2.43 ms per layer. |
 | `MONO_EP_NVFP4_REQUANT_FFMA2` | `1` | `0` | Paired FP32 FMA (FFMA2) in the CUDA requant's delta math; `0` builds the scalar variant, 2-6% slower. |
-| `MONO_EP_NVFP4_LORA_WGRAD` | unset (grouped GEMMs) | `loop` (per-expert reference loop) | LoRA adapter weight gradients of the NVFP4 path. Python-side. |
+| `MONO_EP_LORA_WGRAD` (or `MONO_EP_NVFP4_LORA_WGRAD`) | unset (grouped GEMMs) | `loop` (per-expert reference loop) | LoRA adapter weight gradients from the pools (NVFP4, BF16 and MXFP8 LoRA paths). Python-side. |
+| `MONO_EP_LORA_MERGED_CACHE` | `layer` | `all` | Residency of the merged BF16 weights of `bf16_lora` / `mxfp8_lora` / `fp8_lora`, as `MONO_EP_NVFP4_MERGED_CACHE` for NVFP4. The weight forms the kernels read derive from the merged tensors through the weight-layout cache (`MONO_EP_WEIGHT_CACHE_ENTRIES`). Python-side. |
 | `MONO_EP_BACKWARD_SEGMENT_TIMING` | unset | | Diagnostics: `1` records host time and a CUDA event at the MXFP8 backward's segment boundaries (token quantization, weight forms, kernel, requant, dW1, dW2) into `persistent_backward.SEGMENT_MARKS`, for timing probes. |
 | `MONO_EP_NVFP4_REQUANT_VERBOSE`, `MONO_EP_SM100_NVFP4_PHASE_TRACE` | unset | | Diagnostics: CUDA requant build log, NVFP4 forward phase trace. |
 | `MONO_EP_SM90_FP8_TRAP_TIMEOUTS`, `*_PHASE_TRACE`, `*_DIST_TRACE`, `*_DIAG_ABLATE` | unset | | Diagnostics: trap-only timeouts for compiler experiments, per-phase and per-rank traces, epilogue ablations. Not for training. By name: `MONO_EP_SM90_FP8_PHASE_TRACE`, `MONO_EP_SM90_FP8_FORWARD_PHASE_TRACE`, `MONO_EP_SM90_FP8_DIST_TRACE`, `MONO_EP_SM90_FP8_FORWARD_DIST_TRACE`, `MONO_EP_SM90_FP8_DIAG_ABLATE`, `MONO_EP_SM90_FP8_FORWARD_DIAG_ABLATE`, `MONO_EP_SM100_PHASE_TRACE`, `MONO_EP_SM100_FORWARD_PHASE_TRACE`, `MONO_EP_SM100_DIAG_ABLATE`, `MONO_EP_SM100_FORWARD_DIAG_ABLATE`. |
@@ -220,7 +246,7 @@ Every kernel selector is part of the JIT key, so changing one compiles a new ker
 - **`expert_parallel_backend=mono_ep is unsupported here: <reason>. Falling back to
   expert_parallel_backend=torch ...`** The model or config hits a fallback condition (table
   above). Set `expert_parallel_fallback_on_unsupported: false` to raise instead, or
-  `expert_parallel_mono_ep_mode: dispatch` when only the fused mode is excluded (LoRA,
-  quantized experts, biases, other activations).
+  `expert_parallel_mono_ep_mode: dispatch` when only the fused mode is excluded (adapters the
+  fused LoRA path does not cover, quantized experts, biases, other activations).
 - **Restoring a previous default.** Every selector above lists the value that restores the
   behaviour before its current default; set it in the environment of every rank.

@@ -170,6 +170,30 @@ per-task fences). This works because the NVFP4 backward always gives a CTA pair 
 cross-M-block pipeline that overlapped one block's Dx with the next block's recompute removed the
 Dx wait but did not shorten the backward, so it was not merged.
 
+## Fused LoRA on BF16 experts (`bf16_lora`, `mxfp8_lora`, `fp8_lora`)
+
+The other precisions train a LoRA adapter on frozen BF16 experts with the full fine-tune
+kernels, unchanged. `mono_ep.lora` holds what is shared with `nvfp4_lora`: the
+`MergedWeightCache` (per layer, `layer` or `all` residency, invalidated by an optimizer post-step
+hook) and the rank-r adapter gradients on the backward's pools. Per step and layer
+`LoraExperts` merges `bf16(W + scaling * B_e @ A_e)` with one `baddbmm` per projection (the
+factors enter in BF16, as for the NVFP4 requant) from the base FSDP2 has gathered for that
+forward or backward. The merged tensors go through the same forward and native backward as a
+full fine-tune, so the kernel layouts and the MXFP8 / blockwise FP8 forms come from the
+weight-layout cache keyed by the merged storage; the bounded workspace records its receive
+counts under the frozen base instead, which stays put across merges and regathers.
+
+The backward skips the dW GEMMs (`NativePersistentBackward.backward(weight_grads=False)`) and
+returns the BF16 x / dy / h / dz pools, whose padded tails the kernels zero; `lora_weight_grads`
+computes `Q = X Aᵀ`, `P = dZ B`, `dA = s Pᵀ X`, `dB = s dZᵀ Q` (and the same for W2 with dY and
+H) as eight grouped GEMMs. The full dW is never formed. The MXFP8 backward is launched with BF16
+dW for this, so it writes the BF16 pools (x and dy are the dequantized MXFP8 operands the kernel
+used). The SM90 blockwise FP8 backward keeps only FP8 operand copies, so `fp8_lora` instead
+projects the full FP8 dW the Hopper wgrad already computes (`dA = s Bᵀ dW`, `dB = s dW Aᵀ`). The
+forward and backward run as the `mono_ep::lora_forward` / `lora_backward` custom ops, so
+selective activation checkpointing saves the fused output exactly as it does for
+`persistent_forward`.
+
 ## Dispatch mode and the bounded compact receive
 
 The dispatch mode (`expert_parallel_mono_ep_mode: dispatch`, `MonoEPDispatchRuntime`) runs only

@@ -273,6 +273,35 @@ all-to-all baselines in the same process its 2F+B is slower at the larger shapes
 | 235B-A22B | 14.27 | 17.12 |
 | Beam | 11.03 | 13.61 |
 
+## Fused LoRA on BF16 experts (`mxfp8_lora`, `bf16_lora`)
+
+One MoE layer through the Axolotl experts seam (`examples/benchmark_lora_b200.py`), 8xB200
+mono-ep-dev, EP8, 16,384 tokens per GPU, top-8, PEFT expert adapter rank 16, BF16 base. One
+variant per process, 5 warmups and 40 measured iterations with the two contracts interleaved
+(order reversed every other iteration), host wall max over ranks, median ms; peak is the
+allocator peak within a contract, max over ranks. Every iteration counts as an optimizer step: the
+fused paths rebuild their weight forms inside the step, the LoRA variants also merge
+`W + s B @ A`; the dispatch baseline (mono-ep peer dispatch around SonicMoE LoRA, MXFP8 not
+applicable) builds its effective weight per call. (c) is checkpointed 2F+B, (d) the step with the
+fused output (or the dispatch / combine ops) saved under SAC.
+
+| Shape | Routing | `mxfp8_lora` (c) / (d) | `mxfp8` full FT (c) / (d) | dispatch + SonicMoE LoRA (c) / (d) | `bf16_lora` (c) / (d) | `bf16` full FT (c) / (d) | peak GiB: `mxfp8_lora` / full / dispatch | merge / forms per layer |
+|---|---|---|---|---|---|---|---|---|
+| 30B-A3B | balanced | 7.53 / 6.05 | 7.34 / 5.82 | 12.48 / 11.50 | 8.08 / 6.68 | 8.01 / 6.49 | 3.9 / 5.1 / 20.6 | 0.11 / 0.13 |
+| 30B-A3B | skewed | 9.13 / 7.24 | 9.02 / 7.11 | 13.81 / 12.68 | 9.67 / 7.84 | 9.74 / 7.83 | 3.9 / 5.1 / 20.6 | |
+| 235B-A22B | balanced | 15.05 / 12.50 | 15.80 / 13.16 | 29.92 / 27.65 | 21.87 / 16.75 | 24.86 / 18.98 | 8.7 / 11.3 / 41.7 | 0.44 / 0.37 |
+| 235B-A22B | skewed | 18.81 / 15.39 | 19.82 / 16.41 | 34.81 / 32.25 | 27.31 / 20.64 | 31.48 / 23.23 | 8.7 / 11.3 / 41.7 | |
+| Beam | balanced | 27.88 / 23.96 | 30.54 / 26.43 | 54.07 / 50.92 | 48.51 / 36.50 | 55.35 / 43.40 | 16.8 / 22.1 / 62.8 | 1.78 / 1.33 |
+| Beam | skewed | 34.19 / 29.06 | 37.48 / 32.12 | 62.47 / 60.52 | 59.96 / 45.44 | 68.40 / 55.34 | 16.8 / 22.1 / 62.8 | |
+
+The fused LoRA step is 1.75-2.2x faster than the dispatch mode it replaces under SAC and uses a
+fifth to a quarter of its memory. Against the fused full fine-tune it costs the merge and the
+rank-r adapter GEMMs but skips the dW GEMMs: about +0.1-0.2 ms at 30B-A3B, where both are
+bandwidth-bound, and 0.7-3.1 ms (MXFP8) or 2.2-9.9 ms (BF16) less at 235B-A22B and Beam. The merge
+and forms columns are one layer's per-step rebuild on one B200 (MXFP8 forms; BF16 layouts 0.15 /
+0.39 / 1.46 ms); under the `layer` cache a multi-layer model merges a layer twice per step
+(forward and checkpoint recompute), like the full fine-tune rebuilds its forms twice.
+
 ## SM90 BF16 at the Beam shape (8xH100)
 
 `precision: bf16` (the SM90 `auto` precision) against the blockwise FP8 path above, both from
