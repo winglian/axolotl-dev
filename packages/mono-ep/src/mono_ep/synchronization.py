@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["EPOCH"])
 def _epoch_barrier(
     POINTERS, LOCAL, RANK: tl.constexpr, WORLD: tl.constexpr, EPOCH, BLOCK: tl.constexpr
 ):
