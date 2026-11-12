@@ -149,6 +149,8 @@ def test_grouped_scatter(hidden, inner, case, compiled, assign, output_dtype, bo
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("rows", [0, 137])
 def test_separate_scatter_store(dtype, compiled, rows):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 required")
     from mono_ep.combine import combine_wait_reduce, peer_scatter_store_publish
 
     source = torch.randn(rows, 257, device="cuda", dtype=torch.bfloat16)
@@ -301,6 +303,8 @@ def test_grouped_bf16_scatter(
 @pytest.mark.parametrize("width", [16, 96, 192])
 @pytest.mark.parametrize("compiled", [False, True])
 def test_reduce_scatter_publish(rows, masked, width, compiled):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 required")
     from mono_ep.combine import combine_wait_copy, peer_reduce_scatter_publish
 
     torch.manual_seed(772)
