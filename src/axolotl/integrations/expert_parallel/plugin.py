@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from importlib.util import find_spec
 from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
+from transformers import TrainerCallback
 
 from axolotl.integrations.base import BasePlugin
 from axolotl.utils.logging import get_logger
@@ -149,6 +151,17 @@ def _apply_gate_is_plain(experts) -> bool:
     return tuple(got.shape) == tuple(want.shape) and torch.allclose(
         got.float(), want, atol=1e-5, rtol=1e-5
     )
+
+
+class _MonoEPPrepareCallback(TrainerCallback):
+    """Compiles the fused ``mono_ep`` kernels on every rank before the first step, after the
+    model is wrapped (``MonoEPRuntime.prepare``)."""
+
+    def __init__(self, plugin, cfg, trainer):
+        self.plugin, self.cfg, self.trainer = plugin, cfg, trainer
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.plugin._prepare_mono_ep_runtime(self.cfg, self.trainer)
 
 
 class ExpertParallelPlugin(BasePlugin):
@@ -514,6 +527,68 @@ class ExpertParallelPlugin(BasePlugin):
         if backend == "auto":
             backend = cls._resolve_backend(cfg)
         return backend in ("torch", MONO_EP)
+
+    def add_callbacks_post_trainer(self, cfg, trainer):
+        runtime = self.__dict__.get("_mono_ep_runtime")
+        if runtime is None or not hasattr(runtime, "prepare"):
+            return []
+        return [_MonoEPPrepareCallback(self, cfg, trainer)]
+
+    def _prepare_mono_ep_runtime(self, cfg, trainer) -> None:
+        from .shard import _detect_experts_modules
+
+        runtime = self._mono_ep_runtime
+        model = trainer.model
+        experts = next((m for _n, m in _detect_experts_modules(model)), None)
+        weight = getattr(experts, "gate_up_proj", None)
+        if not isinstance(weight, torch.Tensor):
+            weight = None
+        lora_factor = next(
+            (
+                p
+                for n, p in model.named_parameters()
+                if "lora_A" in n and "experts" in n
+            ),
+            None,
+        )
+        # the dtype the fused forward sees: FSDP2 casts to the mixed-precision param dtype
+        # unless the LoRA FP32-gradient policy keeps the loaded dtypes
+        fsdp_plugin = getattr(trainer.accelerator.state, "fsdp_plugin", None)
+        policy = getattr(fsdp_plugin, "mixed_precision_policy", None)
+        cast = (
+            getattr(fsdp_plugin, "fsdp_version", 1) == 2
+            and getattr(policy, "param_dtype", None) is not None
+            and not getattr(
+                trainer.accelerator.unwrap_model(model),
+                "_axolotl_lora_fp32_gradients",
+                False,
+            )
+        )
+
+        def forward_dtype(param, default):
+            if cast:
+                return policy.param_dtype
+            return param.dtype if param is not None else default
+
+        kwargs = {}
+        if runtime.precision.endswith("_lora"):
+            kwargs = {
+                "lora_rank": cfg.lora_r,
+                "lora_dtype": forward_dtype(lora_factor, torch.float32),
+            }
+            if runtime.precision == "nvfp4_lora":
+                from .nvfp4_lora import get_state
+
+                kwargs["nvfp4_backend"] = getattr(get_state(), "backend", None)
+        else:
+            kwargs["weight_dtype"] = forward_dtype(weight, torch.bfloat16)
+        tokens = min(self._mono_ep_tokens_per_rank(cfg), runtime.max_tokens_per_rank)
+        start = time.perf_counter()
+        runtime.prepare(num_tokens=tokens, **kwargs)
+        LOG.info(
+            f"expert_parallel: mono_ep kernels prepared on every rank in "
+            f"{time.perf_counter() - start:.1f}s ({tokens} tokens/rank, {kwargs})"
+        )
 
     def post_train_unload(self, cfg):
         from . import fused_lora

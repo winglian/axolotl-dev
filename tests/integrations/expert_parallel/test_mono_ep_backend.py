@@ -73,6 +73,8 @@ class _FakeRuntime:
         self.destroyed = False
         precision = kwargs.get("precision", "auto")
         self.precision = "bf16" if precision == "auto" else precision
+        self.max_tokens_per_rank = kwargs.get("max_tokens_per_rank")
+        self.prepared = []
         _FakeRuntime.instances.append(self)
 
     @staticmethod
@@ -82,6 +84,9 @@ class _FakeRuntime:
     def forward(self, x, topk_idx, topk_weights, w1, w2):
         self.calls.append((x, topk_idx, topk_weights, w1, w2))
         return x * 2
+
+    def prepare(self, **kwargs):
+        self.prepared.append(kwargs)
 
     def destroy(self):
         self.destroyed = True
@@ -760,6 +765,54 @@ class TestRuntimeLifecycle:
         with pytest.raises(RuntimeError, match="no runtime built"):
             experts_fn.get_mono_ep_runtime()
         plugin.post_train_unload(cfg)
+
+    @staticmethod
+    def _trainer(model, param_dtype=None, fsdp_version=2):
+        fsdp_plugin = SimpleNamespace(
+            fsdp_version=fsdp_version,
+            mixed_precision_policy=SimpleNamespace(param_dtype=param_dtype),
+        )
+        accelerator = SimpleNamespace(
+            state=SimpleNamespace(fsdp_plugin=fsdp_plugin), unwrap_model=lambda m: m
+        )
+        return SimpleNamespace(model=model, accelerator=accelerator)
+
+    @pytest.mark.parametrize(
+        "param_dtype,fsdp_version,expected",
+        [
+            (None, 2, torch.float32),
+            (torch.bfloat16, 2, torch.bfloat16),
+            (torch.bfloat16, 1, torch.float32),
+        ],
+    )
+    def test_prepared_at_train_begin(
+        self, monkeypatch, mono_ep_package, param_dtype, fsdp_version, expected
+    ):
+        cfg = _cfg()
+        plugin, _ = self._built(cfg, monkeypatch)
+        (runtime,) = _FakeRuntime.instances
+        trainer = self._trainer(_qwen3_model(), param_dtype, fsdp_version)
+        (callback,) = plugin.add_callbacks_post_trainer(cfg, trainer)
+        assert runtime.prepared == []
+        callback.on_train_begin(None, None, None)
+        assert runtime.prepared == [{"num_tokens": 2000, "weight_dtype": expected}]
+
+    def test_prepared_with_lora_rank(self, monkeypatch, mono_ep_package):
+        cfg = _cfg(lora_r=16)
+        plugin, _ = self._built(cfg, monkeypatch)
+        (runtime,) = _FakeRuntime.instances
+        runtime.precision = "bf16_lora"
+        trainer = self._trainer(_qwen3_model(), torch.bfloat16)
+        (callback,) = plugin.add_callbacks_post_trainer(cfg, trainer)
+        callback.on_train_begin(None, None, None)
+        assert runtime.prepared == [
+            {"num_tokens": 2000, "lora_rank": 16, "lora_dtype": torch.bfloat16}
+        ]
+
+    def test_no_callback_without_a_fused_runtime(self, monkeypatch, mono_ep_package):
+        cfg = _cfg(expert_parallel_backend="torch")
+        plugin, _ = self._built(cfg, monkeypatch)
+        assert plugin.add_callbacks_post_trainer(cfg, self._trainer(None)) == []
 
     def test_torch_fallback_builds_nothing(self, monkeypatch, mono_ep_package):
         self._built(_cfg(expert_parallel_backend="torch"), monkeypatch)
