@@ -69,6 +69,23 @@ all-to-all restage of `x` and `dy` and grouped GEMMs), which is correct and slow
   The transposed forms are quantized from transposed reads rather than transposed after the
   cast, because ptxas 12.9 miscompiles 8-bit register layout conversions
   ([upstream-issue-ptxas-fp8-transpose.md](upstream-issue-ptxas-fp8-transpose.md)).
+- **Load producers before a consumer can spin.** Every producer kernel (CUDA, Triton, and
+  helpers such as `torch.cuda._sleep`) must have been launched once in the process before a
+  consumer that spins on it is enqueued. With CUDA lazy loading, the first launch of a kernel
+  loads its module, and the load waits for the kernels already running, including a consumer
+  spinning on that same producer; the consumer then traps on its spin timeout
+  (`ReadyScheduler`, `scheduler/gemm.cuh`, about 15 s; the combine wait and epoch barrier
+  have their own). Across ranks the same thing forms a cycle when every rank enqueues its
+  consumer before a first-launch producer a peer waits on. The symptom is `CUDA error:
+  unspecified launch failure` (719) at an unrelated later launch, with compute-sanitizer
+  reporting only a `Trace/breakpoint trap`. The persistent kernels satisfy the rule by
+  construction: each phase is one launch per rank on one stream, and peers wait only on
+  the same launch on other ranks. `PeerSchedule` runs its first forward and backward
+  without overlap (send, barrier, calculate, barrier, consume) before overlapping streams,
+  and still enqueues producers ahead of consumers. Tests and examples that delay a producer
+  launch it, and `torch.cuda._sleep(1)`, once before the timed loop.
+  `CUDA_MODULE_LOADING=EAGER` can help confirm a suspected case but is not the fix: it does
+  not cover Triton kernels, which load on first launch regardless.
 
 ## Weight layout cache
 
